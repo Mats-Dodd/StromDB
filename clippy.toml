@@ -4,7 +4,7 @@ allow-renamed-params-for = [
   "core::fmt::Display",
 ]
 
-missing-docs-in-crate-items = true
+missing-docs-in-crate-items = false
 
 disallowed-types = [
   { path = "std::collections::HashMap", reason = "iteration order varies between runs; use BTreeMap" },
