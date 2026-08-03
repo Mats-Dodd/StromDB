@@ -184,6 +184,8 @@ read back from durable storage are foreign again and re-enter the path at the to
   concurrency conflict, retryable storage failure, corrupt durable data, or a bounded-work
   limit. Merge variants callers always handle identically.  Too many error variants is just as bad, if not worse than too few.  
 
+-Assert liberally inside the engine. The simulation finds bugs only when some check fails loudly.
+
 - Assertions run in every build. `assert!` is the default; `debug_assert!` MUST NOT be
   used except with a measured cost justification carried in an
   `#[expect(clippy::disallowed_macros, reason = "...")]`.
