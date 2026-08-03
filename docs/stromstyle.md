@@ -30,7 +30,7 @@ When writing code, these are the top considerations:
    is wrong. 
 
 4. Simplicity and explicitness are of utmost importance. Code should be legible and
-   imperative. 
+   explicit. 
 
 
 When an invariant needs enforcing, escalate through representations in this
@@ -46,6 +46,28 @@ At every step, stop when the next step costs more than it removes. Unencoded unc
 outside the process remains a typed failure. An unencoded invariant controlled entirely by the
 current process gets an `assert!` and a rationale. The goal is not maximum type safety—it is
 maximum useful compiler knowledge per unit of cognitive complexity.
+
+### Paradigms are tools
+
+Rust is multi-paradigm on purpose. Choose the tradition per job, not per project, and judge
+every choice by local reasoning:
+
+- Use object-oriented patterns for organization. Structs and enums are where related data
+  and its invariants live (§1); traits mark the boundaries where substitution is required
+  (§6).
+
+- Use functional patterns for data transformations. Inside functions and closures, iterator
+  adapters make a dataflow read top to bottom with no state to track between steps. Switch
+  to a loop the moment a chain needs tuple threading, nested closures, or a comment
+  explaining what each stage carries.
+
+- Use imperative code when sequencing matters. Where the order of effects is the point—I/O,
+  mutation, byte-moving hot paths, low-level details—an explicit loop with early exits is
+  often the clearest form. Keep that code in the smallest scope that owns its state (§5).
+
+- Prefer readability over allegiance to a style. Code that is easy to read and change beats
+  code that follows one programming tradition perfectly. Changing form mid-function when
+  the job changes is deliberate, not inconsistent.
 
 ## 1. Domain modeling—parse, don't validate
 
@@ -149,6 +171,8 @@ read back from durable storage are foreign again and re-enter the path at the to
 
 - `Result` is the default. Use `expect` or `assert!` only for violated
   in-process invariants—programmer errors that cannot occur unless the code is wrong.
+  The `expect` message MUST state the invariant that was violated, not narrate the
+  failure. `unwrap` MUST NOT be used; a lint enforces this.
 
 - Data that crossed a durability, process, or network boundary and came back contradictory
   is a **failure, not a bug**. It MUST be a `Result` variant because corruption, partial
@@ -268,7 +292,12 @@ pure transformation.
   Do not silence it with an `Option`, default value, cast, clone, or wildcard match unless the
   new domain semantics justify that choice.
 
-- All functions in this codebase must be "total", in so far as there should be no dead code arms or unreachable blocks.  Reaching for these is a code smell that points to bad domain modelling further up the callstack.  In these situations, go back to the source and model its invariants more explicitly.  
+- A function MUST NOT contain dead arms or `unreachable!` blocks. A dead arm on a type
+  we own means the type is wider than the domain: go back to the source and narrow the
+  type until the arm disappears. Do not confuse a dead arm with a relational invariant.
+  A fact that spans several values or a span of time—a checkpoint at or below the tail,
+  a buffer length equal to a header field—may cost more to encode than it removes (see
+  the escalation ladder). That fact gets an `assert!` per §3, never an unreachable arm.
 
 ## 6. Module and crate structure
 
@@ -557,6 +586,10 @@ or delete it.
 - Comments explain **why**, never narrate **what**. Code shows what happens; comments and
   architecture decisions preserve why.
 
+- The same rule applies to rustdoc. Document a public item only when the documentation
+  adds information beyond the name and the signature. The `missing_docs` lint stays off;
+  an empty doc comment written to satisfy a lint is worse than no comment.
+
 
 - Include units and qualifiers as suffixes, ordered by descending significance:
   `latency_ms_max`, not `max_latency_ms`. The name then starts with the most significant
@@ -571,3 +604,4 @@ or delete it.
 - Do not abbreviate unless the abbreviation is standard in the domain, such as `I/O`,
   `WAL`, or `SST`. In scripts and tooling, use long-form flags: `--force`, not `-f`.
   Single-letter flags are for interactive use.
+
