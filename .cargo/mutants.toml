@@ -1,0 +1,5 @@
+# Mutation testing configuration; see https://mutants.rs/.
+test_tool = "nextest"
+test_workspace = true
+all_features = true
+profile = "mutants"
