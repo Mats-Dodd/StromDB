@@ -309,7 +309,7 @@ pure transformation.
 
 ## 7. Testing
 
-Tests are executable claims about Courant's domain, protocols, and externally observable
+Tests are executable claims about strom's domain, protocols, and externally observable
 behavior. They protect invariants and contracts, not the current shape of the implementation.
 Test code follows the same standards of simplicity, explicitness, determinism, naming, and
 bounded work as production code.
@@ -505,14 +505,14 @@ or delete it.
 
 ## 9. External dependencies and adapter seams
 
-- Wrap an external dependency in the narrow contract Courant uses instead of threading its
+- Wrap an external dependency in the narrow contract strom uses instead of threading its
   types throughout the codebase. Translate the dependency's error vocabulary into domain
   outcomes at the adapter boundary.
 
 - Foreign dependency types MUST NOT appear in a crate's public API unless exposing that
   dependency is the crate's explicit purpose.
 
-- Keep dependencies boring and justified. Courant is foundational storage code, so every
+- Keep dependencies boring and justified. strom is foundational storage code, so every
   dependency adds supply-chain, determinism, build, and operational risk. Prefer the
   standard library and existing workspace dependencies.
 
