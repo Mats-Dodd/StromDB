@@ -21,20 +21,19 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.96.1
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
 
-      - name: Cache Rust build artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install workspace tools
-        uses: taiki-e/install-action@v2
+      - name: Configure devenv binary cache
+        uses: cachix/cachix-action@v17
         with:
-          tool: just,nextest,cargo-mutants@27.1.0
-          fallback: none
+          name: devenv
+
+      - name: Install devenv
+        run: nix profile add nixpkgs#devenv
 
       - name: Run the mutation gate
-        run: just mutants-ci
+        run: devenv shell just mutants-ci
 
       - name: Upload mutant outcomes
         if: always()
