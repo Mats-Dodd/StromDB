@@ -1,0 +1,27 @@
+id: qualifier-suffix-order
+valid:
+  - |
+    fn flush(batch_bytes_max: usize) {
+        let latency_ms_max = 250;
+    }
+  - |
+    struct Limits {
+        segment_count_max: u32,
+    }
+  - |
+    const RETRY_COUNT_MAX: u32 = 5;
+invalid:
+  - |
+    fn flush(max_batch_bytes: usize) {
+        let max_latency_ms = 250;
+    }
+  - |
+    struct Limits {
+        max_segment_count: u32,
+    }
+  - |
+    fn read(min_position: u64) {
+        todo!()
+    }
+  - |
+    const MAX_RETRY_COUNT: u32 = 5;

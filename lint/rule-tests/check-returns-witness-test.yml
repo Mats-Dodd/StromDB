@@ -1,0 +1,34 @@
+id: check-returns-witness
+valid:
+  - |
+    fn validate_stream_name(raw: &str) -> Result<StreamName, ParseError> {
+        todo!()
+    }
+  - |
+    fn verify_checksum(payload: &[u8]) -> Result<VerifiedPayload, CorruptionError> {
+        todo!()
+    }
+  - |
+    fn is_sealed(&self) -> bool {
+        todo!()
+    }
+  - |
+    #[cfg(test)]
+    mod tests {
+        fn check_recovery_scenario(scenario: &Scenario) {
+            todo!()
+        }
+    }
+invalid:
+  - |
+    fn validate_stream_name(raw: &str) -> bool {
+        todo!()
+    }
+  - |
+    fn check_positions(positions: &[Position]) {
+        todo!()
+    }
+  - |
+    fn verify_checksum(payload: &[u8]) -> () {
+        todo!()
+    }

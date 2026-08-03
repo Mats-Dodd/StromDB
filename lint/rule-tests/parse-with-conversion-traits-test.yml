@@ -1,0 +1,39 @@
+id: parse-with-conversion-traits
+valid:
+  - |
+    impl TryFrom<&[u8]> for RecordHeader {
+        type Error = ParseError;
+        fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+            todo!()
+        }
+    }
+  - |
+    impl FromStr for StreamName {
+        type Err = ParseError;
+        fn from_str(raw: &str) -> Result<Self, Self::Err> {
+            todo!()
+        }
+    }
+  - |
+    fn parse_arguments(raw: &str) -> Result<Arguments, ParseError> {
+        todo!()
+    }
+invalid:
+  - |
+    impl RecordHeader {
+        fn parse_bytes(bytes: &[u8]) -> Result<Self, ParseError> {
+            todo!()
+        }
+    }
+  - |
+    impl StreamName {
+        pub fn from_raw(raw: &str) -> Result<Self, ParseError> {
+            todo!()
+        }
+    }
+  - |
+    impl Checkpoint {
+        fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+            todo!()
+        }
+    }

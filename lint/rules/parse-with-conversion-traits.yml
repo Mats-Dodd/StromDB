@@ -1,0 +1,23 @@
+# stromstyle §1: one value has one canonical parser. Construction from raw or
+# foreign data goes through TryFrom / FromStr / From, never ad hoc inherent methods.
+id: parse-with-conversion-traits
+language: rust
+severity: error
+message: Ad hoc inherent constructor; use TryFrom, FromStr, or From instead
+note: |
+  stromstyle §1: all constructions of a domain value from raw or foreign data
+  MUST use the standard conversion traits. Suppress with
+  `// ast-grep-ignore: parse-with-conversion-traits` and a stated reason.
+rule:
+  kind: function_item
+  has:
+    field: name
+    regex: "^(parse_|parse$|from_)"
+  inside:
+    kind: declaration_list
+    inside:
+      kind: impl_item
+      not:
+        has:
+          field: trait
+          regex: "."

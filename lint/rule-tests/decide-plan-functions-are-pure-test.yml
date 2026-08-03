@@ -1,0 +1,27 @@
+id: decide-plan-functions-are-pure
+valid:
+  - |
+    fn decide_append(state: &SegmentState, record: &Record) -> AppendOutcome {
+        todo!()
+    }
+  - |
+    fn plan_recovery(tail: &TailObservation) -> RecoveryPlan {
+        todo!()
+    }
+  - |
+    fn apply_append(&mut self, plan: &AppendPlan) -> Result<(), StorageError> {
+        todo!()
+    }
+  - |
+    fn decide_trim(self, position: Position) -> TrimOutcome {
+        todo!()
+    }
+invalid:
+  - |
+    fn decide_append(&mut self, record: &Record) -> AppendOutcome {
+        todo!()
+    }
+  - |
+    fn plan_recovery(state: &mut RecoveryState) -> RecoveryPlan {
+        todo!()
+    }

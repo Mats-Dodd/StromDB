@@ -1,0 +1,34 @@
+# stromstyle §1: a check whose fact later code relies upon returns a domain value
+# or witness. A check that returns unit or bool can be omitted and still compile.
+id: check-returns-witness
+language: rust
+severity: error
+message: check_*/validate_*/verify_* must return a parsed value or witness, not bool or unit
+note: |
+  stromstyle §1 (lifecycle of knowledge): return the domain value or a witness so
+  the compiler forces callers to keep the proof. Observation predicates should be
+  named is_*/has_*. Test harness `check` functions live in #[cfg(test)] modules,
+  which this rule skips.
+rule:
+  kind: function_item
+  all:
+    - has:
+        field: name
+        regex: "^(check_|validate_|verify_)"
+    - any:
+        - all:
+            - kind: function_item
+            - not:
+                has:
+                  field: return_type
+                  regex: "."
+        - has:
+            field: return_type
+            regex: "^(bool|\\(\\))$"
+    - not:
+        inside:
+          stopBy: end
+          kind: mod_item
+          follows:
+            kind: attribute_item
+            regex: "cfg\\(test\\)"

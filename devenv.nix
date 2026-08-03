@@ -15,6 +15,7 @@
     cargo-machete
     cargo-hack
     cargo-mutants
+    ast-grep
   ];
 
   env.CARGO_TERM_COLOR = "always";

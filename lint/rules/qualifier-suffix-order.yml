@@ -1,0 +1,21 @@
+# stromstyle §11: units and qualifiers are suffixes in descending significance:
+# latency_ms_max, not max_latency_ms. Related names then group and align.
+id: qualifier-suffix-order
+language: rust
+severity: error
+message: Put the qualifier last, in descending significance (latency_ms_max, not max_latency_ms)
+note: |
+  stromstyle §11: the name starts with the most significant word so that related
+  variables (latency_ms_min, latency_ms_p99) sort and align together.
+rule:
+  regex: "(?i)^(max|min)_"
+  any:
+    - kind: identifier
+    - kind: field_identifier
+  inside:
+    any:
+      - kind: let_declaration
+      - kind: parameter
+      - kind: const_item
+      - kind: static_item
+      - kind: field_declaration

@@ -14,6 +14,24 @@ overflow-checks = true
 inherits = "test"
 debug = "none"
 
+# Prebuilt Dylint lints, consume-only (run with `just dylint`). Pinned to a tag so
+# toolchain drift cannot break the build. Requires rustup for the driver toolchain.
+[workspace.metadata.dylint]
+libraries = [
+  { git = "https://github.com/trailofbits/dylint", tag = "v6.0.1", pattern = "examples/general/crate_wide_allow" },
+  { git = "https://github.com/trailofbits/dylint", tag = "v6.0.1", pattern = "examples/general/non_thread_safe_call_in_test" },
+  { git = "https://github.com/trailofbits/dylint", tag = "v6.0.1", pattern = "examples/supplementary/unnamed_constant" },
+  { git = "https://github.com/trailofbits/dylint", tag = "v6.0.1", pattern = "examples/supplementary/local_ref_cell" },
+  { git = "https://github.com/trailofbits/dylint", tag = "v6.0.1", pattern = "examples/supplementary/commented_out_code" },
+  { git = "https://github.com/trailofbits/dylint", tag = "v6.0.1", pattern = "examples/restriction/misleading_variable_name" },
+  { git = "https://github.com/trailofbits/dylint", tag = "v6.0.1", pattern = "examples/restriction/try_io_result" },
+  { git = "https://github.com/trailofbits/dylint", tag = "v6.0.1", pattern = "examples/restriction/env_literal" },
+  { git = "https://github.com/trailofbits/dylint", tag = "v6.0.1", pattern = "examples/restriction/assert_eq_arg_misordering" },
+  # Trial lints: remove if they prove too noisy on real code.
+  { git = "https://github.com/trailofbits/dylint", tag = "v6.0.1", pattern = "examples/general/non_local_effect_before_unhandled_error" },
+  { git = "https://github.com/trailofbits/dylint", tag = "v6.0.1", pattern = "examples/restriction/non_topologically_sorted_functions" },
+]
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
@@ -105,6 +123,7 @@ unused_async = "warn"
 error_impl_error = "warn"
 impl_trait_in_params = "warn"
 match_wild_err_arm = "warn"
+needless_pass_by_ref_mut = "warn"
 multiple_inherent_impl = "warn"
 partial_pub_fields = "warn"
 ref_option = "warn"

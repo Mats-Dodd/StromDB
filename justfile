@@ -7,11 +7,18 @@ fmt:
 fmt-check:
     cargo fmt --all --check
 
-check: fmt-check clippy
+check: fmt-check clippy lint-style
     cargo check --workspace --all-targets --all-features
 
 clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+lint-style:
+    ast-grep test --skip-snapshot-tests
+    ast-grep scan
+
+dylint:
+    DYLINT_RUSTFLAGS="--deny warnings" cargo dylint --all --workspace -- --all-targets --all-features
 
 test:
     cargo nextest run --workspace --all-features --no-tests pass

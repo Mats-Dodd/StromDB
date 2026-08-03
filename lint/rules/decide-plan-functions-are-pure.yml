@@ -1,0 +1,25 @@
+# stromstyle §5: decide_* and plan_* name the pure half of an operation. A pure
+# function does not write through &mut; mutation belongs to apply_* / commit_*.
+id: decide-plan-functions-are-pure
+language: rust
+severity: error
+message: decide_*/plan_* functions are pure; they must not take &mut
+note: |
+  stromstyle §5: the decision half of an operation is a pure function from state
+  and input to an outcome. Rename the function to apply_*/execute_*/commit_*, or
+  change the parameter to a shared borrow or an owned value.
+rule:
+  kind: function_item
+  all:
+    - has:
+        field: name
+        regex: "^(decide_|plan_)"
+    - has:
+        field: parameters
+        has:
+          stopBy: end
+          any:
+            - kind: self_parameter
+              regex: "&\\s*mut"
+            - kind: reference_type
+              regex: "^&\\s*mut"

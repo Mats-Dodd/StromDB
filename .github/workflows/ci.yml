@@ -34,3 +34,32 @@ jobs:
 
       - name: Run CI checks
         run: devenv test
+
+  # Dylint runs outside the devenv job: it needs rustup to install the nightly
+  # toolchain that the lint driver builds against, and the Nix rust toolchain
+  # does not provide rustup.
+  dylint:
+    name: Dylint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install workspace toolchain
+        run: rustup toolchain install
+
+      - name: Install cargo-dylint, dylint-link, and just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-dylint,dylint-link,just
+
+      - name: Cache Rust artifacts and Dylint drivers
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: |
+            ~/.dylint_drivers
+
+      - name: Run Dylint
+        run: just dylint
