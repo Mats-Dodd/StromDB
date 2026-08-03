@@ -1,18 +1,4 @@
-//! Pure domain types for the Durable Streams protocol's cold stream metadata.
-//!
-//! This crate models the low-churn facts the Ledger stores per stream: its
-//! identity, content type, expiry configuration, and lifecycle. None of these
-//! change on a read or an append. Every type parses at the boundary through
-//! `FromStr` or `TryFrom` and is trusted inward. The crate is pure: no I/O,
-//! no clock.
-//!
-//! Every type implements [`serde::Serialize`], and each impl documents its
-//! durable spelling. `Deserialize` is deliberately absent: untrusted bytes
-//! must re-enter through the canonical parsers, so no decoder can skip an
-//! invariant. The `proptest` feature adds a `strategy` module that generates
-//! valid values through those same parsers.
-//!
-//! Protocol section references (§) cite `docs/protocol.md`.
+//! Cold stream metadata types for the Durable Streams protocol.
 //!
 //! ```
 //! use strom_domain::{ExpiryPolicy, StreamId, StreamTtl};

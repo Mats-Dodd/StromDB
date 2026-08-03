@@ -1,8 +1,3 @@
-//! Integration tests for the `strom-domain` public seam.
-//!
-//! Every test names the protocol fact or algebraic law it protects. Protocol
-//! section references (§) cite `docs/protocol.md`.
-
 use proptest::prelude::*;
 use strom_domain::{
     CONTENT_TYPE_BYTES_MAX, ContentTypeError, ExpiresAt, ExpiresAtError, ExpiresAtRangeError,
@@ -10,12 +5,6 @@ use strom_domain::{
     StreamIdError, StreamLifecycle, StreamTtl, StreamTtlError,
 };
 
-// ---------------------------------------------------------------------------
-// StreamId
-// ---------------------------------------------------------------------------
-
-/// Spec anchor (§6.1, §6.2): the protocol's own stream-root-relative example
-/// paths parse, and parsing preserves the exact path.
 #[test]
 fn stream_id_accepts_protocol_example_paths() -> Result<(), StreamIdError> {
     let events: StreamId = "events/abc".parse()?;
@@ -33,8 +22,6 @@ fn stream_id_accepts_protocol_example_paths() -> Result<(), StreamIdError> {
     Ok(())
 }
 
-/// Spec anchor (§6): `__ds` is reserved only as the *first* segment. The
-/// boundary cases one character or one position away must stay valid.
 #[test]
 fn stream_id_reserves_ds_root_but_not_lookalikes() {
     assert_eq!(
@@ -59,8 +46,6 @@ fn stream_id_reserves_ds_root_but_not_lookalikes() {
     );
 }
 
-/// Enumerates the structural negative space: empty segments in every
-/// position, relative segments, and control characters (§12.3).
 #[test]
 fn stream_id_rejects_structural_hazards() {
     let hazards = [
@@ -83,7 +68,6 @@ fn stream_id_rejects_structural_hazards() {
     }
 }
 
-/// The length bound transitions exactly at `STREAM_ID_BYTES_MAX` bytes.
 #[test]
 fn stream_id_length_boundary_is_exact() {
     let at_max = "a".repeat(STREAM_ID_BYTES_MAX);
@@ -101,8 +85,6 @@ fn stream_id_length_boundary_is_exact() {
 }
 
 proptest! {
-    /// Totality and identity: parsing arbitrary input never panics, and an
-    /// accepted id preserves its input path exactly (no canonicalization).
     #[test]
     fn stream_id_parse_is_total_and_identity(input in any::<String>()) {
         if let Ok(stream_id) = input.parse::<StreamId>() {
@@ -110,7 +92,6 @@ proptest! {
         }
     }
 
-    /// Constructively valid paths always parse and round-trip via `Display`.
     #[test]
     fn stream_id_valid_paths_roundtrip(
         segments in prop::collection::vec("[a-z0-9._-]{1,12}", 1..6),
@@ -125,8 +106,6 @@ proptest! {
         }
     }
 
-    /// The Ledger sorts by stream id; that order is byte-wise order of the
-    /// path, whatever the internal representation becomes.
     #[test]
     fn stream_id_order_is_byte_order(
         left_segments in prop::collection::vec("[a-z0-9_-]{1,8}", 1..4),
@@ -143,12 +122,6 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
-// StreamContentType
-// ---------------------------------------------------------------------------
-
-/// Spec anchor (§5.1): the creation default is `application/octet-stream`,
-/// and the named constructor equals its parsed spelling.
 #[test]
 fn content_type_default_is_octet_stream() -> Result<(), ContentTypeError> {
     let parsed: StreamContentType = "application/octet-stream".parse()?;
@@ -160,8 +133,6 @@ fn content_type_default_is_octet_stream() -> Result<(), ContentTypeError> {
     Ok(())
 }
 
-/// Protocol mode predicates (§9.1 JSON mode, §5.8 SSE encoding) branch on the
-/// essence and must ignore the charset parameter.
 #[test]
 fn content_type_mode_predicates_follow_the_essence() -> Result<(), ContentTypeError> {
     let json: StreamContentType = "application/json; charset=utf-8".parse()?;
@@ -183,8 +154,6 @@ fn content_type_mode_predicates_follow_the_essence() -> Result<(), ContentTypeEr
     Ok(())
 }
 
-/// Idempotent `PUT` compares configuration (§5.1); equality must therefore
-/// treat case-variant spellings of one media type as the same value.
 #[test]
 fn content_type_equality_is_case_insensitive() -> Result<(), ContentTypeError> {
     let canonical: StreamContentType = "application/json;charset=utf-8".parse()?;
@@ -196,7 +165,6 @@ fn content_type_equality_is_case_insensitive() -> Result<(), ContentTypeError> {
     Ok(())
 }
 
-/// Enumerates the malformed negative space around `type/subtype [; charset=token]`.
 #[test]
 fn content_type_rejects_malformed_and_unknown_parameters() {
     let malformed = [
@@ -225,7 +193,6 @@ fn content_type_rejects_malformed_and_unknown_parameters() {
     );
 }
 
-/// The length bound transitions exactly at `CONTENT_TYPE_BYTES_MAX` bytes.
 #[test]
 fn content_type_length_boundary_is_exact() {
     let subtype_length = CONTENT_TYPE_BYTES_MAX.saturating_sub("application/".len());
@@ -247,9 +214,6 @@ fn content_type_length_boundary_is_exact() {
 }
 
 proptest! {
-    /// Totality and canonical stability: parsing arbitrary input never
-    /// panics, and any accepted value's `Display` form reparses to an equal
-    /// value.
     #[test]
     fn content_type_parse_is_total_and_display_reparses(input in any::<String>()) {
         if let Ok(content_type) = input.parse::<StreamContentType>() {
@@ -258,8 +222,6 @@ proptest! {
         }
     }
 
-    /// Constructively valid media types parse, and ASCII case never changes
-    /// the parsed value (§5.1 configuration match).
     #[test]
     fn content_type_valid_inputs_parse_and_case_fold(
         type_raw in "[a-z]{1,10}",
@@ -277,11 +239,6 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
-// StreamTtl
-// ---------------------------------------------------------------------------
-
-/// Spec anchors (§5.1): the protocol's own valid and invalid TTL examples.
 #[test]
 fn ttl_spec_anchors_from_section_5_1() {
     assert_eq!(
@@ -298,8 +255,6 @@ fn ttl_spec_anchors_from_section_5_1() {
     }
 }
 
-/// The value boundaries: zero (Courant restriction), the smallest window,
-/// the representable maximum, and one past it.
 #[test]
 fn ttl_value_boundaries_are_exact() {
     assert_eq!(
@@ -327,8 +282,6 @@ fn ttl_value_boundaries_are_exact() {
     );
 }
 
-/// The infallible widening from a proven-nonzero count agrees with the
-/// strict string grammar: both doors lead to one value.
 #[test]
 fn ttl_from_nonzero_agrees_with_parsing() -> Result<(), Box<dyn std::error::Error>> {
     let seconds = std::num::NonZeroU64::new(3600).ok_or("3600 is nonzero")?;
@@ -339,8 +292,6 @@ fn ttl_from_nonzero_agrees_with_parsing() -> Result<(), Box<dyn std::error::Erro
 }
 
 proptest! {
-    /// Every nonzero u64 round-trips through the strict grammar in both
-    /// directions: parse inverts `to_string`, and `Display` inverts parse.
     #[test]
     fn ttl_roundtrips_for_all_nonzero_values(seconds in 1u64..) {
         let source = seconds.to_string();
@@ -351,7 +302,6 @@ proptest! {
         }
     }
 
-    /// Totality: parsing arbitrary input never panics.
     #[test]
     fn ttl_parse_is_total(input in any::<String>()) {
         let outcome = input.parse::<StreamTtl>();
@@ -359,12 +309,6 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ExpiresAt
-// ---------------------------------------------------------------------------
-
-/// RFC 3339 semantics: an offset form and its UTC form denote one instant,
-/// so they must be equal, and ordering follows the instants.
 #[test]
 fn expires_at_compares_instants_not_spellings() -> Result<(), ExpiresAtError> {
     let utc: ExpiresAt = "2030-01-01T00:00:00Z".parse()?;
@@ -378,8 +322,6 @@ fn expires_at_compares_instants_not_spellings() -> Result<(), ExpiresAtError> {
     Ok(())
 }
 
-/// Enumerates the non-instant negative space: date-only, missing offset,
-/// time-zone annotations, and garbage.
 #[test]
 fn expires_at_rejects_non_instants() {
     let non_instants = [
@@ -399,9 +341,6 @@ fn expires_at_rejects_non_instants() {
     }
 }
 
-/// The durable nanosecond form: an in-range count constructs the instant
-/// its RFC 3339 spelling names, and the extremes of `i128` are rejected,
-/// never wrapped or clamped.
 #[test]
 fn expires_at_nanosecond_range_is_exact() -> Result<(), Box<dyn std::error::Error>> {
     let epoch = ExpiresAt::try_from(0i128)?;
@@ -424,8 +363,6 @@ fn expires_at_nanosecond_range_is_exact() -> Result<(), Box<dyn std::error::Erro
 }
 
 proptest! {
-    /// Constructively valid UTC instants parse, and `Display` prints the
-    /// canonical UTC form back exactly.
     #[test]
     fn expires_at_roundtrips_canonical_utc(
         year in 1970i32..=9999i32,
@@ -444,7 +381,6 @@ proptest! {
         }
     }
 
-    /// Totality: parsing arbitrary input never panics.
     #[test]
     fn expires_at_parse_is_total(input in any::<String>()) {
         let outcome = input.parse::<ExpiresAt>();
@@ -452,12 +388,6 @@ proptest! {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ExpiryPolicy
-// ---------------------------------------------------------------------------
-
-/// Exhaustively enumerates the four header combinations of §5.1: absent,
-/// TTL-only, expires-at-only, and the rejected conflict.
 #[test]
 fn expiry_policy_enumerates_header_combinations() -> Result<(), Box<dyn std::error::Error>> {
     let ttl: StreamTtl = "60".parse()?;
@@ -485,12 +415,6 @@ fn expiry_policy_enumerates_header_combinations() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// StreamLifecycle
-// ---------------------------------------------------------------------------
-
-/// Exhaustively enumerates the lifecycle space: closure is monotonic and
-/// idempotent (§4.1), and the observation predicate agrees.
 #[test]
 fn lifecycle_close_is_monotonic_and_idempotent() {
     assert_eq!(
