@@ -1,0 +1,35 @@
+id: types-own-their-data
+valid:
+  - |
+    struct SegmentHeader {
+        stream: StreamName,
+        position: Position,
+    }
+  - |
+    struct Batch<T> {
+        records: Vec<T>,
+    }
+  - |
+    enum RecoveryOutcome {
+        Clean,
+        TornTail { position: Position },
+    }
+  - |
+    fn longest<'a>(left: &'a str, right: &'a str) -> &'a str {
+        todo!()
+    }
+invalid:
+  - |
+    struct RecordView<'a> {
+        payload: &'a [u8],
+    }
+  - |
+    struct Cursor<'a, T> {
+        segment: &'a Segment,
+        record: T,
+    }
+  - |
+    enum Slot<'a> {
+        Empty,
+        Occupied(&'a Record),
+    }

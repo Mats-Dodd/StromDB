@@ -1,0 +1,22 @@
+# stromstyle north star: types own their data so they support local reasoning.
+# A lifetime parameter on a struct or enum ties the type to one scope and
+# infects every caller; references are temporary views, not stored state.
+id: types-own-their-data
+language: rust
+severity: error
+message: No lifetime parameters on structs or enums; store owned data instead
+note: |
+  stromstyle north star (local reasoning): a type with a lifetime parameter can
+  never leave the scope of its referent, and the lifetime spreads to every
+  containing type and signature. Store owned values (String, Vec<u8>, Arc<str>)
+  and keep borrows short and local. A deliberate byte-plane view type may
+  suppress with `// ast-grep-ignore: types-own-their-data` and a stated reason.
+rule:
+  any:
+    - kind: struct_item
+    - kind: enum_item
+  has:
+    field: type_parameters
+    has:
+      stopBy: end
+      kind: lifetime_parameter

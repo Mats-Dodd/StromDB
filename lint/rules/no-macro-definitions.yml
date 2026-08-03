@@ -1,0 +1,14 @@
+# stromstyle north star: the vocabulary stays small. A macro is a private
+# language extension a reader must learn before the code supports local
+# reasoning; functions, enums, and plain data cover the same ground.
+id: no-macro-definitions
+language: rust
+severity: error
+message: No macro_rules! definitions; use a function, enum, or plain data instead
+note: |
+  stromstyle north star (local reasoning): a macro adds a construct the reader
+  must learn and the compiler checks only after expansion. Express the logic
+  as a function or a data table. If duplication is truly irreducible, suppress
+  with `// ast-grep-ignore: no-macro-definitions` and a stated reason.
+rule:
+  kind: macro_definition

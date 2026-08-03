@@ -1,0 +1,22 @@
+id: no-macro-definitions
+valid:
+  - |
+    fn encode_header(header: &SegmentHeader) -> Vec<u8> {
+        todo!()
+    }
+  - |
+    const HEADER_BYTES: usize = 32;
+    const _: () = assert!(HEADER_BYTES % 8 == 0);
+invalid:
+  - |
+    macro_rules! impl_position {
+        ($name:ident) => {
+            impl Position for $name {}
+        };
+    }
+  - |
+    macro_rules! bail {
+        ($err:expr) => {
+            return Err($err)
+        };
+    }
