@@ -14,8 +14,6 @@ overflow-checks = true
 inherits = "test"
 debug = "none"
 
-# Prebuilt Dylint lints, consume-only (run with `just dylint`). Pinned to a tag so
-# toolchain drift cannot break the build. Requires rustup for the driver toolchain.
 [workspace.metadata.dylint]
 libraries = [
   { git = "https://github.com/trailofbits/dylint", tag = "v6.0.1", pattern = "examples/general/crate_wide_allow" },
@@ -48,7 +46,6 @@ macro_use_extern_crate = "warn"
 meta_variable_misuse = "warn"
 missing_copy_implementations = "warn"
 missing_debug_implementations = "warn"
-# Rustdoc only where it adds information beyond the name and signature (stromstyle §11).
 missing_docs = "allow"
 non_ascii_idents = "deny"
 redundant_lifetimes = "warn"
@@ -77,8 +74,6 @@ allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
 ignore_without_reason = "warn"
 unwrap_used = "deny"
-# `expect` is the Option/Result form of `assert!`: permitted only for violated
-# in-process invariants, and the message states the invariant (stromstyle §3).
 expect_used = "allow"
 get_unwrap = "deny"
 panic = "warn"
