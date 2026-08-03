@@ -6,6 +6,25 @@ allow-renamed-params-for = [
 
 missing-docs-in-crate-items = false
 
+disallowed-methods = [
+  { path = "std::time::SystemTime::now", reason = "wall time enters through an explicit Clock seam" },
+  { path = "std::time::SystemTime::elapsed", reason = "wall time enters through an explicit Clock seam" },
+  { path = "std::time::Instant::now", reason = "monotonic time enters through an explicit Clock seam" },
+  { path = "std::time::Instant::elapsed", reason = "monotonic time enters through an explicit Clock seam" },
+  { path = "std::thread::sleep", reason = "sleeping enters through an explicit Clock seam" },
+  { path = "rand::random", allow-invalid = true, reason = "randomness enters through an explicit Entropy seam" },
+  { path = "rand::rng", allow-invalid = true, reason = "randomness enters through an explicit Entropy seam" },
+  { path = "rand::rngs::thread::rng", allow-invalid = true, reason = "randomness enters through an explicit Entropy seam" },
+  { path = "rand::random_range", allow-invalid = true, reason = "randomness enters through an explicit Entropy seam" },
+  { path = "rand::random_bool", allow-invalid = true, reason = "randomness enters through an explicit Entropy seam" },
+  { path = "rand::random_ratio", allow-invalid = true, reason = "randomness enters through an explicit Entropy seam" },
+  { path = "rand::random_iter", allow-invalid = true, reason = "randomness enters through an explicit Entropy seam" },
+  { path = "std::fs::read", reason = "durable state enters through an explicit storage seam" },
+  { path = "std::fs::write", reason = "durable state enters through an explicit storage seam" },
+  { path = "std::fs::read_to_string", reason = "durable state enters through an explicit storage seam" },
+  { path = "std::fs::read_dir", reason = "durable state enters through an explicit storage seam" },
+]
+
 disallowed-types = [
   { path = "std::collections::HashMap", reason = "iteration order varies between runs; use BTreeMap" },
   { path = "std::collections::HashSet", reason = "iteration order varies between runs; use BTreeSet" },
