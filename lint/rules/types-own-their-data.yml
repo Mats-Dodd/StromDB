@@ -9,8 +9,9 @@ note: |
   stromstyle north star (local reasoning): a type with a lifetime parameter can
   never leave the scope of its referent, and the lifetime spreads to every
   containing type and signature. Store owned values (String, Vec<u8>, Arc<str>)
-  and keep borrows short and local. A deliberate byte-plane view type may
-  suppress with `// ast-grep-ignore: types-own-their-data` and a stated reason.
+  and keep borrows short and local. A deliberate short-lived view type (a
+  byte-plane view, a future, an RAII guard) may suppress with
+  `// ast-grep-ignore: types-own-their-data` and a stated reason.
 rule:
   any:
     - kind: struct_item

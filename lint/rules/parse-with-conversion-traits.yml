@@ -6,13 +6,24 @@ severity: error
 message: Ad hoc inherent constructor; use TryFrom, FromStr, or From instead
 note: |
   stromstyle §1: all constructions of a domain value from raw or foreign data
-  MUST use the standard conversion traits. Suppress with
+  MUST use the standard conversion traits. A fallible from_* is a parse in
+  disguise; move it to TryFrom or FromStr. Infallible unit- or source-qualified
+  constructors (from_unix_nanos, from_seed) are allowed: a bare From impl would
+  erase the unit the name carries. Suppress with
   `// ast-grep-ignore: parse-with-conversion-traits` and a stated reason.
 rule:
   kind: function_item
-  has:
-    field: name
-    regex: "^(parse_|parse$|from_)"
+  any:
+    - has:
+        field: name
+        regex: "^(parse_|parse$)"
+    - all:
+        - has:
+            field: name
+            regex: "^(from_|from$)"
+        - has:
+            field: return_type
+            regex: "(Result|Option)"
   inside:
     kind: declaration_list
     inside:

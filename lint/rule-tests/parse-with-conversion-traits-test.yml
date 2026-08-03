@@ -18,6 +18,18 @@ valid:
     fn parse_arguments(raw: &str) -> Result<Arguments, ParseError> {
         todo!()
     }
+  - |
+    impl Timestamp {
+        pub const fn from_unix_nanos(nanos: u128) -> Self {
+            todo!()
+        }
+    }
+  - |
+    impl Entropy {
+        pub fn from_seed(seed: Seed) -> Self {
+            todo!()
+        }
+    }
 invalid:
   - |
     impl RecordHeader {

@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["crates/stromdb"]
+members = ["crates/strom-common", "crates/stromdb"]
+
+[workspace.dependencies]
+rand = "0.9"
+tokio = { version = "1", features = ["time"] }
 
 [profile.release]
 overflow-checks = true
