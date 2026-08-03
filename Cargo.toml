@@ -49,7 +49,7 @@ unused_qualifications = "warn"
 
 [workspace.lints.rustdoc]
 broken_intra_doc_links = "deny"
-missing_crate_level_docs = "warn"
+missing_crate_level_docs = "allow"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
