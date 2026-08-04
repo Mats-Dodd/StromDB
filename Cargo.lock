@@ -388,6 +388,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "strom-object-store"
+version = "0.1.0"
+
+[[package]]
 name = "stromdb"
 version = "0.1.0"
 

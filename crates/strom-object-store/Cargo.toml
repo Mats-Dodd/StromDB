@@ -1,0 +1,10 @@
+[package]
+name = "strom-object-store"
+description = "Object store for StromDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
