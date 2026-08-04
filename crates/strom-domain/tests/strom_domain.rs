@@ -302,10 +302,14 @@ proptest! {
         }
     }
 
+    /// §5.1 spells a TTL exactly one way, so an accepted header is already its
+    /// own canonical form. This rejects any parser that quietly tolerates
+    /// `+3600`, `03600`, or surrounding whitespace.
     #[test]
-    fn ttl_parse_is_total(input in any::<String>()) {
-        let outcome = input.parse::<StreamTtl>();
-        prop_assert!(outcome.is_ok() || outcome.is_err());
+    fn ttl_accepts_only_its_own_canonical_spelling(input in any::<String>()) {
+        if let Ok(ttl) = input.parse::<StreamTtl>() {
+            prop_assert_eq!(ttl.to_string(), input);
+        }
     }
 }
 
@@ -381,10 +385,15 @@ proptest! {
         }
     }
 
+    /// An instant has many spellings but one canonical rendering, and that
+    /// rendering must be one this same parser accepts. Rejects a `Display` that
+    /// emits a form `FromStr` refuses, such as an RFC 9557 zone annotation.
     #[test]
-    fn expires_at_parse_is_total(input in any::<String>()) {
-        let outcome = input.parse::<ExpiresAt>();
-        prop_assert!(outcome.is_ok() || outcome.is_err());
+    fn expires_at_display_reparses_to_the_same_instant(input in any::<String>()) {
+        if let Ok(expires_at) = input.parse::<ExpiresAt>() {
+            let redisplayed = expires_at.to_string();
+            prop_assert_eq!(redisplayed.parse::<ExpiresAt>().ok(), Some(expires_at));
+        }
     }
 }
 

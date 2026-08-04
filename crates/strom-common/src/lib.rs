@@ -3,5 +3,5 @@
 pub mod randomness;
 pub mod wall_clock;
 
-pub use randomness::{Entropy, Seed};
+pub use randomness::{Entropy, Generator, Seed};
 pub use wall_clock::{Clock, ManualClock, OsClock, Timestamp};

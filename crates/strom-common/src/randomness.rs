@@ -1,10 +1,13 @@
 //! The randomness capability seam (stromstyle §4). No trait: production and
 //! deterministic runs use the same types and differ only in the root seed.
 
+
 use std::collections::BTreeSet;
 
-use rand::rngs::StdRng;
 use rand::{SeedableRng as _, TryRngCore as _};
+use rand_chacha::ChaCha12Rng;
+
+pub type Generator = ChaCha12Rng;
 
 /// The root seed of a run. One value reproduces every random choice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -39,7 +42,7 @@ impl Seed {
 #[derive(Debug)]
 pub struct Entropy {
     seed: Seed,
-    generator: StdRng,
+    generator: Generator,
     forked_labels: BTreeSet<u64>,
 }
 
@@ -48,7 +51,7 @@ impl Entropy {
     pub fn from_seed(seed: Seed) -> Self {
         Self {
             seed,
-            generator: StdRng::seed_from_u64(seed.value()),
+            generator: Generator::seed_from_u64(seed.value()),
             forked_labels: BTreeSet::new(),
         }
     }
@@ -70,7 +73,7 @@ impl Entropy {
         Self::from_seed(Seed::new(splitmix64(self.seed.value() ^ label_digest)))
     }
 
-    pub const fn rng(&mut self) -> &mut StdRng {
+    pub const fn rng(&mut self) -> &mut Generator {
         &mut self.generator
     }
 }
@@ -143,6 +146,28 @@ mod tests {
             child_of_drained.rng().next_u64(),
             child_of_fresh.rng().next_u64(),
             "a fork must depend only on the parent seed and the label, never on prior draws"
+        );
+    }
+
+    /// Pins the seed-to-draw chain: the generator, its seeding, and the fork
+    /// derivation. A seed recorded against a past run must replay that run, so
+    /// these numbers may change only when the recorded seeds are also retired.
+    #[test]
+    fn a_recorded_seed_replays_the_same_draws() {
+        let mut root = Entropy::from_seed(Seed::new(42));
+        let first = root.rng().next_u64();
+        let second = root.rng().next_u64();
+        assert_eq!(
+            [first, second],
+            [9_713_269_763_989_775_522, 10_011_513_049_433_592_189],
+            "the root stream for seed 42 must not move between builds"
+        );
+
+        let mut child = root.fork("wal");
+        assert_eq!(
+            child.rng().next_u64(),
+            10_677_131_651_932_318_252,
+            "the `wal` child stream of seed 42 must not move between builds"
         );
     }
 

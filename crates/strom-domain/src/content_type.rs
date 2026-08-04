@@ -11,14 +11,27 @@ pub struct StreamContentType {
 }
 
 /// Upper bound on a content-type string, in bytes.
+///
+/// The protocol states no limit, so this is strom's own bound on work per
+/// creation request (§10): generous for any real media type, small enough to
+/// reject a hostile header.
 pub const CONTENT_TYPE_BYTES_MAX: usize = 256;
+
+const ESSENCE_OCTET_STREAM: &str = "application/octet-stream";
+const ESSENCE_JSON: &str = "application/json";
+const ESSENCE_TEXT_PREFIX: &str = "text/";
+
+const _: () = assert!(
+    ESSENCE_OCTET_STREAM.len() <= CONTENT_TYPE_BYTES_MAX,
+    "the default content type must be a value this type can also parse back"
+);
 
 impl StreamContentType {
     /// Default when stream creation omits `Content-Type` (§5.1).
     #[must_use]
     pub fn octet_stream() -> Self {
         Self {
-            essence: String::from("application/octet-stream"),
+            essence: String::from(ESSENCE_OCTET_STREAM),
             charset: None,
         }
     }
@@ -26,13 +39,13 @@ impl StreamContentType {
     /// True for `application/json` (JSON-mode message boundaries, §9.1).
     #[must_use]
     pub fn is_json(&self) -> bool {
-        self.essence == "application/json"
+        self.essence == ESSENCE_JSON
     }
 
     /// True for any `text/*` type (SSE text encoding, §5.8).
     #[must_use]
     pub fn is_text(&self) -> bool {
-        self.essence.starts_with("text/")
+        self.essence.starts_with(ESSENCE_TEXT_PREFIX)
     }
 }
 
@@ -44,7 +57,10 @@ impl FromStr for StreamContentType {
             return Err(ContentTypeError::OverMaxBytes);
         }
         let mut parts = input.split(';');
-        let essence_raw = parts.next().unwrap_or("").trim();
+        let essence_raw = parts
+            .next()
+            .expect("str::split yields the whole input when the separator is absent")
+            .trim();
         let (type_raw, subtype_raw) = essence_raw
             .split_once('/')
             .ok_or(ContentTypeError::Malformed)?;

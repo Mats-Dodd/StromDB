@@ -54,7 +54,16 @@ impl fmt::Display for ExpiryPolicyConflict {
 
 impl std::error::Error for ExpiryPolicyConflict {}
 
-/// Sliding idle window in seconds (`Stream-TTL`, §5.1). Zero and leading zeros are rejected.
+/// Sliding idle window in seconds (`Stream-TTL`, §5.1).
+///
+/// This type is deliberately narrower than the protocol. §5.1 accepts any
+/// non-negative decimal integer, so `0` is a well-formed header there. strom
+/// rejects it: a zero window expires the stream at the instant it is created,
+/// and no client can mean that. `NonZeroU64` removes the case instead of
+/// leaving every consumer to re-check it.
+///
+/// Leading zeros, a leading `+`, and non-decimal spellings are rejected as
+/// §5.1 requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamTtl(NonZeroU64);
 
@@ -173,6 +182,14 @@ impl serde::Serialize for ExpiresAt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpiresAtError;
 
+impl fmt::Display for ExpiresAtError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("expires-at is not a valid RFC 3339 timestamp")
+    }
+}
+
+impl std::error::Error for ExpiresAtError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpiresAtRangeError;
 
@@ -183,11 +200,3 @@ impl fmt::Display for ExpiresAtRangeError {
 }
 
 impl std::error::Error for ExpiresAtRangeError {}
-
-impl fmt::Display for ExpiresAtError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("expires-at is not a valid RFC 3339 timestamp")
-    }
-}
-
-impl std::error::Error for ExpiresAtError {}

@@ -83,13 +83,18 @@ pub struct ManualClock {
 #[derive(Debug)]
 struct ManualClockState {
     now: Timestamp,
-    next_sleeper_id: u64,
+    sleeper_id_next: SleeperId,
     sleepers: Vec<Sleeper>,
 }
 
+/// Identifies one registration in [`ManualClockState::sleepers`]. The sleeper's
+/// position moves as others are removed, so a future holds this instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SleeperId(u64);
+
 #[derive(Debug)]
 struct Sleeper {
-    id: u64,
+    id: SleeperId,
     deadline: Timestamp,
     waker: Option<Waker>,
 }
@@ -100,7 +105,7 @@ impl ManualClock {
         Self {
             state: SleeperLock::new(ManualClockState {
                 now: start,
-                next_sleeper_id: 0,
+                sleeper_id_next: SleeperId(0),
                 sleepers: Vec::new(),
             }),
         }
@@ -143,8 +148,13 @@ impl Clock for ManualClock {
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         let mut state = self.state.lock().expect("manual clock lock poisoned");
         let deadline = state.now.saturating_add(duration);
-        let sleeper_id = state.next_sleeper_id;
-        state.next_sleeper_id = sleeper_id.wrapping_add(1);
+        let sleeper_id = state.sleeper_id_next;
+        state.sleeper_id_next = SleeperId(
+            sleeper_id
+                .0
+                .checked_add(1)
+                .expect("a run registers fewer sleeps than a u64 can number"),
+        );
         state.sleepers.push(Sleeper {
             id: sleeper_id,
             deadline,
@@ -163,7 +173,7 @@ impl Clock for ManualClock {
 // ast-grep-ignore: types-own-their-data
 struct ManualSleep<'clock> {
     state: &'clock SleeperLock,
-    sleeper_id: u64,
+    sleeper_id: SleeperId,
     deadline: Timestamp,
 }
 
@@ -237,16 +247,30 @@ mod tests {
         }
     }
 
+    type BoxedSleep<'clock> = Pin<Box<dyn Future<Output = ()> + Send + 'clock>>;
+
+    fn poll_with(sleep: &mut BoxedSleep<'_>, recorder: &Arc<RecordingWake>) -> Poll<()> {
+        let waker = Waker::from(Arc::clone(recorder));
+        sleep.as_mut().poll(&mut Context::from_waker(&waker))
+    }
+
+    fn sleeper_count(clock: &ManualClock) -> usize {
+        clock
+            .state
+            .lock()
+            .expect("manual clock lock poisoned")
+            .sleepers
+            .len()
+    }
+
     #[test]
     fn manual_sleep_completes_only_when_advance_reaches_the_deadline() {
         let clock = ManualClock::new(Timestamp::UNIX_EPOCH);
         let mut sleep = clock.sleep(Duration::from_nanos(100));
         let recorder = RecordingWake::new();
-        let waker = Waker::from(Arc::clone(&recorder));
-        let mut context = Context::from_waker(&waker);
 
         assert!(
-            sleep.as_mut().poll(&mut context).is_pending(),
+            poll_with(&mut sleep, &recorder).is_pending(),
             "a sleep must be pending before its deadline"
         );
 
@@ -256,7 +280,7 @@ mod tests {
             "an advance short of the deadline must not wake the sleeper"
         );
         assert!(
-            sleep.as_mut().poll(&mut context).is_pending(),
+            poll_with(&mut sleep, &recorder).is_pending(),
             "a sleep must stay pending short of its deadline"
         );
 
@@ -266,7 +290,7 @@ mod tests {
             "an advance onto the deadline must wake the sleeper"
         );
         assert!(
-            sleep.as_mut().poll(&mut context).is_ready(),
+            poll_with(&mut sleep, &recorder).is_ready(),
             "a sleep must complete once its deadline is reached"
         );
     }
@@ -276,12 +300,71 @@ mod tests {
         let clock = ManualClock::new(Timestamp::UNIX_EPOCH);
         let mut sleep = clock.sleep(Duration::ZERO);
         let recorder = RecordingWake::new();
-        let waker = Waker::from(Arc::clone(&recorder));
-        let mut context = Context::from_waker(&waker);
 
         assert!(
-            sleep.as_mut().poll(&mut context).is_ready(),
+            poll_with(&mut sleep, &recorder).is_ready(),
             "a zero-duration sleep must complete on the first poll"
+        );
+    }
+
+    #[test]
+    fn one_advance_wakes_exactly_the_sleepers_it_reaches() {
+        let clock = ManualClock::new(Timestamp::UNIX_EPOCH);
+        let passed = RecordingWake::new();
+        let reached = RecordingWake::new();
+        let beyond = RecordingWake::new();
+        let mut sleep_passed = clock.sleep(Duration::from_nanos(10));
+        let mut sleep_reached = clock.sleep(Duration::from_nanos(20));
+        let mut sleep_beyond = clock.sleep(Duration::from_nanos(30));
+        for (sleep, recorder) in [
+            (&mut sleep_passed, &passed),
+            (&mut sleep_reached, &reached),
+            (&mut sleep_beyond, &beyond),
+        ] {
+            assert!(
+                poll_with(sleep, recorder).is_pending(),
+                "every sleep must be pending before the clock advances"
+            );
+        }
+
+        clock.advance(Duration::from_nanos(20));
+
+        assert!(
+            passed.was_woken(),
+            "a deadline the advance stepped past must wake"
+        );
+        assert!(
+            reached.was_woken(),
+            "a deadline the advance landed on must wake"
+        );
+        assert!(
+            !beyond.was_woken(),
+            "a deadline beyond the advance must not wake"
+        );
+        assert_eq!(
+            sleeper_count(&clock),
+            1,
+            "advance must deregister every sleeper it woke and keep the rest"
+        );
+    }
+
+    #[test]
+    fn a_sleep_dropped_before_its_deadline_leaves_no_registration() {
+        let clock = ManualClock::new(Timestamp::UNIX_EPOCH);
+        let sleep = clock.sleep(Duration::from_nanos(100));
+        assert_eq!(
+            sleeper_count(&clock),
+            1,
+            "an outstanding sleep holds one registration"
+        );
+
+        drop(sleep);
+
+        assert_eq!(
+            sleeper_count(&clock),
+            0,
+            "an abandoned sleep must release its registration, or a long run \
+             accumulates sleepers no advance will ever reach"
         );
     }
 

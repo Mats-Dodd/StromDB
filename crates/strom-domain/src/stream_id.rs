@@ -8,8 +8,13 @@ use std::str::FromStr;
 pub struct StreamId(String);
 
 /// Upper bound on a stream id, in bytes.
+///
+/// The protocol states no limit, so this is strom's own bound on work per
+/// request (§10) and on the key length any storage layout must carry.
 pub const STREAM_ID_BYTES_MAX: usize = 512;
 
+/// §6: a first segment of `__ds` addresses subscription control APIs, never an
+/// application stream.
 const ROOT_SEGMENT_RESERVED: &str = "__ds";
 
 impl StreamId {
@@ -77,7 +82,10 @@ impl fmt::Display for StreamIdError {
                 formatter.write_str("stream id contains a `.` or `..` segment")
             }
             Self::ReservedRootSegment => {
-                formatter.write_str("stream id starts with the reserved `__ds` segment")
+                write!(
+                    formatter,
+                    "stream id starts with the reserved `{ROOT_SEGMENT_RESERVED}` segment"
+                )
             }
         }
     }

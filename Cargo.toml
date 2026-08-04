@@ -6,6 +6,7 @@ members = ["crates/strom-common", "crates/strom-domain", "crates/stromdb"]
 jiff = "0.2"
 proptest = "1"
 rand = "0.9"
+rand_chacha = "0.9"
 serde = "1"
 tokio = { version = "1", features = ["time"] }
 
