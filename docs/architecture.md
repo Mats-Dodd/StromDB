@@ -901,3 +901,220 @@ Forks are explicitly deffered to a followup RFC
 ## subscriptions and delivery
 
 This is explicitly deffered to a followup RFC
+
+
+## bootstrap state machine
+
+Bootstrap is an explicit event-driven machine, not one helper with hidden
+retries:
+
+```rust
+enum BootstrapPhase {
+    DiscoverHead,
+    ReadHead { generation: SealGeneration },
+    PublishClaim { prepared: PreparedClaim },
+    LoadAdmissionBase { claim: AuthoredClaim },
+    PlaceFence { claim: AuthoredClaim, candidate: BatchId },
+    Replay { next: BatchId, fence: BatchId },
+    RefreshAnomaly,
+    FinalRefresh,
+    Ready,
+}
+```
+
+The implementation may split effect-start and effect-completion variants to
+satisfy borrowing, but it does not hide transitions or retry indefinitely
+inside adapters.
+
+Bootstrap performs the bounded Seal decode and structural capacity checks
+before competing for ownership. The same GET supplies the complete manifest;
+there is no second metadata fetch. Only a direct claimant pays to load and
+validate the resident Ledger/Tally bases, authenticated child footers, and
+Annals startup metadata. This avoids several contenders performing full cold
+bootstrap work.
+
+The partition does not accept traffic until:
+
+- the newest self-contained Seal is decoded;
+- its range structure, TableRefs, table footers, and bulk source bounds are
+  valid;
+- admission-resident Ledger/Tally state is built and cross-checked;
+- Annals planning metadata is available within its bound;
+- the claim was directly authored;
+- the first-hole FENCE was established;
+- strict replay reached that fence with the claimed owner;
+- the final newest-generation observation still matches; and
+- the recovered PublishedView is installed.
+
+Missing current children, corruption, contradictory counts, or an over-bound
+current source make the partition unready. Recovery never interprets absence
+as an empty tree or silently scans backward to an older convenient Seal.
+
+
+## storage adapter APIs
+
+
+The engine depends on narrow private contracts rather than a general-purpose
+object-store handle:
+
+```rust
+trait SealStore {
+    async fn create_seal(
+        &self,
+        candidate: EncodedSeal,
+    ) -> Result<CreateEvidence, SealStoreError>;
+
+    async fn newest_generation(
+        &self,
+        partition: PartitionId,
+    ) -> Result<Option<SealGeneration>, SealStoreError>;
+
+    async fn read_seal(
+        &self,
+        identity: SealIdentity,
+    ) -> Result<Option<DecodedSeal>, SealStoreError>;
+}
+
+trait WalStore {
+    async fn create_wal(
+        &self,
+        candidate: EncodedWal,
+    ) -> Result<CreateEvidence, WalStoreError>;
+
+    async fn read_wal(
+        &self,
+        identity: WalIdentity,
+    ) -> Result<Option<ObservedWal>, WalStoreError>;
+
+    async fn newest_surviving_batch(
+        &self,
+        partition: PartitionId,
+    ) -> Result<Option<BatchId>, WalStoreError>;
+
+    async fn delete_run(
+        &self,
+        proof: AuthorizedWalRunDelete,
+    ) -> Result<ConditionalDeleteObservation, WalStoreError>;
+}
+
+trait ContentStore {
+    async fn create_or_verify(
+        &self,
+        object: EncodedContentObject,
+    ) -> Result<DurableContentObject, ContentStoreError>;
+
+    async fn read_object(
+        &self,
+        identity: ContentObjectId,
+    ) -> Result<Option<DecodedContentObject>, ContentStoreError>;
+
+    async fn read_range(
+        &self,
+        range: AuthenticatedObjectRange,
+    ) -> Result<Option<VerifiedRangeBytes>, ContentStoreError>;
+
+    async fn list_page(
+        &self,
+        request: BoundedContentPageRequest,
+    ) -> Result<ContentPage, ContentStoreError>;
+
+    async fn delete(
+        &self,
+        proof: AuthorizedContentDelete,
+    ) -> Result<DeleteObservation, ContentStoreError>;
+}
+```
+
+These signatures are responsibility sketches. Concrete private traits may be
+combined when that removes ceremony, but the special rules for newest-head
+listing, exact WAL deletion, authenticated range construction, and typed
+content deletion must remain impossible to bypass.
+
+
+## failure, fencing, routing, and shutdown
+
+Courant is fail-stop around uncertainty.
+
+```rust
+enum WriterExit {
+    Shutdown,
+    Fenced { observed: SealGeneration },
+    Poisoned { coordinate: DurableCoordinate, detail: String },
+    Contradiction { coordinate: DurableCoordinate, detail: String },
+}
+```
+
+- `Fenced` is normal ownership movement.
+- `Poisoned` means an effect may have happened but this process lacks evidence
+  to continue.
+- `Contradiction` means durable bytes violate the storage model.
+- Capacity shedding occurs before fact creation and is not a writer exit.
+
+On poison or fencing, the writer revokes readiness, stops admission, withholds
+unresolved definitive replies, abandons non-authoritative candidates, records
+exact durable coordinates, and exits for fresh bootstrap. It never reports
+definite failure while a request may still linearize.
+
+Object-store fencing does not revoke an HTTP socket. The router exposes exactly
+one assignment for a partition and uses a generation-fenced response gate:
+
+```text
+revoke old gate
+-> stop admitting old mutation/read chunks
+-> expose new Ready assignment
+```
+
+A read chunk already admitted through the atomic gate may finish. An acquired
+but ungated chunk is discarded. A non-atomic “check route, then write headers”
+does not refine this contract.
+
+Graceful shutdown first removes the assignment from routing, closes ingress,
+drains already accepted commands, resolves the one active WAL create,
+publishes every proven result, stops starting maintenance, and allows finished
+content PUTs to become selected or orphaned. It does not delete a Seal or
+FENCE to relinquish ownership.
+
+Forced shutdown can abandon client connections. Recovery determines durable
+outcomes afterward.
+
+
+
+## Final model
+
+The complete recovery equation is:
+
+```text
+CurrentState
+    = LogicalState(newest Seal's inline tree versions)
+      folded with every valid WAL RUN after Seal.through
+      in coordinate and within-RUN order
+```
+
+The complete publication equation is:
+
+```text
+current exact source
+    + exact selected WAL prefix or logically equivalent maintenance
+    + source-carried or successor-fresh immutable children
+    -> one complete exact-successor permanent Seal
+```
+
+The complete deletion rule is:
+
+```text
+delete only when one captured current composition
+proves the object is no longer nameable,
+and no legal successor can resurrect it
+```
+
+The intended system has one flow:
+
+```text
+the Seal commits
+the WAL remembers
+the forest organizes
+the packs carry bytes
+GC removes only what the current composition can no longer name
+```
+
+This design provides us with, a single round trip append, exact failover, atomic protocol facts, bounded incrimental compaction, ordered stream reads, payload seperation all while using only s3 as source of both durability and authority. 
