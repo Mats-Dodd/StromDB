@@ -46,21 +46,6 @@ impl RawObject {
     }
 }
 
-/// Range bytes whose checksum matched the caller's expectation.
-#[derive(Debug, Clone)]
-pub struct VerifiedRangeBytes(bytes::Bytes);
-
-impl VerifiedRangeBytes {
-    pub(crate) const fn new(body: bytes::Bytes) -> Self {
-        Self(body)
-    }
-
-    #[must_use]
-    pub fn body(&self) -> &[u8] {
-        &self.0
-    }
-}
-
 /// One bounded request for one lexicographically ordered list page.
 #[derive(Debug, Clone)]
 pub struct ListPageRequest {

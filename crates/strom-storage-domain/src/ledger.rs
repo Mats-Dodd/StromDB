@@ -4,6 +4,6 @@ mod codec;
 pub(crate) mod key;
 mod record;
 
-pub use codec::{decode_ledger_record, encode_ledger_record};
-pub use key::LedgerKey;
-pub use record::{LedgerRecord, PathTombstone, StreamRecord};
+pub use codec::{decode_stream_record, encode_stream_record};
+pub use key::DirectoryKey;
+pub use record::{DirectoryEntry, LedgerCell, StreamRecord};

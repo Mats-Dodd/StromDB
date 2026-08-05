@@ -2,11 +2,12 @@ use std::num::NonZeroU64;
 
 use strom_domain::{ExpiryPolicy, StreamContentType, StreamId, StreamLifecycle, StreamTtl};
 use strom_storage_domain::{
-    BatchId, BoundedNonEmptyVec, DecodeError, LEDGER_RECORD_BYTES_MAX, LedgerKey, LedgerRecord,
-    OperationFact, OwnerToken, PartitionId, PathTombstone, SEAL_ENCODED_BYTES_MAX, Seal,
-    SealFormat, SealGeneration, SealIdentity, StreamRecord, StreamUid, TreeVersion,
-    WAL_ENCODED_BYTES_MAX, WalFence, WalIdentity, WalObject, WalReplayPoint, WalRun,
-    decode_ledger_record, decode_seal, decode_wal, encode_ledger_record, encode_seal, encode_wal,
+    AttemptId, BatchId, BoundedNonEmptyVec, DecodeError, DirectoryKey, FreshIdentity,
+    OperationFact, OwnerToken, PartitionId, RangeVersion, SEAL_ENCODED_BYTES_MAX,
+    STREAM_RECORD_BYTES_MAX, Seal, SealFormat, SealGeneration, SealIdentity, SortedRun, StoreKind,
+    StreamRecord, StreamUid, TableObjectId, TableRef, TreeVersion, WAL_ENCODED_BYTES_MAX, WalFence,
+    WalIdentity, WalObject, WalReplayPoint, WalRun, decode_seal, decode_stream_record, decode_wal,
+    encode_seal, encode_stream_record, encode_wal,
 };
 
 fn partition() -> Result<PartitionId, strom_storage_domain::PartitionIdError> {
@@ -17,9 +18,9 @@ fn uid(raw: u64) -> Result<StreamUid, strom_storage_domain::ZeroCoordinate> {
     StreamUid::try_from(raw)
 }
 
-fn ledger_key(raw: &str) -> Result<LedgerKey, strom_domain::StreamIdError> {
+fn directory_key(raw: &str) -> Result<DirectoryKey, strom_domain::StreamIdError> {
     raw.parse::<StreamId>()
-        .map(|stream_id| LedgerKey::from(&stream_id))
+        .map(|stream_id| DirectoryKey::from(&stream_id))
 }
 
 fn genesis_seal() -> Result<Seal, Box<dyn std::error::Error>> {
@@ -27,11 +28,12 @@ fn genesis_seal() -> Result<Seal, Box<dyn std::error::Error>> {
         partition()?,
         SealGeneration::genesis(),
         WalReplayPoint::Genesis,
-        SealFormat::V1,
+        SealFormat::V2,
         TreeVersion::empty(),
         TreeVersion::empty(),
         TreeVersion::empty(),
-    ))
+        TreeVersion::empty(),
+    )?)
 }
 
 fn replay_seal() -> Result<Seal, Box<dyn std::error::Error>> {
@@ -43,16 +45,50 @@ fn replay_seal() -> Result<Seal, Box<dyn std::error::Error>> {
             batch: BatchId::try_from(9)?,
             owner,
         },
-        SealFormat::V1,
+        SealFormat::V2,
         TreeVersion::empty(),
         TreeVersion::empty(),
         TreeVersion::empty(),
-    ))
+        TreeVersion::empty(),
+    )?)
+}
+
+fn non_empty_seal() -> Result<Seal, Box<dyn std::error::Error>> {
+    let owner = SealGeneration::genesis();
+    let birth = SealGeneration::try_from(2)?;
+    let generation = SealGeneration::try_from(3)?;
+    let attempt = AttemptId::new(owner, 4);
+    let directory_table = TableRef::new(
+        TableObjectId::new(FreshIdentity::new(birth, attempt, 0)?, StoreKind::Directory),
+        NonZeroU64::new(100).ok_or("table length is nonzero")?,
+    )?;
+    let ledger_table = TableRef::new(
+        TableObjectId::new(FreshIdentity::new(birth, attempt, 1)?, StoreKind::Ledger),
+        NonZeroU64::new(200).ok_or("table length is nonzero")?,
+    )?;
+    let directory =
+        TreeVersion::try_from_ranges(vec![RangeVersion::full(vec![SortedRun::try_from_tables(
+            vec![directory_table],
+        )?])?])?;
+    let ledger =
+        TreeVersion::try_from_ranges(vec![RangeVersion::full(vec![SortedRun::try_from_tables(
+            vec![ledger_table],
+        )?])?])?;
+    Ok(Seal::new(
+        partition()?,
+        generation,
+        WalReplayPoint::Genesis,
+        SealFormat::V2,
+        directory,
+        ledger,
+        TreeVersion::empty(),
+        TreeVersion::empty(),
+    )?)
 }
 
 fn one_fact_run() -> Result<WalObject, Box<dyn std::error::Error>> {
     let fact = OperationFact::StreamCreated {
-        path: ledger_key("events/abc")?,
+        path: directory_key("events/abc")?,
         uid: uid(7)?,
         content_type: "application/json; charset=utf-8".parse()?,
         expiry: ExpiryPolicy::None,
@@ -73,31 +109,41 @@ fn fence() -> Result<WalObject, Box<dyn std::error::Error>> {
     )))
 }
 
-fn live_record(expiry: ExpiryPolicy) -> Result<LedgerRecord, Box<dyn std::error::Error>> {
-    Ok(LedgerRecord::Live(StreamRecord::new(
-        uid(7)?,
+fn live_record(expiry: ExpiryPolicy) -> Result<StreamRecord, Box<dyn std::error::Error>> {
+    Ok(StreamRecord::new(
         "application/json; charset=utf-8".parse()?,
         expiry,
         StreamLifecycle::Closed,
         BatchId::try_from(9)?,
-    )))
+    ))
 }
 
 #[test]
-fn seal_golden_vectors_anchor_both_replay_variants() -> Result<(), Box<dyn std::error::Error>> {
-    let cases: [(Seal, &[u8]); 2] = [
+fn seal_v2_golden_vectors_anchor_empty_and_non_empty_manifests()
+-> Result<(), Box<dyn std::error::Error>> {
+    let cases: [(Seal, &[u8]); 3] = [
         (
             genesis_seal()?,
             &[
-                83, 84, 82, 77, 1, 1, 0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204,
-                221, 238, 255, 1, 0, 1, 109, 40, 168, 72,
+                83, 84, 82, 77, 1, 2, 0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204,
+                221, 238, 255, 1, 0, 2, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 77, 227,
+                224, 170,
             ],
         ),
         (
             replay_seal()?,
             &[
-                83, 84, 82, 77, 1, 1, 0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204,
-                221, 238, 255, 3, 1, 9, 2, 1, 251, 232, 10, 231,
+                83, 84, 82, 77, 1, 2, 0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204,
+                221, 238, 255, 3, 1, 9, 2, 2, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 94,
+                194, 117, 144,
+            ],
+        ),
+        (
+            non_empty_seal()?,
+            &[
+                83, 84, 82, 77, 1, 2, 0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204,
+                221, 238, 255, 3, 0, 2, 1, 1, 3, 1, 1, 2, 1, 4, 0, 1, 100, 1, 1, 3, 1, 1, 2, 1, 4,
+                1, 2, 200, 1, 1, 1, 3, 0, 1, 1, 3, 0, 192, 145, 197, 15,
             ],
         ),
     ];
@@ -114,7 +160,8 @@ fn seal_golden_vectors_anchor_both_replay_variants() -> Result<(), Box<dyn std::
 }
 
 #[test]
-fn wal_golden_vectors_anchor_run_and_fence() -> Result<(), Box<dyn std::error::Error>> {
+fn wal_v1_golden_vectors_prove_directory_key_rename_stability()
+-> Result<(), Box<dyn std::error::Error>> {
     let cases: [(WalObject, &[u8]); 2] = [
         (
             one_fact_run()?,
@@ -146,23 +193,21 @@ fn wal_golden_vectors_anchor_run_and_fence() -> Result<(), Box<dyn std::error::E
 }
 
 #[test]
-fn ledger_golden_vectors_anchor_every_expiry_and_tombstones()
--> Result<(), Box<dyn std::error::Error>> {
+fn stream_record_golden_vectors_anchor_every_expiry() -> Result<(), Box<dyn std::error::Error>> {
     let ttl = StreamTtl::from(NonZeroU64::new(3600).ok_or("3600 is nonzero")?);
-    let cases: [(LedgerRecord, &[u8]); 4] = [
+    let cases: [(StreamRecord, &[u8]); 3] = [
         (
             live_record(ExpiryPolicy::None)?,
             &[
-                0, 7, 31, 97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 106, 115, 111,
-                110, 59, 32, 99, 104, 97, 114, 115, 101, 116, 61, 117, 116, 102, 45, 56, 0, 1, 9,
+                31, 97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 106, 115, 111, 110, 59,
+                32, 99, 104, 97, 114, 115, 101, 116, 61, 117, 116, 102, 45, 56, 0, 1, 9,
             ],
         ),
         (
             live_record(ExpiryPolicy::SlidingTtl(ttl))?,
             &[
-                0, 7, 31, 97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 106, 115, 111,
-                110, 59, 32, 99, 104, 97, 114, 115, 101, 116, 61, 117, 116, 102, 45, 56, 1, 144,
-                28, 1, 9,
+                31, 97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 106, 115, 111, 110, 59,
+                32, 99, 104, 97, 114, 115, 101, 116, 61, 117, 116, 102, 45, 56, 1, 144, 28, 1, 9,
             ],
         ),
         (
@@ -170,26 +215,22 @@ fn ledger_golden_vectors_anchor_every_expiry_and_tombstones()
                 "2030-01-01T00:00:00Z".parse()?,
             ))?,
             &[
-                0, 7, 31, 97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 106, 115, 111,
-                110, 59, 32, 99, 104, 97, 114, 115, 101, 116, 61, 117, 116, 102, 45, 56, 2, 128,
-                128, 168, 221, 230, 140, 244, 198, 52, 1, 9,
+                31, 97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 106, 115, 111, 110, 59,
+                32, 99, 104, 97, 114, 115, 101, 116, 61, 117, 116, 102, 45, 56, 2, 128, 128, 168,
+                221, 230, 140, 244, 198, 52, 1, 9,
             ],
-        ),
-        (
-            LedgerRecord::Tombstone(PathTombstone::new(uid(7)?)),
-            &[1, 7],
         ),
     ];
     for (record, expected) in cases {
-        let encoded = encode_ledger_record(&record)?;
+        let encoded = encode_stream_record(&record)?;
         assert_eq!(
             encoded, expected,
-            "Ledger bytes are a durable format anchor"
+            "StreamRecord bytes are a durable format anchor"
         );
         assert_eq!(
-            decode_ledger_record(expected)?,
+            decode_stream_record(expected)?,
             record,
-            "golden Ledger bytes must decode independently of the encoder"
+            "golden StreamRecord bytes must decode independently of the encoder"
         );
     }
     Ok(())
@@ -290,10 +331,10 @@ fn decoders_reject_trailing_bytes_and_location_identity_mismatches()
     );
 
     let record = live_record(ExpiryPolicy::None)?;
-    let mut row = encode_ledger_record(&record)?;
+    let mut row = encode_stream_record(&record)?;
     row.push(0);
     assert_eq!(
-        decode_ledger_record(&row),
+        decode_stream_record(&row),
         Err(DecodeError::TrailingBytes { bytes_actual: 1 }),
         "frameless rows are canonical postcard values too"
     );
@@ -320,7 +361,7 @@ fn every_decoder_rejects_over_bound_input_before_parsing() -> Result<(), Box<dyn
         Err(DecodeError::EncodedBytesOverMax { .. })
     ));
     assert!(matches!(
-        decode_ledger_record(&vec![0; LEDGER_RECORD_BYTES_MAX.saturating_add(1)]),
+        decode_stream_record(&vec![0; STREAM_RECORD_BYTES_MAX.saturating_add(1)]),
         Err(DecodeError::EncodedBytesOverMax { .. })
     ));
     Ok(())
@@ -336,16 +377,15 @@ fn canonical_content_type_boundary_roundtrips_through_storage()
         strom_domain::CONTENT_TYPE_BYTES_MAX,
         "the accepted boundary value has an in-bound canonical spelling"
     );
-    let record = LedgerRecord::Live(StreamRecord::new(
-        uid(1)?,
+    let record = StreamRecord::new(
         content_type,
         ExpiryPolicy::None,
         StreamLifecycle::Open,
         BatchId::try_from(1)?,
-    ));
-    let encoded = encode_ledger_record(&record)?;
+    );
+    let encoded = encode_stream_record(&record)?;
     assert_eq!(
-        decode_ledger_record(&encoded)?,
+        decode_stream_record(&encoded)?,
         record,
         "every accepted content type must remain parseable after durable canonicalization"
     );

@@ -9,7 +9,6 @@ use serde::Serialize;
 pub struct PartitionId([u8; 16]);
 
 impl PartitionId {
-    #[cfg(test)]
     #[must_use]
     pub(crate) const fn as_bytes(&self) -> &[u8; 16] {
         &self.0

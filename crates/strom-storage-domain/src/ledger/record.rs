@@ -5,15 +5,14 @@ use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
 
 use crate::{BatchId, StreamUid};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub enum LedgerRecord {
-    Live(StreamRecord),
-    Tombstone(PathTombstone),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryEntry {
+    Live(StreamUid),
+    Tombstone(StreamUid),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamRecord {
-    uid: StreamUid,
     content_type: StreamContentType,
     expiry: ExpiryPolicy,
     lifecycle: StreamLifecycle,
@@ -21,31 +20,24 @@ pub struct StreamRecord {
 }
 
 const _: () = assert!(
-    size_of::<StreamRecord>() == 64,
-    "a live ledger row is what resident-state scans touch; it stays within one cache line"
+    size_of::<StreamRecord>() == 56,
+    "a resident stream record has no repeated StreamUid"
 );
 
 impl StreamRecord {
     #[must_use]
     pub const fn new(
-        uid: StreamUid,
         content_type: StreamContentType,
         expiry: ExpiryPolicy,
         lifecycle: StreamLifecycle,
         created_at: BatchId,
     ) -> Self {
         Self {
-            uid,
             content_type,
             expiry,
             lifecycle,
             created_at,
         }
-    }
-
-    #[must_use]
-    pub const fn uid(&self) -> StreamUid {
-        self.uid
     }
 
     #[must_use]
@@ -69,19 +61,8 @@ impl StreamRecord {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct PathTombstone {
-    uid: StreamUid,
-}
-
-impl PathTombstone {
-    #[must_use]
-    pub const fn new(uid: StreamUid) -> Self {
-        Self { uid }
-    }
-
-    #[must_use]
-    pub const fn uid(self) -> StreamUid {
-        self.uid
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LedgerCell {
+    Value(StreamRecord),
+    Delete,
 }

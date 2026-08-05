@@ -3,22 +3,22 @@
 use serde::Serialize;
 use strom_domain::{ExpiryPolicy, StreamContentType};
 
-use crate::{LedgerKey, StreamUid};
+use crate::{DirectoryKey, StreamUid};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum OperationFact {
     StreamCreated {
-        path: LedgerKey,
+        path: DirectoryKey,
         uid: StreamUid,
         content_type: StreamContentType,
         expiry: ExpiryPolicy,
     },
     StreamClosed {
-        path: LedgerKey,
+        path: DirectoryKey,
         uid: StreamUid,
     },
     StreamDeleted {
-        path: LedgerKey,
+        path: DirectoryKey,
         uid: StreamUid,
     },
 }

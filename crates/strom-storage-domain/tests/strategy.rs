@@ -2,7 +2,7 @@
 
 use proptest::prelude::*;
 use strom_storage_domain::{
-    decode_ledger_record, decode_seal, decode_wal, encode_ledger_record, encode_seal, encode_wal,
+    decode_seal, decode_stream_record, decode_wal, encode_seal, encode_stream_record, encode_wal,
     strategy,
 };
 
@@ -26,13 +26,13 @@ proptest! {
     }
 
     #[test]
-    fn generated_ledger_records_roundtrip_through_the_durable_codec(
-        record in strategy::ledger_record(),
+    fn generated_stream_records_roundtrip_through_the_durable_codec(
+        record in strategy::stream_record(),
     ) {
-        let encoded = encode_ledger_record(&record);
+        let encoded = encode_stream_record(&record);
         prop_assert!(encoded.is_ok());
         if let Ok(encoded) = encoded {
-            prop_assert_eq!(decode_ledger_record(&encoded), Ok(record));
+            prop_assert_eq!(decode_stream_record(&encoded), Ok(record));
         }
     }
 }

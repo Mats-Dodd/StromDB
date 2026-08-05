@@ -12,13 +12,13 @@ use object_store::aws::AmazonS3Builder;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{
-    ClientOptions, GetOptions, GetRange, ObjectStore, ObjectStoreExt as _, PutMode, PutOptions,
-    PutPayload, RetryConfig,
+    ClientOptions, GetOptions, ObjectStore, ObjectStoreExt as _, PutMode, PutOptions, PutPayload,
+    RetryConfig,
 };
 
-use crate::bytes::{ByteBound, ByteRange, Checksum, Etag, FrozenBytes};
+use crate::bytes::{ByteBound, Etag, FrozenBytes};
 use crate::error::{S3ConfigError, StoreContradiction, StoreError};
-use crate::evidence::{CreateEvidence, ListPage, ListPageRequest, RawObject, VerifiedRangeBytes};
+use crate::evidence::{CreateEvidence, ListPage, ListPageRequest, RawObject};
 use crate::key::ObjectKey;
 
 /// Explicit S3 client configuration (stromstyle §6: options are spelled out).
@@ -169,65 +169,9 @@ impl ObjectStoreAdapter {
                         },
                     ));
                 }
-                let etag = require_etag(observation.meta.e_tag.clone())?;
-                let body = observation
-                    .bytes()
+                consume_bounded_object(key, bytes_max, observation)
                     .await
-                    .map_err(|source| map_operation_error(&source))?;
-                Ok(Some(RawObject::new(body, etag)))
-            }
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(source) => Err(map_operation_error(&source)),
-        }
-    }
-
-    /// Read one authenticated byte range and verify its checksum.
-    ///
-    /// # Errors
-    ///
-    /// A short read or a checksum mismatch is a [`StoreError::Contradiction`];
-    /// transport trouble is [`StoreError::Retryable`]. Absence is `Ok(None)`.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "usize always fits in u64 on supported targets"
-    )]
-    pub async fn read_range(
-        &self,
-        key: &ObjectKey,
-        range: ByteRange,
-        expected: Checksum,
-    ) -> Result<Option<VerifiedRangeBytes>, StoreError> {
-        let location = key.to_store_path();
-        let options = GetOptions {
-            range: Some(GetRange::Bounded(range.start()..range.end_exclusive())),
-            ..GetOptions::default()
-        };
-        match self.store.get_opts(&location, options).await {
-            Ok(observation) => {
-                let body = observation
-                    .bytes()
-                    .await
-                    .map_err(|source| map_operation_error(&source))?;
-                let bytes_actual =
-                    u64::try_from(body.len()).expect("usize fits in u64 on supported platforms");
-                if bytes_actual != range.length() {
-                    return Err(StoreError::Contradiction(StoreContradiction::ShortRange {
-                        key: key.clone(),
-                        bytes_expected: range.length(),
-                        bytes_actual,
-                    }));
-                }
-                let actual = Checksum::compute(&body);
-                if actual != expected {
-                    return Err(StoreError::Contradiction(
-                        StoreContradiction::ChecksumMismatch {
-                            key: key.clone(),
-                            expected,
-                            actual,
-                        },
-                    ));
-                }
-                Ok(Some(VerifiedRangeBytes::new(body)))
+                    .map(Some)
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(source) => Err(map_operation_error(&source)),
@@ -322,6 +266,39 @@ impl ObjectStoreAdapter {
     }
 }
 
+async fn consume_bounded_object(
+    key: &ObjectKey,
+    bytes_max: ByteBound,
+    observation: object_store::GetResult,
+) -> Result<RawObject, StoreError> {
+    let etag = require_etag(observation.meta.e_tag.clone())?;
+    let mut body = bytes::BytesMut::new();
+    let mut stream = observation.into_stream();
+    let mut bytes_observed = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|source| map_operation_error(&source))?;
+        let chunk_bytes = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        let bytes_remaining = bytes_max
+            .get()
+            .checked_sub(bytes_observed)
+            .expect("the running byte count never exceeds the bound");
+        if chunk_bytes > bytes_remaining {
+            return Err(StoreError::Contradiction(
+                StoreContradiction::OversizedObject {
+                    key: key.clone(),
+                    bytes_max: bytes_max.get(),
+                    bytes_actual: bytes_max.get().saturating_add(1),
+                },
+            ));
+        }
+        bytes_observed = bytes_observed
+            .checked_add(chunk_bytes)
+            .expect("an accepted chunk fits inside the u64 byte bound");
+        body.extend_from_slice(&chunk);
+    }
+    Ok(RawObject::new(body.freeze(), etag))
+}
+
 fn require_etag(observed: Option<String>) -> Result<Etag, StoreError> {
     let raw = observed.ok_or_else(|| StoreError::Rejected {
         detail: "backend returned no etag for an observed object".to_owned(),
@@ -357,5 +334,40 @@ fn map_operation_error(source: &object_store::Error) -> StoreError {
         _ => StoreError::Retryable {
             detail: source.to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn body_bound_overrules_dishonest_in_bound_metadata() {
+        let store = InMemory::new();
+        let location = Path::from("dishonest");
+        store
+            .put(&location, PutPayload::from_static(b"six bytes"))
+            .await
+            .expect("test body stores");
+        let mut observation = store.get(&location).await.expect("test body reads");
+        observation.meta.size = 1;
+        let key: ObjectKey = "dishonest".parse().expect("test key is canonical");
+        let bound = ByteBound::try_from(5).expect("test bound is nonzero");
+
+        let outcome = consume_bounded_object(&key, bound, observation).await;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(StoreError::Contradiction(
+                    StoreContradiction::OversizedObject {
+                        bytes_max: 5,
+                        bytes_actual: 6,
+                        ..
+                    }
+                ))
+            ),
+            "the stream stops at the first byte beyond the bound, got {outcome:?}"
+        );
     }
 }

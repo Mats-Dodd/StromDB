@@ -8,9 +8,9 @@ use serde::{Deserialize, Deserializer};
 use super::{BatchId, BoundedNonEmptyVec, OperationFact, WalFence, WalIdentity, WalObject, WalRun};
 use crate::bounds::{WAL_ENCODED_BYTES_MAX, WAL_RUN_FACTS_MAX};
 use crate::envelope::{DecodeError, EncodeError, ObjectKind, decode_frame, encode_frame};
-use crate::ledger::key::LedgerKeyWire;
+use crate::ledger::key::DirectoryKeyWire;
 use crate::wire::{ExpiryPolicyWire, parse_content_type};
-use crate::{LedgerKey, OwnerToken, PartitionId, SealGeneration, StreamUid};
+use crate::{DirectoryKey, OwnerToken, PartitionId, SealGeneration, StreamUid};
 
 const VERSION: u8 = 1;
 
@@ -175,17 +175,17 @@ impl<'de> Visitor<'de> for BoundedFactsVisitor {
 #[cfg_attr(test, derive(serde::Serialize))]
 enum OperationFactWire {
     Created {
-        path: Vec<u8>,
+        path: DirectoryKeyWire,
         uid: u64,
         content_type: String,
         expiry: ExpiryPolicyWire,
     },
     Closed {
-        path: Vec<u8>,
+        path: DirectoryKeyWire,
         uid: u64,
     },
     Deleted {
-        path: Vec<u8>,
+        path: DirectoryKeyWire,
         uid: u64,
     },
 }
@@ -201,17 +201,17 @@ impl TryFrom<OperationFactWire> for OperationFact {
                 content_type,
                 expiry,
             } => Ok(Self::StreamCreated {
-                path: LedgerKey::try_from(LedgerKeyWire::from(path))?,
+                path: DirectoryKey::try_from(path)?,
                 uid: parse_uid(uid)?,
                 content_type: parse_content_type(&content_type)?,
                 expiry: strom_domain::ExpiryPolicy::try_from(expiry)?,
             }),
             OperationFactWire::Closed { path, uid } => Ok(Self::StreamClosed {
-                path: LedgerKey::try_from(LedgerKeyWire::from(path))?,
+                path: DirectoryKey::try_from(path)?,
                 uid: parse_uid(uid)?,
             }),
             OperationFactWire::Deleted { path, uid } => Ok(Self::StreamDeleted {
-                path: LedgerKey::try_from(LedgerKeyWire::from(path))?,
+                path: DirectoryKey::try_from(path)?,
                 uid: parse_uid(uid)?,
             }),
         }
@@ -331,7 +331,7 @@ mod tests {
                 1,
                 1,
                 vec![OperationFactWire::Deleted {
-                    path: b"events/abc".to_vec(),
+                    path: b"events/abc".to_vec().into(),
                     uid: 0,
                 }],
             ),
@@ -340,7 +340,7 @@ mod tests {
                 1,
                 1,
                 vec![OperationFactWire::Deleted {
-                    path: b"events//abc".to_vec(),
+                    path: b"events//abc".to_vec().into(),
                     uid: 1,
                 }],
             ),
@@ -349,7 +349,7 @@ mod tests {
                 1,
                 1,
                 vec![OperationFactWire::Created {
-                    path: b"events/abc".to_vec(),
+                    path: b"events/abc".to_vec().into(),
                     uid: 1,
                     content_type: String::from("not-a-media-type"),
                     expiry: ExpiryPolicyWire::None,
@@ -360,7 +360,7 @@ mod tests {
                 1,
                 1,
                 vec![OperationFactWire::Created {
-                    path: b"events/abc".to_vec(),
+                    path: b"events/abc".to_vec().into(),
                     uid: 1,
                     content_type: String::from("application/octet-stream"),
                     expiry: ExpiryPolicyWire::SlidingTtl(0),
@@ -398,7 +398,7 @@ mod tests {
     fn deleted_facts(count: usize) -> Vec<OperationFactWire> {
         (0..count)
             .map(|_ordinal| OperationFactWire::Deleted {
-                path: b"events/abc".to_vec(),
+                path: b"events/abc".to_vec().into(),
                 uid: 1,
             })
             .collect()

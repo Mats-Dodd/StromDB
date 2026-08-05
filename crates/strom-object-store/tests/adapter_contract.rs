@@ -3,8 +3,8 @@
 //! S3 endpoint.
 
 use strom_object_store::{
-    ByteBound, ByteRange, Checksum, CreateEvidence, FrozenBytes, KeysBound, ListPageRequest,
-    ObjectKey, ObjectStoreAdapter, StoreContradiction, StoreError,
+    ByteBound, CreateEvidence, FrozenBytes, KeysBound, ListPageRequest, ObjectKey,
+    ObjectStoreAdapter, StoreContradiction, StoreError,
 };
 
 fn page_request(
@@ -126,58 +126,6 @@ async fn oversized_object_is_a_contradiction_not_a_download() {
         ),
         "a body above the caller's bound fails closed, got {outcome:?}"
     );
-}
-
-#[tokio::test]
-async fn range_read_verifies_checksum_and_rejects_a_wrong_expectation() {
-    let adapter = ObjectStoreAdapter::in_memory();
-    let coordinate = key("partition/p1/table/v1/ledger/1/1/0");
-    let full = b"headerBLOCK-A-BYTESfooter";
-    adapter
-        .create_if_absent(&coordinate, body(full))
-        .await
-        .expect("create runs");
-
-    let block = &full[6..19];
-    let range = ByteRange::try_from((6, 13)).expect("legal range parses");
-
-    let verified = adapter
-        .read_range(&coordinate, range, Checksum::compute(block))
-        .await
-        .expect("range read runs")
-        .expect("range exists");
-    assert_eq!(
-        verified.body(),
-        block,
-        "verified bytes are exactly the requested range"
-    );
-
-    let wrong = Checksum::from(Checksum::compute(block).value() ^ 1);
-    let outcome = adapter.read_range(&coordinate, range, wrong).await;
-    assert!(
-        matches!(
-            outcome,
-            Err(StoreError::Contradiction(
-                StoreContradiction::ChecksumMismatch { .. }
-            ))
-        ),
-        "a checksum off by one bit fails closed, got {outcome:?}"
-    );
-}
-
-#[tokio::test]
-async fn range_read_of_an_absent_object_is_none() {
-    let adapter = ObjectStoreAdapter::in_memory();
-    let range = ByteRange::try_from((0, 8)).expect("legal range parses");
-    let outcome = adapter
-        .read_range(
-            &key("partition/p1/pack/v1/absent"),
-            range,
-            Checksum::from(0),
-        )
-        .await
-        .expect("range read runs");
-    assert!(outcome.is_none(), "absence is Ok(None), not an error");
 }
 
 #[tokio::test]

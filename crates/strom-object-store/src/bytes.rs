@@ -1,5 +1,4 @@
-//! Byte-plane vocabulary: frozen candidate bodies, read bounds, authenticated
-//! ranges, checksums, and validators.
+//! Byte-plane vocabulary: frozen candidate bodies, read bounds, and validators.
 
 use std::fmt;
 use std::num::NonZeroU64;
@@ -87,87 +86,6 @@ impl TryFrom<u64> for ByteBound {
 #[error("byte bound is zero")]
 pub struct ZeroByteBound;
 
-/// A non-empty, overflow-checked byte range inside one object.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ByteRange {
-    start: u64,
-    length: NonZeroU64,
-    end_exclusive: u64,
-}
-
-impl ByteRange {
-    #[must_use]
-    pub const fn start(self) -> u64 {
-        self.start
-    }
-
-    #[must_use]
-    pub const fn length(self) -> u64 {
-        self.length.get()
-    }
-
-    #[must_use]
-    pub const fn end_exclusive(self) -> u64 {
-        self.end_exclusive
-    }
-}
-
-impl TryFrom<(u64, u64)> for ByteRange {
-    type Error = ByteRangeError;
-
-    fn try_from((start, length): (u64, u64)) -> Result<Self, Self::Error> {
-        let length = NonZeroU64::new(length).ok_or(ByteRangeError::ZeroLength)?;
-        let end_exclusive = start
-            .checked_add(length.get())
-            .ok_or(ByteRangeError::EndOverflow {
-                start,
-                length: length.get(),
-            })?;
-        Ok(Self {
-            start,
-            length,
-            end_exclusive,
-        })
-    }
-}
-
-/// Why a `(start, length)` pair is not a legal byte range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ByteRangeError {
-    #[error("byte range has zero length")]
-    ZeroLength,
-    #[error("byte range {start}+{length} overflows the address space")]
-    EndOverflow { start: u64, length: u64 },
-}
-
-/// A CRC-32C checksum over one bounded byte span.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Checksum(u32);
-
-impl Checksum {
-    #[must_use]
-    pub fn compute(body: &[u8]) -> Self {
-        Self(crc32c::crc32c(body))
-    }
-
-    #[must_use]
-    pub const fn value(self) -> u32 {
-        self.0
-    }
-}
-
-impl From<u32> for Checksum {
-    fn from(raw: u32) -> Self {
-        Self(raw)
-    }
-}
-
-impl fmt::Display for Checksum {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:08x}", self.0)
-    }
-}
-
 /// The backend's opaque validator for one observed object version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Etag(String);
@@ -204,41 +122,6 @@ pub struct EmptyEtag;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn checksum_matches_the_crc32c_check_value() {
-        // Spec anchor: the CRC-32C (Castagnoli) check value for the ASCII
-        // bytes "123456789" is 0xE3069283 (RFC 3720, appendix B.4).
-        let checksum = Checksum::compute(b"123456789");
-        assert_eq!(
-            0xE306_9283,
-            checksum.value(),
-            "CRC-32C check value must hold"
-        );
-    }
-
-    #[test]
-    fn byte_range_rejects_zero_length_and_overflow() {
-        assert_eq!(
-            Err(ByteRangeError::ZeroLength),
-            ByteRange::try_from((7, 0)),
-            "zero length is illegal"
-        );
-        assert_eq!(
-            Err(ByteRangeError::EndOverflow {
-                start: u64::MAX,
-                length: 1
-            }),
-            ByteRange::try_from((u64::MAX, 1)),
-            "an end past the address space is illegal"
-        );
-    }
-
-    #[test]
-    fn byte_range_end_is_exclusive() {
-        let range = ByteRange::try_from((10, 5)).expect("legal range parses");
-        assert_eq!(15, range.end_exclusive(), "end must be start plus length");
-    }
 
     #[test]
     fn empty_bodies_and_zero_bounds_are_rejected() {

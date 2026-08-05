@@ -15,13 +15,9 @@ mod key;
 
 pub use adapter::{ObjectStoreAdapter, S3Config, S3Credentials};
 pub use bounds::{KEY_BYTES_MAX, LIST_KEYS_MAX, PUT_BYTES_MAX};
-pub use bytes::{
-    ByteBound, ByteRange, ByteRangeError, Checksum, EmptyEtag, Etag, FrozenBytes, FrozenBytesError,
-    ZeroByteBound,
-};
+pub use bytes::{ByteBound, EmptyEtag, Etag, FrozenBytes, FrozenBytesError, ZeroByteBound};
 pub use error::{S3ConfigError, StoreContradiction, StoreError};
 pub use evidence::{
     CreateEvidence, KeysBound, KeysBoundError, ListPage, ListPageRequest, RawObject,
-    VerifiedRangeBytes,
 };
 pub use key::{ObjectKey, ObjectKeyError};

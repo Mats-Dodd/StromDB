@@ -4,8 +4,8 @@ use std::num::NonZeroU64;
 use proptest::prelude::*;
 use strom_domain::StreamId;
 use strom_storage_domain::{
-    BatchId, BoundedNonEmptyVec, BoundedNonEmptyVecError, CoordinateExhausted, KeySpellingError,
-    LedgerKey, PartitionId, PartitionIdError, SealGeneration, SealIdentity, SealKey,
+    BatchId, BoundedNonEmptyVec, BoundedNonEmptyVecError, CoordinateExhausted, DirectoryKey,
+    KeySpellingError, PartitionId, PartitionIdError, SealGeneration, SealIdentity, SealKey,
     WAL_RUN_FACTS_MAX, WalIdentity, WalKey,
 };
 
@@ -155,7 +155,7 @@ fn malformed_durable_key_spellings_fail_closed() {
 
 proptest! {
     #[test]
-    fn ledger_key_order_is_stream_id_utf8_byte_order(
+    fn directory_key_order_is_stream_id_utf8_byte_order(
         left_segments in prop::collection::vec("[a-z0-9_-]{1,8}", 1..4),
         right_segments in prop::collection::vec("[a-z0-9_-]{1,8}", 1..4),
     ) {
@@ -165,8 +165,8 @@ proptest! {
         let right_stream = right_raw.parse::<StreamId>();
         prop_assert!(left_stream.is_ok() && right_stream.is_ok());
         if let (Ok(left_stream), Ok(right_stream)) = (left_stream, right_stream) {
-            let left_key = LedgerKey::from(&left_stream);
-            let right_key = LedgerKey::from(&right_stream);
+            let left_key = DirectoryKey::from(&left_stream);
+            let right_key = DirectoryKey::from(&right_stream);
             prop_assert_eq!(left_key.cmp(&right_key), left_raw.as_bytes().cmp(right_raw.as_bytes()));
         }
     }

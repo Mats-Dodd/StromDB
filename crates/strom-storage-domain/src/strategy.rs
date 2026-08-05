@@ -5,9 +5,9 @@ use std::num::NonZeroU64;
 use proptest::prelude::{Just, Strategy, prop_oneof};
 
 use crate::{
-    BatchId, BoundedNonEmptyVec, LedgerKey, LedgerRecord, OperationFact, OwnerToken, PartitionId,
-    PathTombstone, Seal, SealFormat, SealGeneration, StreamRecord, StreamUid, TreeVersion,
-    WalFence, WalObject, WalReplayPoint, WalRun,
+    BatchId, BoundedNonEmptyVec, DirectoryKey, OperationFact, OwnerToken, PartitionId, Seal,
+    SealFormat, SealGeneration, StreamRecord, StreamUid, TreeVersion, WalFence, WalObject,
+    WalReplayPoint, WalRun,
 };
 
 pub fn partition_id() -> impl Strategy<Value = PartitionId> {
@@ -46,14 +46,14 @@ pub fn stream_uid() -> impl Strategy<Value = StreamUid> {
     })
 }
 
-pub fn ledger_key() -> impl Strategy<Value = LedgerKey> {
-    strom_domain::strategy::stream_id().prop_map(|stream_id| LedgerKey::from(&stream_id))
+pub fn directory_key() -> impl Strategy<Value = DirectoryKey> {
+    strom_domain::strategy::stream_id().prop_map(|stream_id| DirectoryKey::from(&stream_id))
 }
 
 pub fn operation_fact() -> impl Strategy<Value = OperationFact> {
     prop_oneof![
         (
-            ledger_key(),
+            directory_key(),
             stream_uid(),
             strom_domain::strategy::stream_content_type(),
             strom_domain::strategy::expiry_policy(),
@@ -66,9 +66,9 @@ pub fn operation_fact() -> impl Strategy<Value = OperationFact> {
                     expiry,
                 }
             ),
-        (ledger_key(), stream_uid())
+        (directory_key(), stream_uid())
             .prop_map(|(path, uid)| OperationFact::StreamClosed { path, uid }),
-        (ledger_key(), stream_uid())
+        (directory_key(), stream_uid())
             .prop_map(|(path, uid)| OperationFact::StreamDeleted { path, uid }),
     ]
 }
@@ -100,41 +100,36 @@ pub fn seal() -> impl Strategy<Value = Seal> {
         seal_generation(),
         proptest::option::of((batch_id(), owner_token())),
     )
-        .prop_map(|(partition, generation, replay)| {
-            let replay = match replay {
-                Some((batch, owner)) => WalReplayPoint::Through { batch, owner },
-                None => WalReplayPoint::Genesis,
-            };
-            Seal::new(
-                partition,
-                generation,
-                replay,
-                SealFormat::V1,
-                TreeVersion::empty(),
-                TreeVersion::empty(),
-                TreeVersion::empty(),
-            )
-        })
+        .prop_filter_map(
+            "canonical empty trees always form a V2 Seal",
+            |(partition, generation, replay)| {
+                let replay = match replay {
+                    Some((batch, owner)) => WalReplayPoint::Through { batch, owner },
+                    None => WalReplayPoint::Genesis,
+                };
+                Seal::new(
+                    partition,
+                    generation,
+                    replay,
+                    SealFormat::V2,
+                    TreeVersion::empty(),
+                    TreeVersion::empty(),
+                    TreeVersion::empty(),
+                    TreeVersion::empty(),
+                )
+                .ok()
+            },
+        )
 }
 
-pub fn ledger_record() -> impl Strategy<Value = LedgerRecord> {
-    prop_oneof![
-        (
-            stream_uid(),
-            strom_domain::strategy::stream_content_type(),
-            strom_domain::strategy::expiry_policy(),
-            strom_domain::strategy::stream_lifecycle(),
-            batch_id(),
-        )
-            .prop_map(|(uid, content_type, expiry, lifecycle, created_at)| {
-                LedgerRecord::Live(StreamRecord::new(
-                    uid,
-                    content_type,
-                    expiry,
-                    lifecycle,
-                    created_at,
-                ))
-            }),
-        stream_uid().prop_map(|uid| LedgerRecord::Tombstone(PathTombstone::new(uid))),
-    ]
+pub fn stream_record() -> impl Strategy<Value = StreamRecord> {
+    (
+        strom_domain::strategy::stream_content_type(),
+        strom_domain::strategy::expiry_policy(),
+        strom_domain::strategy::stream_lifecycle(),
+        batch_id(),
+    )
+        .prop_map(|(content_type, expiry, lifecycle, created_at)| {
+            StreamRecord::new(content_type, expiry, lifecycle, created_at)
+        })
 }

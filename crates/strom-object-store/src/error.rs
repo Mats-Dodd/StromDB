@@ -1,6 +1,5 @@
 //! Failure vocabulary, shaped by the caller's decisions (stromstyle §3).
 
-use crate::bytes::Checksum;
 use crate::key::ObjectKey;
 
 /// A failed adapter operation.
@@ -30,13 +29,6 @@ pub enum StoreContradiction {
         bytes_max: u64,
         bytes_actual: u64,
     },
-    /// Authenticated range bytes did not match their expected checksum.
-    #[error("object {key} range checksum is {actual}; expected {expected}")]
-    ChecksumMismatch {
-        key: ObjectKey,
-        expected: Checksum,
-        actual: Checksum,
-    },
     /// A listing surfaced a noncanonical key under an owned prefix.
     #[error("listed key {listed:?} is not canonical: {detail}")]
     ForeignKey { listed: String, detail: String },
@@ -45,13 +37,6 @@ pub enum StoreContradiction {
     UnorderedList {
         previous: ObjectKey,
         listed: ObjectKey,
-    },
-    /// The range read returned a different byte count than requested.
-    #[error("object {key} range returned {bytes_actual} bytes; expected {bytes_expected}")]
-    ShortRange {
-        key: ObjectKey,
-        bytes_expected: u64,
-        bytes_actual: u64,
     },
 }
 
