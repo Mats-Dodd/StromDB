@@ -104,7 +104,7 @@ create is both manifest publication and transaction commit: children written
 before it are either selected together or remain unreachable garbage. There
 is no intermediate root object.
 
-## 4. Protocol state and physical projections
+## 4. protocol state and physical projections
 
 The public protocol exposes one stream abstraction. The engine represents its
 state through three ordered projections because their workloads differ. They
@@ -112,7 +112,7 @@ are not three transactions or three authorities. One `OperationFact` can
 change all three atomically at one WAL coordinate.
 
 
-### 4.1 Ledger: ordered identity and lifecycle
+### 4.1 ledger: ordered identity and lifecycle
 
 
 Ledger is keyed primarily by canonical stream path and stores cold identity:
@@ -135,9 +135,8 @@ Path tombstones are permanent logical values because the protocol discourages
 reusing a deleted stream URL. Compaction does not silently erase that fact.
 
 
-### 4.2 Tally: current state and admission
 
-### 4.2 Tally: current state and admission
+### 4.2 tally: current state and admission
 
 NB the exact semantics/ layout of the tally LSM are still subejct to change by a further RFC.  They still adhere to the currect correctness protocol though. 
 
@@ -173,7 +172,7 @@ owned_unique_referenced_*  canonical Annals bytes/extents owned by this
 Forking increases logical visibility but creates no duplicate Annals row and
 therefore adds no owned-unique bytes.
 
-### 4.3 Annals: ordered retained history
+### 4.3 annals: ordered retained history
 
 NB the exact semantics/ layout of the tally LSM are still subejct to change by a further RFC.  They still adhere to the currect correctness protocol though. 
 
@@ -237,7 +236,7 @@ GETs may reconcile the same frozen bytes after an ambiguous response. Content
 objects such as SSTs and packs may use create-or-verify because their presence
 alone grants no authority.
 
-## 6. Durable namespace and identities
+## 6. durable namespace and identities
 
 Keys are canonical, versioned, and derived from domain identities. The shape
 is conceptually:
