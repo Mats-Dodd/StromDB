@@ -1,6 +1,11 @@
 # StromDB
 
-StromDB is a database project written in Rust.
+StromDB is a durable streams db.  The goal for the project is to offer both an embeddable library as well as a http server binary that serve the protocol, using only s3 as the durable source of truth.  
+
+All development happens through the rfc process.  existing RFC's can be found in [docs/rfcs.md](docs/rfcs.md).  An initial sketch of the architecture is available in our architecture doc at [docs/architecture.md](docs/architecture.md).  It is in no way canonical and is guarentee to change as this project develops.  
+
+The project is pre alpha software.  It is under active development and all design decisions, api surface and implementation details are subject to significant change.  
+
 
 ## Development
 
