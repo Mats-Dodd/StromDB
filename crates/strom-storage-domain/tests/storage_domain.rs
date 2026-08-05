@@ -4,9 +4,10 @@ use std::num::NonZeroU64;
 use proptest::prelude::*;
 use strom_domain::StreamId;
 use strom_storage_domain::{
-    BatchId, BoundedNonEmptyVec, BoundedNonEmptyVecError, CoordinateExhausted, DirectoryKey,
-    KeySpellingError, PartitionId, PartitionIdError, SealGeneration, SealIdentity, SealKey,
-    WAL_RUN_FACTS_MAX, WalIdentity, WalKey,
+    AttemptId, BatchId, BoundedNonEmptyVec, BoundedNonEmptyVecError, CoordinateExhausted,
+    DirectoryKey, FreshIdentity, KeySpellingError, PartitionId, PartitionIdError, SealGeneration,
+    SealIdentity, SealKey, StoreKind, TableKey, TableObjectId, WAL_RUN_FACTS_MAX, WalIdentity,
+    WalKey,
 };
 
 #[test]
@@ -149,6 +150,68 @@ fn malformed_durable_key_spellings_fail_closed() {
             raw.parse::<SealKey>(),
             Err(expected),
             "noncanonical durable key must be rejected: {raw}"
+        );
+    }
+}
+
+#[test]
+fn table_key_golden_spellings_anchor_every_store() -> Result<(), Box<dyn std::error::Error>> {
+    let partition: PartitionId = "00112233-4455-6677-8899-aabbccddeeff".parse()?;
+    let fresh = FreshIdentity::new(
+        SealGeneration::try_from(2)?,
+        AttemptId::new(SealGeneration::genesis(), 4),
+        7,
+    )?;
+    let cases = [
+        (
+            StoreKind::Directory,
+            "partition/00112233-4455-6677-8899-aabbccddeeff/table/v1/directory/00000000000000000002/00000000000000000001-00000000000000000004/0000000007",
+        ),
+        (
+            StoreKind::Ledger,
+            "partition/00112233-4455-6677-8899-aabbccddeeff/table/v1/ledger/00000000000000000002/00000000000000000001-00000000000000000004/0000000007",
+        ),
+        (
+            StoreKind::Tally,
+            "partition/00112233-4455-6677-8899-aabbccddeeff/table/v1/tally/00000000000000000002/00000000000000000001-00000000000000000004/0000000007",
+        ),
+        (
+            StoreKind::Annals,
+            "partition/00112233-4455-6677-8899-aabbccddeeff/table/v1/annals/00000000000000000002/00000000000000000001-00000000000000000004/0000000007",
+        ),
+    ];
+    for (store, expected) in cases {
+        let key = TableKey::new(partition, TableObjectId::new(fresh, store));
+        assert_eq!(
+            key.to_string(),
+            expected,
+            "each store has one lowercase spelling"
+        );
+        assert_eq!(
+            expected.parse::<TableKey>()?,
+            key,
+            "the golden key roundtrips"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn malformed_table_key_spellings_fail_closed() {
+    let valid = "partition/00112233-4455-6677-8899-aabbccddeeff/table/v1/directory/00000000000000000002/00000000000000000001-00000000000000000004/0000000007";
+    let cases = [
+        valid.replace("directory", "Directory"),
+        valid.replace("00000000000000000002", "0000000000000000002"),
+        valid.replace("00000000000000000004", "+0000000000000000004"),
+        valid.replace("0000000007", "00000000007"),
+        valid.replace("0000000007", "4294967296"),
+        valid.replace("00000000000000000002", "00000000000000000000"),
+        format!("{valid}/extra"),
+    ];
+    for malformed in cases {
+        assert!(
+            malformed.parse::<TableKey>().is_err(),
+            "noncanonical table key must be rejected: {malformed}"
         );
     }
 }

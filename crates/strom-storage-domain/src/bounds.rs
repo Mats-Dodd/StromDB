@@ -42,7 +42,32 @@ pub const PARTITION_BOOTSTRAP_BYTES_MAX_V2: u64 = 32 * 1024 * 1024 * 1024;
 /// Largest inclusive replay-coordinate span from a V2 Seal through its FENCE.
 pub const WAL_SUFFIX_COORDINATES_MAX_V2: u64 = 1024;
 
+/// Worst-case resident logical bytes charged for one Directory row.
+pub const DIRECTORY_ROW_LOGICAL_BYTES_MAX: u64 = 525;
+
+/// Worst-case resident logical bytes charged for one Ledger value row.
+pub const LEDGER_VALUE_ROW_LOGICAL_BYTES_MAX: u64 = 1_035;
+
+/// Resident logical bytes charged for a Ledger delete before newest-wins merge.
+pub const LEDGER_DELETE_ROW_LOGICAL_BYTES: u64 = 9;
+
 const _: () = assert!(
     DIRECTORY_KEY_BYTES_MAX == strom_domain::STREAM_ID_BYTES_MAX,
     "Directory keys and protocol stream identifiers share one path bound"
+);
+
+const _: () = assert!(
+    DIRECTORY_KEY_BYTES_MAX == 512
+        && STREAM_RECORD_BYTES_MAX == 1_024
+        && DIRECTORY_ROW_LOGICAL_BYTES_MAX == 13 + 512
+        && LEDGER_VALUE_ROW_LOGICAL_BYTES_MAX == 11 + 1_024
+        && LEDGER_DELETE_ROW_LOGICAL_BYTES == 9,
+    "the V1 worst-row account must track every configured field bound"
+);
+
+const _: () = assert!(
+    PARTITION_PATH_OCCUPANCIES_MAX_V2
+        * (DIRECTORY_ROW_LOGICAL_BYTES_MAX + LEDGER_VALUE_ROW_LOGICAL_BYTES_MAX)
+        < PARTITION_RESIDENT_LOGICAL_BYTES_MAX_V2,
+    "ten million worst-case live rows must fit the V2 resident logical-byte bound"
 );

@@ -1,13 +1,14 @@
 //! Proptest strategies for valid storage-domain values.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
 use proptest::prelude::{Just, Strategy, prop_oneof};
 
 use crate::{
-    BatchId, BoundedNonEmptyVec, DirectoryKey, OperationFact, OwnerToken, PartitionId, Seal,
-    SealFormat, SealGeneration, StreamRecord, StreamUid, TreeVersion, WalFence, WalObject,
-    WalReplayPoint, WalRun,
+    BatchId, BoundedNonEmptyVec, DirectoryEntry, DirectoryKey, LedgerCell, OperationFact,
+    OwnerToken, PartitionId, Seal, SealFormat, SealGeneration, StreamRecord, StreamUid,
+    TreeVersion, WalFence, WalObject, WalReplayPoint, WalRun,
 };
 
 pub fn partition_id() -> impl Strategy<Value = PartitionId> {
@@ -132,4 +133,36 @@ pub fn stream_record() -> impl Strategy<Value = StreamRecord> {
         .prop_map(|(content_type, expiry, lifecycle, created_at)| {
             StreamRecord::new(content_type, expiry, lifecycle, created_at)
         })
+}
+
+pub fn directory_entry() -> impl Strategy<Value = DirectoryEntry> {
+    prop_oneof![
+        stream_uid().prop_map(DirectoryEntry::Live),
+        stream_uid().prop_map(DirectoryEntry::Tombstone),
+    ]
+}
+
+pub fn ledger_cell() -> impl Strategy<Value = LedgerCell> {
+    prop_oneof![
+        stream_record().prop_map(LedgerCell::Value),
+        Just(LedgerCell::Delete)
+    ]
+}
+
+pub fn directory_rows() -> impl Strategy<Value = Vec<(DirectoryKey, DirectoryEntry)>> {
+    proptest::collection::vec((directory_key(), directory_entry()), 1..=16).prop_map(|rows| {
+        rows.into_iter()
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .collect()
+    })
+}
+
+pub fn ledger_rows() -> impl Strategy<Value = Vec<(StreamUid, LedgerCell)>> {
+    proptest::collection::vec((stream_uid(), ledger_cell()), 1..=16).prop_map(|rows| {
+        rows.into_iter()
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .collect()
+    })
 }

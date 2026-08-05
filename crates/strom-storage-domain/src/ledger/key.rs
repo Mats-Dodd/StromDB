@@ -27,6 +27,25 @@ impl From<&StreamId> for DirectoryKey {
     }
 }
 
+impl TryFrom<Box<[u8]>> for DirectoryKey {
+    type Error = DirectoryKeyError;
+
+    fn try_from(bytes: Box<[u8]>) -> Result<Self, Self::Error> {
+        let raw = std::str::from_utf8(&bytes).map_err(|_detail| DirectoryKeyError::InvalidUtf8)?;
+        raw.parse::<StreamId>()
+            .map(|_stream_id| Self(bytes))
+            .map_err(DirectoryKeyError::StreamId)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DirectoryKeyError {
+    #[error("Directory key is not UTF-8")]
+    InvalidUtf8,
+    #[error("Directory key is not a canonical stream id: {0}")]
+    StreamId(#[source] strom_domain::StreamIdError),
+}
+
 #[derive(Debug)]
 pub(crate) struct DirectoryKeyWire(Vec<u8>);
 
@@ -121,11 +140,7 @@ impl TryFrom<DirectoryKeyWire> for DirectoryKey {
     type Error = DecodeError;
 
     fn try_from(wire: DirectoryKeyWire) -> Result<Self, Self::Error> {
-        let bytes = wire.0;
-        let raw = std::str::from_utf8(&bytes).map_err(|_detail| DecodeError::InvalidBody)?;
-        raw.parse::<StreamId>()
-            .map(|_stream_id| Self(bytes.into_boxed_slice()))
-            .map_err(|_detail| DecodeError::InvalidBody)
+        Self::try_from(wire.0.into_boxed_slice()).map_err(|_detail| DecodeError::InvalidBody)
     }
 }
 
