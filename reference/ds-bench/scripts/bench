@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# bench <suite.json> {run|report|teardown} — declarative write-throughput suite.
+#
+#   run      ensure one persistent cluster per mode (zones a/b/c, own KUBECONFIG),
+#            then for each (mode, stream_count) skip-if-saturated else walk_cell.
+#            Modes run in parallel. State+results: results/<suite>/<mode>/cells.json.
+#   report   regenerate results/<suite>/aggregate.{csv,json} + report.md (no cluster).
+#   teardown delete ONLY the clusters this suite created (.bench-state/<suite>.json).
+#
+# BENCH_DRYRUN=1 echoes the destructive cluster ops (for tests).
+set -uo pipefail
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$REPO_ROOT"
+
+usage() { echo "usage: scripts/bench <suite.json> {run|report|teardown|teardown-if-complete}" >&2; exit 2; }
+[ $# -lt 2 ] && usage
+SUITE_FILE="$1"; CMD="$2"
+[ -f "$SUITE_FILE" ] || { echo "no such suite: $SUITE_FILE" >&2; exit 2; }
+export SUITE_FILE
+SUITE_NAME="$(python3 -c "import sys;sys.path.insert(0,'scripts');from suite import Suite;print(Suite.load('$SUITE_FILE').name)")"
+STATE=".bench-state/${SUITE_NAME}.json"; mkdir -p .bench-state
+RUN="${BENCH_DRYRUN:+echo}"
+
+_suite() { python3 -c "import sys;sys.path.insert(0,'scripts');from suite import Suite;s=Suite.load('$SUITE_FILE');print($1)"; }
+
+cmd_teardown() {
+  [ -f "$STATE" ] || { echo "no clusters recorded for $SUITE_NAME"; return 0; }
+  python3 -c "import json;[print(c['name'],c['zone']) for c in json.load(open('$STATE'))['clusters']]" \
+    | while read -r name zone; do
+        if [ -n "$RUN" ]; then $RUN gcloud container clusters delete "$name" --zone "$zone" --quiet; continue; fi
+        # Real teardown: a delete fails while the cluster is PROVISIONING/RECONCILING
+        # (GKE rejects concurrent ops). Retry until the cluster is actually gone so a
+        # transient state never strands a billing cluster.
+        ok=0
+        for i in $(seq 1 30); do
+          if ! gcloud container clusters describe "$name" --zone "$zone" >/dev/null 2>&1; then ok=1; break; fi
+          gcloud container clusters delete "$name" --zone "$zone" --quiet >/dev/null 2>&1 && { ok=1; break; }
+          echo "  teardown $name: delete failed (likely RECONCILING) — retry $i" >&2; sleep 20
+        done
+        [ "$ok" = 1 ] || echo "  WARN: $name still present after retries — watchdog will catch it" >&2
+      done
+  # Clear the state file after a REAL teardown (skip in dry-run) so a later re-run
+  # recreates cleanly rather than thinking the deleted cluster still exists.
+  [ -z "$RUN" ] && rm -f "$STATE"
+  return 0
+}
+
+cmd_report() {
+  case "$(_suite 's.workload')" in
+    sustained) python3 scripts/sustained_report.py "$SUITE_FILE" ;;
+    catchup)   python3 scripts/catchup_report.py "$SUITE_FILE" ;;
+    reads)     python3 scripts/reads_report.py "$SUITE_FILE" ;;
+    mixed)     python3 scripts/mixed_report.py "$SUITE_FILE" ;;
+    *)         # backfill peak + p50 pod memory from the saved samples, then render
+               python3 scripts/podmem.py "results/${SUITE_NAME}" >/dev/null 2>&1 || true
+               python3 scripts/report.py "$SUITE_FILE" ;;
+  esac
+}
+
+# Tear down this suite's cluster(s) ONLY if the run finished cleanly and results
+# were collected. Errors/incompleteness keep the cluster up for investigation/
+# resume. BENCH_KEEP_CLUSTER=1 always keeps it.
+_maybe_teardown() {
+  if [ "${BENCH_KEEP_CLUSTER:-0}" = "1" ]; then
+    echo "[bench] BENCH_KEEP_CLUSTER=1 — leaving ${SUITE_NAME} cluster(s) up"; return 0
+  fi
+  # Most workloads render results/<suite>/report.md; catch-up writes a single
+  # COMBINED report at results/catchup/report.md instead, so look there for it.
+  local report_md; case "$(_suite 's.workload')" in
+    catchup) report_md="results/catchup/report.md" ;;
+    *)       report_md="results/${SUITE_NAME}/report.md" ;;
+  esac
+  if [ ! -f "$report_md" ]; then
+    echo "[bench] results not collected (no ${report_md}) — leaving cluster(s) up"; return 0
+  fi
+  local st; st="$(python3 -c "import sys;sys.path.insert(0,'scripts');import report;print(report.suite_status('$SUITE_FILE','results/${SUITE_NAME}'))")"
+  case "$st" in
+    complete)
+      echo "[bench] ${SUITE_NAME} complete + results collected → tearing down cluster(s)"
+      cmd_teardown ;;
+    errors)
+      echo "[bench] ${SUITE_NAME} has error cells → leaving cluster(s) up (fix/re-run to resume; teardown happens once clean)" ;;
+    incomplete)
+      echo "[bench] ${SUITE_NAME} incomplete → leaving cluster(s) up (re-run to resume)" ;;
+  esac
+}
+
+cmd_run() {
+  local modes; modes="$(_suite "' '.join(s.modes)")"
+  for mode in $modes; do ( run_mode "$mode" ) & done
+  wait
+  cmd_report          # collect + aggregate (per-cell artifacts already pulled locally)
+  _maybe_teardown     # teardown only if complete + report written
+}
+
+run_mode() {
+  local mode="$1"
+  local workload; workload="$(_suite 's.workload')"
+  local cluster
+  if [ "${DS_TARGET:-remote}" = "local" ]; then
+    # Local kind: one shared cluster, the kind context in the default kubeconfig, no
+    # node pools. Server runs with fewer CPUs (the kind node is a single Docker VM).
+    cluster="${KIND_CLUSTER:-ds-bench}"
+    DS_TARGET=local bash scripts/cluster-up.sh
+    export DS_TARGET=local CLUSTER="$cluster" KCTX="kind-${cluster}"
+    export SERVER_CPUS="${SERVER_CPUS:-$(_suite 's.cluster.get("server_cpus", 2)')}" SERVER_MEM="${SERVER_MEM:-2Gi}"
+  else
+    # Remote GKE: its OWN cluster per mode (parallel-safe), keyed KUBECONFIG. cluster
+    # name + zone default to bench-<mode> / region-{a,b,c}; a suite may override
+    # cluster.cluster_name / cluster.zone so a same-mode run gets its own cluster.
+    local region; region="$(_suite 's.cluster["region"]')"
+    cluster="$(_suite 's.cluster.get("cluster_name") or "bench-'"$mode"'"')"
+    local zone; zone="$(_suite 's.cluster.get("zone") or ""')"
+    if [ -z "$zone" ]; then
+      # Most GCP regions (incl. europe-west4) have only zones a/b/c. The matrix caps
+      # at 3 parallel clusters, so the 4th (node) reuses a freed zone (b = ursula's).
+      local zoneidx; case "$mode" in wal) zoneidx=a;; ursula) zoneidx=b;; s2) zoneidx=c;; node) zoneidx=b;; *) zoneidx=a;; esac
+      zone="${region}-${zoneidx}"
+    fi
+    export KUBECONFIG="$REPO_ROOT/.bench-state/kc-${cluster}"
+    CLUSTER="$cluster" ZONE="$zone" SERVER_MACHINE="$(_suite 's.cluster["server_machine"]')" \
+      CLIENT_MACHINE="$(_suite 's.cluster["client_machine"]')" CLIENT_NODES="$(_suite 's.cluster["client_nodes"]')" \
+      DS_TARGET=remote bash scripts/cluster-up.sh
+    _record_cluster "$cluster" "$zone"   # so teardown only touches what we created
+    export DS_TARGET=remote PROJECT="${PROJECT:-$(gcloud config get-value project 2>/dev/null)}"
+    export ZONE="$zone" CLUSTER="$cluster" KCTX="gke_${PROJECT}_${zone}_${cluster}"
+    # Suite may pin the server's vCPU budget (cluster.server_cpus) so a CPU-sweep
+    # suite (e.g. 4 vs 8 vCPU) is self-contained; env still overrides.
+    export SERVER_CPUS="${SERVER_CPUS:-$(_suite 's.cluster.get("server_cpus", 4)')}"
+  fi
+  export SERVER_CPU="${SERVER_CPUS%% *}"
+  # fleet_cpu/setup/payload come from the saturation block (write) OR the sustained
+  # block (sustained suites have no saturation block); warmup/measure are write-only.
+  export FLEET_CPU="$(_suite 's.saturation.get("fleet_cpu", s.sustained.get("fleet_cpu", 0.5))')"
+  export WARMUP_SECS="$(_suite 's.saturation.get("warmup_secs", 15)')"
+  export MEASURE_SECS="$(_suite 's.saturation.get("measure_secs", 20)')"
+  export SETTLE_SECS="${SETTLE_SECS:-5}"
+  export SETUP_CONCURRENCY="$(_suite 's.saturation.get("setup_concurrency", s.sustained.get("setup_concurrency", 32))')"
+  export PAYLOAD_BYTES="$(_suite 's.saturation.get("payload_bytes", s.sustained.get("payload_bytes", 256))')"
+  # connections>0 → bounded-concurrency pool client (offered load = pods × connections,
+  # decoupled from stream count). Set per-pod to ~80% of a single pod's measured max
+  # (see CALIBRATION in docs); 0 = legacy 1-in-flight-per-stream client.
+  export CONNS_PER_POD="${CONNS_PER_POD:-$(_suite 's.saturation.get("connections", 0)')}"
+  # batch>1 → N records per POST (pool only); biggest fleet-cost lever (see AGENTS.md §7).
+  export BATCH_PER_POD="${BATCH_PER_POD:-$(_suite 's.saturation.get("batch", 1)')}"
+  export SWEEP_RUN_ID="${SUITE_NAME}-${mode}"
+  local mode_root="results/${SUITE_NAME}/${mode}"
+  export RESULTS_ROOT="$mode_root" SAT_RESULT_ROOT="$mode_root/cells"
+  local cells_json="${mode_root}/cells.json"
+
+  # source the engine (defines K/deploy_mode/walk_cell against the now-correct KCTX).
+  # sustained suites also get run_sustained_cell (lib-sustained sources lib-saturate).
+  case "$workload" in
+    sustained) . scripts/lib-sustained.sh ;;
+    catchup)   . scripts/lib-catchup.sh ;;
+    reads)     . scripts/lib-reads.sh ;;
+    mixed)     . scripts/lib-mixed.sh ;;
+    *)         . scripts/lib-saturate.sh ;;
+  esac
+  ensure_metrics_configmap >&2 || true
+  # cold-tier buckets (ursula/s2 write to the object store)
+  K exec deploy/minio -- sh -c 'mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null 2>&1; mc mb -p local/ursula local/s2-bench local/durable-streams local/bench-results >/dev/null 2>&1; true' >/dev/null 2>&1 || true
+
+  # Local kind is one shared cluster: clear any server left by a prior suite so this run
+  # never contends with another server on the single node (this suite self-cleans on exit).
+  [ "${DS_TARGET}" = "local" ] && shutdown_local_servers
+
+  # One result series per server-config variant (label). Variants share the mode's
+  # cluster: redeploy the server with the variant's args, then walk all stream-counts
+  # into results/<suite>/<label>/cells.json — so e.g. wal vs wal-tailcache compare
+  # side by side in the report. A mode with no server_configs has one baseline.
+  local nconf; nconf="$(_suite 'len(s.configs_for("'"$mode"'"))')"
+  local i
+  for ((i=0; i<nconf; i++)); do
+    local label args
+    label="$(_suite 's.configs_for("'"$mode"'")['"$i"']["label"]')"
+    args="$(_suite 's.configs_for("'"$mode"'")['"$i"']["args"]')"
+    local label_root="results/${SUITE_NAME}/${label}"
+    local label_cells="${label_root}/cells.json"
+    export RESULTS_ROOT="$label_root" SAT_RESULT_ROOT="$label_root/cells"
+    export WAL_SERVER_ARGS="$args"   # injected only for wal; ignored by ursula/s2
+
+    echo "[$mode/$label] deploy (args='${args}')"
+    deploy_mode "$mode" || { echo "[$mode/$label] deploy failed — skipping variant" >&2; continue; }
+    local digest; digest="$(server_image_digest "$mode" "$args")"
+
+    # write-throughput → walk_cell (saturate), skip cells already `saturated`.
+    # sustained → run_sustained_cell (one fixed-rate run), skip cells already `done`.
+    # write-throughput → walk_cell (saturate, skip `saturated`); sustained →
+    # run_sustained_cell; catchup → run_catchup_cell (both single-shot, skip `done`).
+    local sc st store skip verb
+    case "$workload" in
+      sustained) store=sustained_cells; skip=done; verb="sustained run" ;;
+      catchup)   store=catchup_cells;   skip=done; verb="catch-up run" ;;
+      reads)     store=reads_cells;     skip=done; verb="reads run" ;;
+      mixed)     store=mixed_cells;     skip=done; verb="mixed run" ;;
+      *)         store=cells;           skip=saturated; verb="walking ladder" ;;
+    esac
+    for sc in $(_suite "' '.join(map(str,s.stream_counts))"); do
+      st="$(python3 -c "import sys;sys.path.insert(0,'scripts');import ${store};print(${store}.status_of('$label_cells',$sc,'$digest'))")"
+      [ "$st" = "$skip" ] && { echo "[$label $sc] already ${skip}, skip"; continue; }
+      echo "[$label $sc] ${verb} (status=$st)"
+      # base $mode (not $label) so reset_state + addressing resolve; per-label
+      # SAT_RESULT_ROOT + cells path keep variants from colliding.
+      case "$workload" in
+        sustained) run_sustained_cell "$mode" "$sc" "$label_cells" "$digest" ;;
+        catchup)   run_catchup_cell   "$mode" "$sc" "$label_cells" "$digest" ;;
+        reads)     run_reads_cell      "$mode" "$sc" "$label_cells" "$digest" ;;
+        mixed)     run_mixed_cell      "$mode" "$sc" "$label_cells" "$digest" ;;
+        *)         walk_cell           "$mode" "$sc" "$label_cells" "$digest" ;;
+      esac
+    done
+  done
+  # Local: self-shutdown the server when the suite finishes (the kind cluster stays up,
+  # so the node is free for the next suite). Remote tears down its own cluster instead.
+  [ "${DS_TARGET}" = "local" ] && { echo "[bench] local: shutting down server (kind cluster kept)"; shutdown_local_servers; }
+}
+
+_record_cluster() {  # idempotent append to the suite state file
+  python3 -c "
+import json,os
+p='$STATE'; d=json.load(open(p)) if os.path.exists(p) else {'clusters':[]}
+if not any(c['name']=='$1' for c in d['clusters']): d['clusters'].append({'name':'$1','zone':'$2'})
+json.dump(d, open(p,'w'), indent=2)"
+}
+
+case "$CMD" in
+  run) cmd_run ;;
+  report) cmd_report ;;
+  teardown) cmd_teardown ;;
+  teardown-if-complete) _maybe_teardown ;;
+  *) usage ;;
+esac

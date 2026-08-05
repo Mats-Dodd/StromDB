@@ -1,0 +1,28 @@
+[
+  {
+    "mode": "wal",
+    "stream_count": 50,
+    "sweep": "writer_rate",
+    "level": 0,
+    "readers": 0,
+    "subscribers": 0,
+    "writer_rate": 0,
+    "read_rate": 0,
+    "write_ops_per_sec": 81564.35,
+    "write_p50": 0.457,
+    "write_p99": 1.845,
+    "read_ops_per_sec": 0.0,
+    "read_mib_per_sec": 0.0,
+    "read_p50": null,
+    "read_p99": null,
+    "events_per_sec": 0.0,
+    "delivery_p50": null,
+    "delivery_p99": null,
+    "write_bp": 0,
+    "write_err": 0,
+    "read_bp": 0,
+    "read_err": 0,
+    "status": "ok",
+    "reason": "complete"
+  }
+]

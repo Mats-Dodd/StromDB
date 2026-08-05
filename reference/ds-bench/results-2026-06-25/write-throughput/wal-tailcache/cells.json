@@ -1,0 +1,100 @@
+{
+  "cells": {
+    "100": {
+      "stream_count": 100,
+      "image_digest": "a3af0b74d273",
+      "walk": [
+        [
+          32,
+          463799.99999999994
+        ],
+        [
+          48,
+          528464.1
+        ],
+        [
+          64,
+          463416.05000000005
+        ]
+      ],
+      "pinned_pods": 48,
+      "throughput": 528464.1,
+      "p50": 0.262,
+      "p99": 0.45,
+      "pod_mem_mb": 110,
+      "saturated": true,
+      "status": "ok",
+      "reason": "plateau",
+      "pod_mem_p50_mb": 36
+    },
+    "1000": {
+      "stream_count": 1000,
+      "image_digest": "a3af0b74d273",
+      "walk": [
+        [
+          16,
+          606963.7000000001
+        ],
+        [
+          24,
+          653405.8999999999
+        ]
+      ],
+      "pinned_pods": 16,
+      "throughput": 606963.7000000001,
+      "p50": 1.245,
+      "p99": 7.571,
+      "pod_mem_mb": 74,
+      "saturated": true,
+      "status": "ok",
+      "reason": "plateau",
+      "pod_mem_p50_mb": 57
+    },
+    "10000": {
+      "stream_count": 10000,
+      "image_digest": "a3af0b74d273",
+      "walk": [
+        [
+          32,
+          559709.6000000001
+        ],
+        [
+          48,
+          599793.4499999998
+        ]
+      ],
+      "pinned_pods": 32,
+      "throughput": 559709.6000000001,
+      "p50": 1.472,
+      "p99": 208.255,
+      "pod_mem_mb": 203,
+      "saturated": true,
+      "status": "ok",
+      "reason": "plateau",
+      "pod_mem_p50_mb": 183
+    },
+    "100000": {
+      "stream_count": 100000,
+      "image_digest": "a3af0b74d273",
+      "walk": [
+        [
+          80,
+          886952.3000000002
+        ],
+        [
+          100,
+          828512.4000000001
+        ]
+      ],
+      "pinned_pods": 80,
+      "throughput": 886952.3000000002,
+      "p50": 2.117,
+      "p99": 957.439,
+      "pod_mem_mb": 977,
+      "saturated": true,
+      "status": "ok",
+      "reason": "plateau",
+      "pod_mem_p50_mb": 655
+    }
+  }
+}

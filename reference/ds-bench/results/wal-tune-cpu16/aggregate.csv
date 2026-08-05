@@ -1,0 +1,2 @@
+mode,stream_count,pods,throughput,p50,p99,knee_pods,knee_throughput,knee_p50,knee_p99,pod_mem_mb,pod_mem_p50_mb,saturated,status,reason
+wal-3x3-16c,100000,4,537163.0,1.69,4.079,4,542967.45,1.655,4.391,732,658,True,ok,plateau

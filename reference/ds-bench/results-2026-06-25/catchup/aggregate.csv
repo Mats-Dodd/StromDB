@@ -1,0 +1,11 @@
+label,pre_events,clients,event_bytes,snapshot_bytes,p50,p99,body_kb,mb_per_sec,bytes_received_total,status,reason
+durable,200,,,,,,,,,missing,
+durable,2000,,,,,,,,,missing,
+wal,200,,,,,,,,,missing,
+wal,1000,,,,,,,,,missing,
+node,200,1000,1024,51200,92.799,185.983,200.0,700.0042026236314,204800000.0,ok,complete
+node,2000,1000,1024,51200,1240.063,2121.727,2000.0,906.1278468332084,2048000000.0,ok,complete
+s2,200,,,,,,,,,missing,
+s2,2000,,,,,,,,,missing,
+ursula,200,,,,,,,,,missing,
+ursula,2000,,,,,,,,,missing,

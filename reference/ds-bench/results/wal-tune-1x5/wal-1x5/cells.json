@@ -1,0 +1,31 @@
+{
+  "cells": {
+    "100000": {
+      "stream_count": 100000,
+      "image_digest": "a96c7eeabc9c",
+      "walk": [
+        [
+          4,
+          386606.05000000005,
+          2.495,
+          4.431
+        ],
+        [
+          8,
+          364118.39999999997,
+          5.331,
+          8.583
+        ]
+      ],
+      "pinned_pods": 8,
+      "throughput": 364118.39999999997,
+      "p50": null,
+      "p99": null,
+      "pod_mem_mb": 779,
+      "saturated": false,
+      "status": "ok",
+      "reason": "ladder_exhausted",
+      "pod_mem_p50_mb": 663
+    }
+  }
+}

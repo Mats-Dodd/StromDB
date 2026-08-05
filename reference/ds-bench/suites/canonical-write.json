@@ -1,0 +1,53 @@
+{
+  "suite": "canonical-write",
+  "_doc": "CANONICAL write-saturation benchmark for durable-streams (see AGENTS.md 'Canonical suites'). Two configs on ONE cluster: wal-ideal = the validated ideal disk configuration (WAL_TUNING.md: 3 stream lanes + 3 WAL shard lanes on 6 raw-block NVMe devices, syncfs checkpoints [unconditional on Linux], 1GiB retained-WAL checkpoint budget + 60s fallback, exclusive pinned cores) and memory = the no-fsync ceiling. References (2026-07-13): wal-ideal 374k @100k (no cliff: -3% vs 10k... 385k @10k), memory 512k @100k (-6% vs 10k). REGRESSION GATE: wal-ideal@100k < 250k or memory@100k < 400k or a >30% 10k->100k drop = cliff regression -> stop, diagnose, fix. RUN WITH: DS_TARGET=remote STATIC_CPU=1 SPLITLANE=1 GUARANTEED=1 SERVER_LOCAL_SSD_BLOCK=1 SERVER_MANIFEST=gke/durable-streams-splitlane3x3-guaranteed.yaml SPOT_SERVER=1. NOTE: memory arm passes --tier off (the manifest bakes in --tier s3 and the server refuses memory+tier).",
+  "cluster": {
+    "server_machine": "c4d-standard-64-lssd",
+    "server_cpus": 8,
+    "client_machine": "n2d-standard-32",
+    "client_nodes": 3,
+    "cluster_name": "bench-canon",
+    "zone": "europe-west4-b",
+    "region": "europe-west4"
+  },
+  "saturation": {
+    "plateau_pct": 8,
+    "patience": 2,
+    "fleet_cpu": 2,
+    "connections": 256,
+    "repeats": 1,
+    "warmup_secs": 12,
+    "measure_secs": 20,
+    "setup_concurrency": 32,
+    "payload_bytes": 256
+  },
+  "modes": [
+    "wal"
+  ],
+  "server_configs": {
+    "wal": [
+      {
+        "label": "wal-ideal",
+        "args": "--wal-shards 3 --stream-lanes 3 --wal-checkpoint-wal-bytes 1073741824 --wal-checkpoint-interval-ms 60000 --worker-threads 8 --wal-stats 3 --server-stats 3 --data-dir /data/wal/0"
+      },
+      {
+        "label": "memory",
+        "args": "--durability memory --worker-threads 8 --server-stats 3 --data-dir /data/wal/0 --tier off"
+      }
+    ]
+  },
+  "stream_counts": [
+    10000,
+    100000
+  ],
+  "pod_ladder": {
+    "10000": [
+      4,
+      8
+    ],
+    "100000": [
+      4,
+      8
+    ]
+  }
+}

@@ -1,0 +1,108 @@
+{
+  "cells": {
+    "100": {
+      "stream_count": 100,
+      "image_digest": "92f4a6387253",
+      "walk": [
+        [
+          16,
+          463093.75
+        ],
+        [
+          24,
+          501524.875
+        ],
+        [
+          32,
+          530912.375
+        ]
+      ],
+      "pinned_pods": 24,
+      "throughput": 501524.875,
+      "p50": 0.222,
+      "p99": 0.407,
+      "pod_mem_mb": 69,
+      "saturated": true,
+      "status": "ok",
+      "reason": "plateau",
+      "pod_mem_p50_mb": 12
+    },
+    "1000": {
+      "stream_count": 1000,
+      "image_digest": "92f4a6387253",
+      "walk": [
+        [
+          16,
+          626173.375
+        ],
+        [
+          24,
+          677649.75
+        ],
+        [
+          32,
+          713186.625
+        ]
+      ],
+      "pinned_pods": 24,
+      "throughput": 677649.75,
+      "p50": 1.181,
+      "p99": 6.607,
+      "pod_mem_mb": 43,
+      "saturated": true,
+      "status": "ok",
+      "reason": "plateau",
+      "pod_mem_p50_mb": 35
+    },
+    "10000": {
+      "stream_count": 10000,
+      "image_digest": "92f4a6387253",
+      "walk": [
+        [
+          32,
+          674274.75
+        ],
+        [
+          48,
+          732617.25
+        ],
+        [
+          64,
+          774126.875
+        ]
+      ],
+      "pinned_pods": 48,
+      "throughput": 732617.25,
+      "p50": 1.43,
+      "p99": 93.567,
+      "pod_mem_mb": 193,
+      "saturated": true,
+      "status": "ok",
+      "reason": "plateau",
+      "pod_mem_p50_mb": 103
+    },
+    "100000": {
+      "stream_count": 100000,
+      "image_digest": "92f4a6387253",
+      "walk": [
+        [
+          80,
+          927583.5
+        ],
+        [
+          100,
+          732543.875
+        ]
+      ],
+      "pinned_pods": 80,
+      "throughput": 927583.5,
+      "p50": 40.575,
+      "p99": 737.279,
+      "pod_mem_mb": 854,
+      "saturated": true,
+      "status": "ok",
+      "reason": "plateau",
+      "pod_mem_p50_mb": 545
+    }
+  }
+}

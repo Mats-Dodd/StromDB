@@ -1,0 +1,81 @@
+{
+  "cells": {
+    "100": {
+      "stream_count": 100,
+      "image_digest": "eeeb6d3de518",
+      "walk": [
+        [
+          4,
+          62679.5
+        ],
+        [
+          8,
+          64881.375
+        ]
+      ],
+      "pinned_pods": 4,
+      "throughput": 62679.5,
+      "p50": 0.536,
+      "p99": 42.879,
+      "pod_mem_mb": 2580,
+      "saturated": true,
+      "status": "ok",
+      "reason": "plateau",
+      "pod_mem_p50_mb": 1960
+    },
+    "1000": {
+      "stream_count": 1000,
+      "image_digest": "eeeb6d3de518",
+      "walk": [
+        [
+          4,
+          85666.375
+        ],
+        [
+          8,
+          99436.5
+        ],
+        [
+          16,
+          110982.75
+        ]
+      ],
+      "pinned_pods": 16,
+      "throughput": 110982.75,
+      "p50": null,
+      "p99": null,
+      "pod_mem_mb": 2359,
+      "saturated": false,
+      "status": "ok",
+      "reason": "ladder_exhausted",
+      "pod_mem_p50_mb": 1956
+    },
+    "10000": {
+      "stream_count": 10000,
+      "image_digest": "eeeb6d3de518",
+      "walk": [
+        [
+          8,
+          126869.25
+        ],
+        [
+          16,
+          146253.0
+        ],
+        [
+          24,
+          156053.75
+        ]
+      ],
+      "pinned_pods": 16,
+      "throughput": 146253.0,
+      "p50": 24.367,
+      "p99": 287.999,
+      "pod_mem_mb": 3496,
+      "saturated": true,
+      "status": "ok",
+      "reason": "plateau",
+      "pod_mem_p50_mb": 3159
+    }
+  }
+}

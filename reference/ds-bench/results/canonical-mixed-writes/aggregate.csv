@@ -1,0 +1,5 @@
+mode,stream_count,sweep,level,readers,subscribers,writer_rate,read_rate,write_ops_per_sec,write_p50,write_p99,read_ops_per_sec,read_mib_per_sec,read_p50,read_p99,events_per_sec,delivery_p50,delivery_p99,write_bp,write_err,read_bp,read_err,status,reason
+wal,10000,readers,0,0,0,5,0,49959.8,3.757,1220.607,0.0,0.0,,,0.0,,,0,0,0,0,ok,complete
+wal,10000,readers,1000,1000,0,5,0,49908.53333333333,3.905,1323.007,49.93333333333333,3.045393880208333,1.514,377.343,0.0,,,0,0,0,0,ok,complete
+wal,10000,readers,10000,10000,0,5,0,50047.63333333333,3.735,1385.471,499.1333333333333,30.448221842447918,1.41,340.479,0.0,,,0,0,0,0,ok,complete
+wal,10000,readers,100000,100000,0,5,0,50033.76666666667,4.547,2961.407,4987.7,303.6758666992188,1.438,1072.127,0.0,,,0,0,0,0,ok,complete

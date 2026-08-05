@@ -1,0 +1,49 @@
+{
+  "suite": "canonical-mixed-delivery",
+  "workload": "mixed",
+  "cluster": {
+    "server_machine": "c4d-standard-16-lssd",
+    "client_machine": "n2d-standard-32",
+    "client_nodes": 2,
+    "region": "europe-west4",
+    "cluster_name": "bench-canon-mixed"
+  },
+  "mixed": {
+    "sweep": "writer_rate",
+    "levels": [
+      2,
+      8,
+      20,
+      33,
+      0
+    ],
+    "writers_per_stream": 1,
+    "readers": 0,
+    "subscribers": 2000,
+    "duration_secs": 30,
+    "payload_bytes": 256,
+    "setup_concurrency": 64,
+    "pods": 1,
+    "backfill_events": 50,
+    "fleet_timeout_secs": 900
+  },
+  "modes": [
+    "wal"
+  ],
+  "server_configs": {
+    "wal": [
+      {
+        "label": "wal",
+        "args": ""
+      },
+      {
+        "label": "memory",
+        "args": "--durability memory --tier off"
+      }
+    ]
+  },
+  "stream_counts": [
+    2000
+  ],
+  "_doc": "CANONICAL delivery-under-write-load: spread SSE subscribers vs a write ladder; watches for the memory-mode delivery collapse found 2026-07-02."
+}

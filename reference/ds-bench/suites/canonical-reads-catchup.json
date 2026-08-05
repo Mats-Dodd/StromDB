@@ -1,0 +1,35 @@
+{
+  "suite": "canonical-reads-catchup",
+  "workload": "reads",
+  "cluster": {
+    "server_machine": "c4d-standard-16-lssd",
+    "client_machine": "n2d-standard-32",
+    "client_nodes": 2,
+    "region": "europe-west4"
+  },
+  "reads": {
+    "mode": "catchup",
+    "read_size_bytes": 4096,
+    "seed_bytes": 16777216,
+    "duration_secs": 15,
+    "warmup_secs": 5,
+    "settle_secs": 2,
+    "connection_levels": [
+      8,
+      32,
+      128,
+      512
+    ],
+    "pods": 1,
+    "repeats": 1
+  },
+  "modes": [
+    "wal",
+    "ursula"
+  ],
+  "stream_counts": [
+    10,
+    100
+  ],
+  "_doc": "CANONICAL catch-up read benchmark (historical replay throughput/latency vs connections)."
+}

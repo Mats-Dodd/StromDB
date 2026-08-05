@@ -1,0 +1,157 @@
+# DS-rust durable-streams server for Phase 2b, on the NVMe role=server node.
+# Data-dir on local-SSD emptyDir for fast fsync; cold tier offloaded to the
+# in-cluster MinIO `durable-streams` bucket. Raw-only, separate-token args
+# (identical to Phase 2a). ${PROJECT} is substituted (sed/envsubst) by the
+# run scripts before apply.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: durable-streams
+  namespace: ds-bench
+  labels:
+    app: durable-streams
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: durable-streams
+  template:
+    metadata:
+      labels:
+        app: durable-streams
+    spec:
+      nodeSelector: ${NODESEL_SERVER}
+      # Required so the metrics sidecar can read /proc/<pid>/stat of the server.
+      # ConfigMap must be created before apply:
+      #   kubectl -n ds-bench create configmap metrics-poller \
+      #     --from-file=poller.sh=deploy/metrics/poller.sh
+      shareProcessNamespace: true
+      # io_uring backend (Linux): Docker 25 / containerd's default seccomp blocks
+      # io_uring_setup/enter/register (moby#46762), and a Pod Security / CIS policy
+      # may impose RuntimeDefault. Unconfined permits the io_uring syscalls. It is a
+      # superset, so the reference (splice/fdatasync) server is unaffected. GKE
+      # Standard + COS allows this; do NOT route this pod through gVisor (no io_uring).
+      securityContext:
+        seccompProfile:
+          type: Unconfined
+      # Wipe the data-dir between cells. A pod restart already gives a fresh
+      # emptyDir, but this guarantees /data is empty even if the volume backing
+      # changes (e.g. NVMe local-SSD reuse).
+      initContainers:
+        - name: wipe-data
+          image: ${IMG_SERVER}
+          imagePullPolicy: ${PULL_POLICY}
+          command: ["sh", "-c", "rm -rf /data/* /data/.[!.]* 2>/dev/null; true"]
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      containers:
+        - name: durable-streams
+          image: ${IMG_SERVER}
+          imagePullPolicy: ${PULL_POLICY}
+          args:
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "4438"
+            - "--data-dir"
+            - "/data"
+            - "--tier"
+            - "s3"
+            - "--tier-endpoint"
+            - "http://minio:9000"
+            - "--tier-region"
+            - "us-east-1"
+            - "--tier-bucket"
+            - "durable-streams"
+            - "--tier-allow-http"
+          env:
+            - name: DS_S3_ACCESS_KEY_ID
+              value: minioadmin
+            - name: DS_S3_SECRET_ACCESS_KEY
+              value: minioadmin
+          ports:
+            - containerPort: 4438
+          # Serve-readiness gate (see ursula.yaml) so the matrix's rollout-restart
+          # + `wait --for=condition=available` only passes once :4438 accepts.
+          readinessProbe:
+            tcpSocket: { port: 4438 }
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 30
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          resources:
+            requests:
+              memory: "2Gi"
+              # Only the LIMIT sets cgroup v2 cpu.max (the quota that available_parallelism
+              # reads to bound worker_threads). The request only affects cpu.weight under
+              # contention — keep it a small floor so a SERVER_CPU=8 pod still schedules on
+              # an 8-core node (the server node is dedicated, so it bursts to the limit).
+              cpu: "500m"
+            limits:
+              memory: "${SERVER_MEM}"
+              cpu: "${SERVER_CPU}"
+        # ── metrics sidecar ─────────────────────────────────────────────────────
+        # Samples the server's RSS + CPU from /proc/<pid>/stat every second and
+        # appends rows to /metrics/samples.csv (shared emptyDir).
+        # Runs at nice -n 19 so it does not perturb latency measurements.
+        # See gke/metrics-sidecar.yaml for full usage notes.
+        - name: metrics
+          image: ${IMG_METRICS}
+          imagePullPolicy: ${PULL_POLICY}
+          command:
+            - nice
+            - "-n"
+            - "19"
+            - bash
+            - /deploy/metrics/poller.sh
+          env:
+            - name: SERVER_PROC
+              value: durable-streams-server
+            - name: METRICS_INTERVAL_S
+              value: "1"
+            - name: METRICS_OUT
+              value: /metrics/samples.csv
+            # The poller df's this dir to find the backing block device, then reads
+            # device-wide sectors-written from /proc/diskstats (catches kernel
+            # writeback the per-pid /proc/<pid>/io counter misses for buffered writes).
+            - name: DATA_DIR
+              value: /data
+            # POD_UID lets the poller find this pod's cgroup under the host cgroupfs
+            # to sample pod working-set memory (anon + active page cache).
+            - { name: POD_UID, valueFrom: { fieldRef: { fieldPath: metadata.uid } } }
+          volumeMounts:
+            - { name: metrics, mountPath: /metrics }
+            - { name: metrics-poller, mountPath: /deploy/metrics }
+            - { name: data, mountPath: /data, readOnly: true }
+            - { name: cgroup-host, mountPath: /host/cgroup, readOnly: true }
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "32Mi"
+            limits:
+              cpu: "50m"
+              memory: "64Mi"
+      volumes:
+        - name: data
+          emptyDir: { medium: "" }
+        - name: metrics
+          emptyDir: {}
+        - name: metrics-poller
+          configMap:
+            name: metrics-poller
+            defaultMode: 0755
+        - name: cgroup-host
+          hostPath: { path: /sys/fs/cgroup }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: durable-streams
+  namespace: ds-bench
+spec:
+  selector:
+    app: durable-streams
+  ports:
+    - port: 4438
+      targetPort: 4438

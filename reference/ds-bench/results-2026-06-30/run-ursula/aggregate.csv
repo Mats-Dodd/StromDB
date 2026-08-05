@@ -1,0 +1,7 @@
+mode,stream_count,pods,throughput,p50,p99,pod_mem_mb,pod_mem_p50_mb,saturated,status,reason
+ursula-disk,100,4,2438.5,14.415,87.999,1082,1046,True,ok,plateau
+ursula-memory,100,4,62679.5,0.536,42.879,2580,1960,True,ok,plateau
+ursula-disk,1000,4,6665.875,112.575,384.255,1631,1475,True,ok,plateau
+ursula-memory,1000,16,110982.75,,,2359,1956,False,ok,ladder_exhausted
+ursula-disk,10000,8,12153.25,1184.767,2619.391,2486,2351,True,ok,plateau
+ursula-memory,10000,16,146253.0,24.367,287.999,3496,3159,True,ok,plateau

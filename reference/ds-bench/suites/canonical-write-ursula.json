@@ -1,0 +1,58 @@
+{
+  "suite": "canonical-write-ursula",
+  "cluster": {
+    "server_machine": "c4d-standard-16-lssd",
+    "client_machine": "n2d-standard-32",
+    "client_nodes": 2,
+    "region": "europe-west4",
+    "cluster_name": "bench-ursula",
+    "zone": "europe-west4-c"
+  },
+  "saturation": {
+    "plateau_pct": 8,
+    "fleet_cpu": 0.5,
+    "repeats": 1,
+    "warmup_secs": 8,
+    "measure_secs": 8,
+    "setup_concurrency": 16,
+    "payload_bytes": 256
+  },
+  "modes": [
+    "ursula"
+  ],
+  "server_configs": {
+    "ursula": [
+      {
+        "label": "ursula-memory",
+        "args": "memory"
+      },
+      {
+        "label": "ursula-disk",
+        "args": "disk"
+      }
+    ]
+  },
+  "stream_counts": [
+    100,
+    1000,
+    10000
+  ],
+  "pod_ladder": {
+    "100": [
+      4,
+      8,
+      16
+    ],
+    "1000": [
+      4,
+      8,
+      16
+    ],
+    "10000": [
+      8,
+      16,
+      24
+    ]
+  },
+  "_doc": "CANONICAL write-saturation benchmark for ursula v0.2.0 (upstream image ghcr.io/tonbo-io/ursula:v0.2.0, target-env.sh default). Same workload as canonical-write, ursula's historic cardinality range. Runs on its own cluster (parallel-safe with canonical-write)."
+}

@@ -1,0 +1,44 @@
+{
+  "suite": "wal-tune-1x5",
+  "_doc": "WAL tuning arm 1/2 (2026-07-23, server 0.1.5): the WAL_TUNING.md '<=100k streams' layout — 1 data lane + 5 WAL shard lanes (gke/durable-streams-splitlane-guaranteed.yaml, selected by SPLITLANE=1 GUARANTEED=1) vs the canonical 3x3 general-purpose split. Same 8 pinned cores as canonical-write, 100k streams only. Compare against the canonical-write wal-ideal @100k control from the same campaign. RUN WITH: DS_TARGET=remote STATIC_CPU=1 SPLITLANE=1 GUARANTEED=1 SERVER_LOCAL_SSD_BLOCK=1 SPOT_SERVER=1 (no SERVER_MANIFEST — the SPLITLANE+GUARANTEED default IS the 1x5 manifest).",
+  "cluster": {
+    "server_machine": "c4d-standard-64-lssd",
+    "server_cpus": 8,
+    "client_machine": "n2d-standard-32",
+    "client_nodes": 3,
+    "cluster_name": "bench-waltune",
+    "zone": "europe-west4-b",
+    "region": "europe-west4"
+  },
+  "saturation": {
+    "plateau_pct": 8,
+    "patience": 2,
+    "fleet_cpu": 2,
+    "connections": 256,
+    "repeats": 1,
+    "warmup_secs": 12,
+    "measure_secs": 20,
+    "setup_concurrency": 32,
+    "payload_bytes": 256
+  },
+  "modes": [
+    "wal"
+  ],
+  "server_configs": {
+    "wal": [
+      {
+        "label": "wal-1x5",
+        "args": "--wal-shards 5 --wal-checkpoint-wal-bytes 1073741824 --wal-checkpoint-interval-ms 60000 --worker-threads 8 --wal-stats 3 --server-stats 3 --data-dir /data/wal/0"
+      }
+    ]
+  },
+  "stream_counts": [
+    100000
+  ],
+  "pod_ladder": {
+    "100000": [
+      4,
+      8
+    ]
+  }
+}

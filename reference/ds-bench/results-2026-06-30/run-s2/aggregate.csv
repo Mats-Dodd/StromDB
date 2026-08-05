@@ -1,0 +1,3 @@
+mode,stream_count,pods,throughput,p50,p99,pod_mem_mb,pod_mem_p50_mb,saturated,status,reason
+s2,100,2,1975.0,51.071,51.999,65,45,True,ok,plateau
+s2,1000,,0.0,,,,,False,error,creation_choke

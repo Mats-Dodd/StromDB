@@ -1,0 +1,108 @@
+{
+  "cells": {
+    "100": {
+      "stream_count": 100,
+      "image_digest": "92f4a6387253",
+      "walk": [
+        [
+          32,
+          461118.9
+        ],
+        [
+          48,
+          519927.95000000007
+        ],
+        [
+          64,
+          466651.9999999998
+        ]
+      ],
+      "pinned_pods": 48,
+      "throughput": 519927.95000000007,
+      "p50": 0.264,
+      "p99": 0.458,
+      "pod_mem_mb": 103,
+      "saturated": true,
+      "status": "ok",
+      "reason": "plateau",
+      "pod_mem_p50_mb": 45
+    },
+    "1000": {
+      "stream_count": 1000,
+      "image_digest": "92f4a6387253",
+      "walk": [
+        [
+          16,
+          599711.2500000001
+        ],
+        [
+          24,
+          650474.9
+        ],
+        [
+          32,
+          673484.5999999997
+        ]
+      ],
+      "pinned_pods": 24,
+      "throughput": 650474.9,
+      "p50": 1.264,
+      "p99": 6.427,
+      "pod_mem_mb": 52,
+      "saturated": true,
+      "status": "ok",
+      "reason": "plateau",
+      "pod_mem_p50_mb": 41
+    },
+    "10000": {
+      "stream_count": 10000,
+      "image_digest": "92f4a6387253",
+      "walk": [
+        [
+          32,
+          572306.2999999999
+        ],
+        [
+          48,
+          610858.4999999999
+        ]
+      ],
+      "pinned_pods": 32,
+      "throughput": 572306.2999999999,
+      "p50": 1.473,
+      "p99": 202.751,
+      "pod_mem_mb": 202,
+      "saturated": true,
+      "status": "ok",
+      "reason": "plateau",
+      "pod_mem_p50_mb": 177
+    },
+    "100000": {
+      "stream_count": 100000,
+      "image_digest": "92f4a6387253",
+      "walk": [
+        [
+          64,
+          531849.6500000001
+        ],
+        [
+          80,
+          859661.1000000001
+        ],
+        [
+          96,
+          560740.8
+        ]
+      ],
+      "pinned_pods": 80,
+      "throughput": 859661.1000000001,
+      "p50": 2.511,
+      "p99": 830.975,
+      "pod_mem_mb": 950,
+      "saturated": true,
+      "status": "ok",
+      "reason": "plateau",
+      "pod_mem_p50_mb": 515
+    }
+  }
+}

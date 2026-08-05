@@ -1,0 +1,38 @@
+{
+  "suite": "canonical-mixed-writes",
+  "workload": "mixed",
+  "cluster": {
+    "server_machine": "c4d-standard-16-lssd",
+    "client_machine": "n2d-standard-32",
+    "client_nodes": 2,
+    "region": "europe-west4",
+    "cluster_name": "bench-canon-mixed"
+  },
+  "mixed": {
+    "sweep": "readers",
+    "levels": [
+      0,
+      1000,
+      10000,
+      100000
+    ],
+    "writers_per_stream": 1,
+    "writer_rate": 5,
+    "read_rate": 0,
+    "subscribers": 0,
+    "duration_secs": 60,
+    "payload_bytes": 256,
+    "setup_concurrency": 64,
+    "pods": 1,
+    "read_interval_ms": 30000,
+    "backfill_events": 50,
+    "fleet_timeout_secs": 900
+  },
+  "modes": [
+    "wal"
+  ],
+  "stream_counts": [
+    10000
+  ],
+  "_doc": "CANONICAL read/write interference: paced catch-up readers (1k/10k/100k) against pinned writes \u2014 the '100k readers cost writes nothing' claim."
+}

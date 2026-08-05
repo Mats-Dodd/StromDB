@@ -1,0 +1,48 @@
+# Cross-node merge coordinator (Phase 2b). Downloads every fleet pod's
+# .hdr/.json from s3://bench-results/${RUN_ID}/ into a local emptyDir, then
+# runs `ds-bench hdr-merge` over the lot — the exact cross-node HDR merge that
+# the Phase-2a single-node ReadWriteOnce PVC could not do.
+#
+# Substituted by the run scripts before apply:
+#   ${PROJECT}     registry project
+#   ${RUN_ID}      run prefix to pull from MinIO
+#   ${MERGE_CMD}   the hdr-merge invocation (plain, or per-class for mixed)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bench-coordinator
+  namespace: ds-bench
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector: ${NODESEL_CLIENT}
+      containers:
+        - name: coordinator
+          image: ${IMG_DSBENCH}
+          imagePullPolicy: ${PULL_POLICY}
+          env:
+            - { name: RUN_ID, value: "${RUN_ID}" }
+          command: ["/bin/sh", "-c"]
+          # Robust collection: an empty/partial prefix (clients that crashed or were
+          # killed before uploading their HDR) must NOT abort with a raw `mc` error
+          # that renders as a misleading "0 ops". Count first; if nothing uploaded,
+          # emit an explicit JSON marker so the renderer shows "collection failed"
+          # rather than a real zero. If some uploaded, merge whatever is present.
+          args:
+            - >
+              mc alias set local http://minio:9000 minioadmin minioadmin;
+              n=$(mc ls --recursive "local/bench-results/${RUN_ID}/" 2>/dev/null | wc -l | tr -d ' ');
+              echo "coordinator: ${n} client result file(s) under ${RUN_ID}" >&2;
+              if [ "${n}" = "0" ]; then
+              echo '{"error":"no_client_results_uploaded","merged_count":0,"collected_files":0}';
+              exit 0;
+              fi;
+              mc cp --recursive "local/bench-results/${RUN_ID}/" /merge/ 2>/dev/null || true;
+              ${MERGE_CMD}
+          volumeMounts:
+            - { name: merge, mountPath: /merge }
+      volumes:
+        - name: merge
+          emptyDir: {}

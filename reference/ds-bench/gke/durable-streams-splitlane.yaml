@@ -1,0 +1,256 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# durable-streams-splitlane.yaml — SPLIT-LANE local-NVMe variant: STREAM DATA
+# FILES and WAL SHARDS on physically separate NVMe devices, so the checkpoint's
+# stream-file writeback + syncfs NEVER contends with the commit path's WAL
+# fdatasync. Motivated by wal-decomp-lane0 (2026-07-13): with everything on ONE
+# lane, ref-3s = 55k @10k; with WAL on dedicated lanes (streams elsewhere),
+# ref-3s = 270k ≈ the 260k no-fsync ceiling — the commit-fsync tax is mostly
+# device contention, not fsync itself.
+#
+# REQUIRES the server node pool created with RAW-BLOCK local NVMe
+# (SERVER_LOCAL_SSD_BLOCK=1, machine c4d-standard-64-lssd = 6 devices).
+#
+# LAYOUT (server runs with --data-dir /data/wal/0 and --wal-shards 5):
+#   * device 0 -> /data/wal/0            = the data root: streams/ (checkpoint
+#     writeback + syncfs domain), meta, cold staging.
+#   * device I (1..5) -> /data/wal/0/wal/<I-1> = WAL shard I-1's dir (walset
+#     opens shard i at <data-dir>/wal/<i>), each an independent fsync lane.
+#   * Shard count MUST be ≤ 5 (devices minus the data lane). --wal-shards 6+
+#     would spill shard 5 onto the data lane and re-introduce the contention.
+#
+# MOUNT PROPAGATION (the crux — a mount made in one container is invisible to
+# siblings unless propagated):
+#   * init container   -> mountPropagation: Bidirectional  (propagates the mounts
+#     OUT to the host mount namespace = rshared, so they SURVIVE the init
+#     container exiting and become visible to the server container).
+#   * server container -> mountPropagation: HostToContainer (RECEIVES those
+#     submounts). HostToContainer needs no privilege; Bidirectional would force
+#     the server to run privileged, which we avoid. Only the short-lived init
+#     container is privileged.
+# ${...} placeholders are envsubst-substituted by deploy_server()/MANIFEST_VARS,
+# identical to gke/durable-streams.yaml.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: durable-streams
+  namespace: ds-bench
+  labels:
+    app: durable-streams
+spec:
+  replicas: 1
+  # Recreate (not RollingUpdate): the old pod must be FULLY torn down before the
+  # new pod's initContainers wipe/mount the shared NVMe lane devices. With surge
+  # rollouts the old pod's volume teardown (kubelet cleanup recursing through its
+  # stale host-side lane mounts) raced the NEW server and deleted its freshly
+  # created dirs on the same ext4 device (--data-dir /data/wal/0 → 500 ENOENT on
+  # every stream create; wal-decomp-lane0 2026-07-13). Bench cells tolerate the
+  # brief downtime between pods.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: durable-streams
+  template:
+    metadata:
+      labels:
+        app: durable-streams
+    spec:
+      nodeSelector: ${NODESEL_SERVER}
+      shareProcessNamespace: true
+      securityContext:
+        seccompProfile:
+          type: Unconfined
+      initContainers:
+        # ── wipe the base /data volume (emptyDir) between cells ────────────────
+        # Runs FIRST (initContainers run sequentially). Only clears the base
+        # volume (the wal/shards metadata file + cold tier); the per-shard NVMe
+        # devices are wiped by mount-shards after they are mounted.
+        - name: wipe-data
+          image: ${IMG_SERVER}
+          imagePullPolicy: ${PULL_POLICY}
+          command: ["sh", "-c", "rm -rf /data/* /data/.[!.]* 2>/dev/null; true"]
+          volumeMounts:
+            - { name: data, mountPath: /data }
+        # ── mount ONE NVMe device per shard dir ───────────────────────────────
+        # Privileged: needs mount(2) + access to the host raw block devices.
+        # VERIFY AT PROVISION TIME (see MULTILANE_SETUP.md):
+        #   * image ships mkfs.ext4/mount/blkid — the server & metrics images do
+        #     NOT, so we use debian-slim + apt-get e2fsprogs/util-linux at runtime;
+        #     confirm the node has egress to mirror.gcr.io + the apt mirrors, else
+        #     bake a pinned util image into Artifact Registry and swap image: here.
+        #   * device symlink name = google-local-ssd-blockN (raw-block naming);
+        #     adjust DEV_GLOB below if `ls /dev/disk/by-id | grep local-ssd` differs.
+        - name: mount-shards
+          image: mirror.gcr.io/library/debian:12-slim
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          command:
+            - bash
+            - -c
+            - |
+              set -euo pipefail
+              # Raw-block local-NVMe device symlinks exposed by the COS host.
+              DEV_GLOB="/dev/disk/by-id/google-local-ssd-block*"
+              # mkfs.ext4 / mount / blkid are not in debian-slim by default.
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq e2fsprogs util-linux >/dev/null
+              shopt -s nullglob
+              devs=( $DEV_GLOB )
+              if [ "${#devs[@]}" -eq 0 ]; then
+                echo "FATAL: no raw-block local-NVMe devices matched $DEV_GLOB" >&2
+                echo "       (was the node created with --local-nvme-ssd-block? see MULTILANE_SETUP.md)" >&2
+                ls -l /dev/disk/by-id/ >&2 || true
+                exit 1
+              fi
+              echo "found ${#devs[@]} raw-block NVMe device(s): ${devs[*]}"
+              # split-lane topology: device 0 = data root (streams), devices 1..N
+              # nested INSIDE it as WAL shard dirs. Mount order matters: the data
+              # lane must be mounted before the shard mounts nest under it.
+              mount_one() { # $1=dev $2=dir
+                if ! blkid -o value -s TYPE "$1" 2>/dev/null | grep -qx ext4; then
+                  echo "mkfs.ext4 $1 -> $2"
+                  mkfs.ext4 -F -q "$1"
+                fi
+                mkdir -p "$2"
+                if ! mountpoint -q "$2"; then
+                  echo "mount $1 -> $2"
+                  mount "$1" "$2"
+                fi
+                # Wipe contents (fresh cell).
+                rm -rf "${2:?}"/* "${2:?}"/.[!.]* 2>/dev/null || true
+              }
+              # sort devices by ordinal suffix for a stable assignment
+              mapfile -t devs < <(printf '%s\n' "${devs[@]}" | sort -V)
+              mount_one "${devs[0]}" /data/wal/0
+              mkdir -p /data/wal/0/wal
+              n=0
+              for dev in "${devs[@]:1}"; do
+                mount_one "$dev" "/data/wal/0/wal/${n}"
+                n=$((n+1))
+              done
+              echo "split-lane mounts ready (data=${devs[0]}, ${n} wal lanes):"
+              mount | grep /data/wal || true
+          volumeMounts:
+            # Bidirectional so the mounts propagate to the host namespace and
+            # survive this container exiting (visible to the server container).
+            - { name: data, mountPath: /data, mountPropagation: Bidirectional }
+            # Host /dev so the raw by-id symlinks (-> /dev/nvmeXn1) resolve here.
+            - { name: dev, mountPath: /dev }
+      containers:
+        - name: durable-streams
+          image: ${IMG_SERVER}
+          imagePullPolicy: ${PULL_POLICY}
+          args:
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "4438"
+            - "--data-dir"
+            - "/data"
+            - "--tier"
+            - "s3"
+            - "--tier-endpoint"
+            - "http://minio:9000"
+            - "--tier-region"
+            - "us-east-1"
+            - "--tier-bucket"
+            - "durable-streams"
+            - "--tier-allow-http"
+          env:
+            - name: DS_S3_ACCESS_KEY_ID
+              value: minioadmin
+            - name: DS_S3_SECRET_ACCESS_KEY
+              value: minioadmin
+          ports:
+            - containerPort: 4438
+          readinessProbe:
+            tcpSocket: { port: 4438 }
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 30
+          volumeMounts:
+            # HostToContainer: RECEIVE the per-shard submounts the init container
+            # propagated to the host. (No privilege needed; Bidirectional here
+            # would force the server to run privileged — see MULTILANE_SETUP.md.)
+            - { name: data, mountPath: /data, mountPropagation: HostToContainer }
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
+            limits:
+              memory: "${SERVER_MEM}"
+              cpu: "${SERVER_CPU}"
+        # ── metrics sidecar ─────────────────────────────────────────────────────
+        # Unchanged from gke/durable-streams.yaml. NOTE: it df's /data (the base
+        # volume) for /proc/diskstats, so its device-wide write-bytes column now
+        # under-counts the per-shard NVMe traffic (the shard writes go to the 6
+        # sub-mounts, not the base device). Throughput/latency verdicts are
+        # client-side and unaffected. See MULTILANE_SETUP.md verify-item 7.
+        - name: metrics
+          image: ${IMG_METRICS}
+          imagePullPolicy: ${PULL_POLICY}
+          command:
+            - nice
+            - "-n"
+            - "19"
+            - bash
+            - /deploy/metrics/poller.sh
+          env:
+            - name: SERVER_PROC
+              value: durable-streams-server
+            - name: METRICS_INTERVAL_S
+              value: "1"
+            - name: METRICS_OUT
+              value: /metrics/samples.csv
+            - name: DATA_DIR
+              value: /data
+            - { name: POD_UID, valueFrom: { fieldRef: { fieldPath: metadata.uid } } }
+          volumeMounts:
+            - { name: metrics, mountPath: /metrics }
+            - { name: metrics-poller, mountPath: /deploy/metrics }
+            - { name: data, mountPath: /data, readOnly: true }
+            - { name: cgroup-host, mountPath: /host/cgroup, readOnly: true }
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "32Mi"
+            limits:
+              cpu: "50m"
+              memory: "64Mi"
+      volumes:
+        # hostPath, NOT emptyDir: kubelet deletes emptyDir contents on pod
+        # teardown, and with the lane devices still mounted under the old pod's
+        # volume path that cleanup recursed INTO the shared ext4 lanes and wiped
+        # the next server's live data (see strategy: Recreate note above). A
+        # hostPath is never cleaned up by kubelet; per-cell freshness comes from
+        # the wipe-data + mount-shards initContainers, same as before.
+        - name: data
+          # /mnt/disks is the writable hostPath root on COS nodes (bare /mnt is
+          # a read-only filesystem → MountVolume.SetUp fails).
+          hostPath: { path: /mnt/disks/ds-bench-data, type: DirectoryOrCreate }
+        - name: metrics
+          emptyDir: {}
+        - name: metrics-poller
+          configMap:
+            name: metrics-poller
+            defaultMode: 0755
+        - name: cgroup-host
+          hostPath: { path: /sys/fs/cgroup }
+        # Host /dev exposes the raw-block local-NVMe device nodes to the mount
+        # init container (its by-id symlinks point into /dev/nvmeXn1).
+        - name: dev
+          hostPath: { path: /dev }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: durable-streams
+  namespace: ds-bench
+spec:
+  selector:
+    app: durable-streams
+  ports:
+    - port: 4438
+      targetPort: 4438
