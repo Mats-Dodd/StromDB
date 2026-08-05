@@ -172,3 +172,26 @@ owned_unique_referenced_*  canonical Annals bytes/extents owned by this
 
 Forking increases logical visibility but creates no duplicate Annals row and
 therefore adds no owned-unique bytes.
+
+### 4.3 Annals: ordered retained history
+
+NB the exact semantics/ layout of the tally LSM are still subejct to change by a further RFC.  They still adhere to the currect correctness protocol though. 
+
+Annals is keyed by canonical owner and stream offset:
+
+```text
+(owning stream, start offset)
+    -> extent identity
+       end offset
+       cumulative byte/message positions
+       bounded message-boundary metadata
+       payload locator and checksum
+```
+
+Its dominant operations are predecessor seek, stream-range scan, append,
+point trim, and payload-locator replacement. Annals contains index metadata,
+not payload bodies.
+
+A fork stores its lineage and boundary in Ledger and its pins/counters in
+Tally. It does not duplicate inherited Annals entries. Reads traverse a
+bounded lineage and then read canonical owner extents.
