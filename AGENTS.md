@@ -2,7 +2,10 @@
 
 StromDB is a conforming durable streams server. See [docs/durable-streams-protocol.md](docs/durable-streams-protocol.md) for the full spec.
 
-The project is nascent and pre alpha, there is no need for any kind of backward compatibility of any kind.
+The project is nascent and pre alpha, there is no need for any kind of backward compatibility of any kind. Any and all changes are allowed and actively encouraged, no migration, no versioning.  The code should be as clean, straightforward and simple as possible. Be ambitious, if there is a clear path to improving the implementation that involves restructuring some of the codebase, go for it. Look for opportunities to reframe the change so that whole branches, helpers, modes, conditionals, or layers disappear entirely.
+Prefer the solution that makes the code feel inevitable in hindsight.
+Assume there is often a "code judo" move available: a re-organization that uses the existing architecture more effectively and makes the change dramatically simpler and more elegant.
+If you see a path to delete complexity rather than rearrange it, push hard for that path.
 
 All code must be written to adhere to our style guide in [docs/stromstyle](docs/stromstyle.md).
 
