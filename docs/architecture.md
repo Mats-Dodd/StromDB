@@ -1,6 +1,6 @@
 # durable streams server architecture
 
-This document specifies StromDb's storage engine.  Its correctness protocol, storage layout, program shape, writes, reads, maintenance and garbage collection. 
+This document specifies StromDb's storage engine.  Its correctness protocol, storage layout, program shape, writes, reads, maintenance and garbage collection. It remains authority unless superseded by explicit RFC's.  
 
 [`durable-streams-protocol.md`](durable-streams-protocol.md) remains the external Durable Streams contract.
 
@@ -195,3 +195,109 @@ not payload bodies.
 A fork stores its lineage and boundary in Ledger and its pins/counters in
 Tally. It does not duplicate inherited Annals entries. Reads traverse a
 bounded lineage and then read canonical owner extents.
+
+
+## storage capability contract
+
+strom db depends on a deliberatly narrow object store adapter.  It must provide:
+
+1. linearizable create-if-absent with exactly one direct winner;
+2. immutable object bytes while a key exists;
+3. strong read-after-create GET and ordered LIST;
+4. bounded lexicographic LIST pages with an exclusive continuation poin
+5. independently checksummed bounded range GETs;
+6. exact-validator conditional deletion for a currently observed WAL RUN;
+7. idempotent deletion for other authorized content objects;
+8. bounded decode before allocation, including key/body agreement; and
+
+Explicit operation concerns ie IAM are explicitly out of scope.  
+
+Seal deletion is denied outright.
+
+ Lifecycle deletion is disabled for all
+Courant namespaces. The WAL collector is the only role allowed to delete in
+the shared RUN/FENCE namespace.
+
+The adapter normalizes conditional-create results as evidence:
+
+```rust
+enum CreateEvidence {
+    Direct,       // this request received the winning response
+    DurableMatch, // the exact bytes exist; their author is unknown
+    NotOurs,      // different bytes occupy the immutable coordinate
+    Unresolved,   // the request may still take effect
+}
+```
+
+`Direct` is stronger than byte equality. The adapter must not manufacture it
+by transparently sending another create after an ambiguous request.
+
+Authority-bearing Seal and WAL candidates are sent exactly once. Bounded exact
+GETs may reconcile the same frozen bytes after an ambiguous response. Content
+objects such as SSTs and packs may use create-or-verify because their presence
+alone grants no authority.
+
+## 6. Durable namespace and identities
+
+Keys are canonical, versioned, and derived from domain identities. The shape
+is conceptually:
+
+```text
+partition/<partition>/seal/v1/<reverse generation>
+partition/<partition>/wal/v1/<reverse batch>
+partition/<partition>/table/v1/<store>/<birth generation>/<attempt>/<ordinal>
+partition/<partition>/payload-pack/v1/<birth generation>/<attempt>/<ordinal>
+```
+
+Reverse coordinates are fixed-width decimal encodings:
+
+```text
+storage_ordinal = u64::MAX - logical_ordinal
+```
+
+Ascending `ListObjectsV2(MaxKeys=1)` therefore returns the greatest Seal
+generation or greatest surviving WAL coordinate. The exact wire spelling is a
+versioned format decision and receives golden vectors.
+
+Fresh immutable object identity is scoped to the Seal generation that could
+first select it:
+
+```rust
+struct AttemptId {
+    owner_claim: SealGeneration,
+    local_counter: u64,
+}
+
+struct FreshIdentity {
+    birth_generation: SealGeneration,
+    attempt: AttemptId,
+    ordinal: u32,
+}
+
+struct TableObjectId {
+    fresh: FreshIdentity,
+    store: StoreKind,
+}
+
+struct PayloadPackId(FreshIdentity);
+```
+
+The counter is checked and process-local. After restart, a process must author
+a new claim before preparing objects, so a legal writer never reuses
+`(owner_claim, local_counter)`. An attempt never adopts an arbitrary orphan
+found by LIST or content hash.
+
+Every object envelope contains its logical identity, format, bounded lengths,
+and checksum. Decode verifies:
+
+```text
+length bound
+-> magic, object kind, and format
+-> checksum
+-> bounded body with no trailing bytes
+-> domain invariants
+-> canonical key/body identity
+```
+
+Foreign or noncanonical objects under a Courant-owned prefix are durable
+contradictions, not candidates to ignore.
