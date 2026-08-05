@@ -1,0 +1,585 @@
+//! The `Network` is a set of proxies used to inject network faults in a Vortex test cluster. We
+//! create one `Proxy` per replica in the test cluster. Each proxy has a set of available
+//! `Connection`s, which model the communication through the proxy (replica-to-replica or
+//! client-to-replica). Each `Connection` has two pipes, connecting the peers' inputs and outputs
+//! (recv and send).
+//!
+//! The _mappings_ are pairs of addresses:
+//!
+//! * _origin_: the address on which the proxy listens for connections from _origin_ peers
+//! * _remote_: the address the proxy connects to, to communicate with the _remote_ peers
+//!
+//! A pipe runs, alternating recv and send, until it sees that the connection is no longer proxying
+//! or if there's an error or EOF, in which case it also closes the parent connection.
+//!
+//! When the `Faults` struct is populated with non-null configurations, the pipes inject
+//! corresponding faults according to the probabilities.
+//!
+//! NOTE: The pipe is not yet message-aware (and perhaps shouldn't be?), which means that we deal
+//! with whatever chunks of bytes we receive immediately, instead of collecting a buffer with a
+//! full message before piping it through.
+const std = @import("std");
+const stdx = @import("stdx");
+const IO = @import("../../io.zig").IO;
+const constants = @import("constants.zig");
+
+const assert = std.debug.assert;
+const log = std.log.scoped(.faulty_network);
+const Ratio = stdx.PRNG.Ratio;
+
+const Faults = struct {
+    const Delay = struct {
+        time_ms: u32,
+        jitter_ms: u32,
+    };
+
+    delay: ?Delay = null,
+    corrupt: ?Ratio = null,
+
+    // Others not implemented: duplication, reordering, rate
+
+    pub fn heal(faults: *Faults) void {
+        faults.delay = null;
+        faults.corrupt = null;
+    }
+
+    pub fn is_healed(faults: *const Faults) bool {
+        return faults.delay == null and faults.corrupt == null;
+    }
+};
+
+const Pipe = struct {
+    io: *IO,
+    connection: *Connection,
+    input: ?std.posix.socket_t = null,
+    output: ?std.posix.socket_t = null,
+    buffer: [constants.vsr.message_size_max]u8 = undefined,
+    status: enum { idle, recv, send, send_timeout } = .idle,
+    recv_size: u32 = 0,
+    send_size: u32 = 0,
+
+    recv_completion: IO.Completion = undefined,
+    send_completion: IO.Completion = undefined,
+
+    fn open(
+        pipe: *Pipe,
+        input: std.posix.socket_t,
+        output: std.posix.socket_t,
+    ) void {
+        assert(pipe.connection.state == .proxying);
+        assert(pipe.status == .idle);
+        assert(pipe.input == null);
+        assert(pipe.output == null);
+        assert(pipe.recv_size == 0);
+        assert(pipe.send_size == 0);
+
+        pipe.input = input;
+        pipe.output = output;
+
+        // Kick off the recv/send loop.
+        pipe.recv();
+    }
+
+    fn recv(pipe: *Pipe) void {
+        assert(pipe.send_size <= pipe.recv_size);
+        assert(pipe.connection.state == .proxying);
+
+        assert(pipe.status == .idle);
+        pipe.status = .recv;
+
+        pipe.recv_size = 0;
+        pipe.send_size = 0;
+
+        // We don't need to recv a certain count of bytes, because whatever we recv, we send along.
+        pipe.connection.io.recv(
+            *Pipe,
+            pipe,
+            recv_callback,
+            &pipe.recv_completion,
+            pipe.input.?,
+            pipe.buffer[0..],
+        );
+    }
+
+    fn recv_callback(pipe: *Pipe, _: *IO.Completion, result: IO.RecvError!usize) void {
+        assert(pipe.recv_size == 0);
+        assert(pipe.send_size == 0);
+        assert(pipe.connection.state != .free);
+        assert(pipe.connection.state != .accepting);
+        assert(pipe.connection.state != .connecting);
+
+        assert(pipe.status == .recv);
+        pipe.status = .idle;
+
+        if (pipe.connection.state != .proxying) return;
+
+        const recv_size = result catch |err| {
+            log.warn("recv error ({d},{d}): {any}", .{
+                pipe.connection.replica_index,
+                pipe.connection.connection_index,
+                err,
+            });
+            return pipe.connection.try_close();
+        };
+
+        pipe.recv_size = @intCast(recv_size);
+        if (pipe.recv_size == 0) {
+            // Zero bytes means EOF.
+            return pipe.connection.try_close();
+        }
+
+        if (pipe.connection.network.faults.corrupt) |corrupt| {
+            if (pipe.connection.network.prng.chance(corrupt)) {
+                switch (pipe.connection.network.prng.enum_uniform(enum { shuffle, zero })) {
+                    .shuffle => {
+                        log.debug("shuffling {d} bytes ({d},{d})", .{
+                            pipe.recv_size,
+                            pipe.connection.replica_index,
+                            pipe.connection.connection_index,
+                        });
+                        pipe.connection.network.prng.shuffle(u8, pipe.buffer[0..pipe.recv_size]);
+                    },
+                    .zero => {
+                        log.debug("zeroing {d} bytes ({d},{d})", .{
+                            pipe.recv_size,
+                            pipe.connection.replica_index,
+                            pipe.connection.connection_index,
+                        });
+                        @memset(pipe.buffer[0..pipe.recv_size], 0);
+                    },
+                }
+            }
+        }
+
+        if (pipe.connection.network.faults.delay) |delay| {
+            assert(delay.time_ms > 0);
+            assert(delay.jitter_ms <= delay.time_ms);
+            const jitter_size = pipe.connection.network.prng.int_inclusive(
+                u32,
+                delay.jitter_ms,
+            );
+            const jitter_diff_ms: i32 = @as(i32, @intCast(jitter_size)) *
+                (if (pipe.connection.network.prng.boolean()) @as(i32, 1) else -1);
+            // timeout(0) is banned - 1ns is close enough.
+            const timeout_duration_ns = @as(
+                u63,
+                @intCast(@as(i32, @intCast(delay.time_ms)) + jitter_diff_ms),
+            ) * std.time.ns_per_ms + 1;
+            assert(timeout_duration_ns > 0);
+
+            log.debug("delaying {} ({d},{d})", .{
+                std.fmt.fmtDuration(timeout_duration_ns),
+                pipe.connection.replica_index,
+                pipe.connection.connection_index,
+            });
+
+            assert(pipe.status == .idle);
+            pipe.status = .send_timeout;
+            pipe.io.timeout(
+                *Pipe,
+                pipe,
+                timeout_callback,
+                &pipe.send_completion,
+                timeout_duration_ns,
+            );
+        } else {
+            pipe.send();
+        }
+    }
+
+    fn timeout_callback(pipe: *Pipe, _: *IO.Completion, result: IO.TimeoutError!void) void {
+        assert(pipe.status == .send_timeout);
+        assert(pipe.connection.state != .free);
+        assert(pipe.connection.state != .accepting);
+        assert(pipe.connection.state != .connecting);
+        pipe.status = .idle;
+
+        if (pipe.connection.state != .proxying) return;
+
+        result catch @panic("timeout error");
+        pipe.send();
+    }
+
+    fn send(pipe: *Pipe) void {
+        assert(pipe.connection.state == .proxying);
+        assert(pipe.send_size < pipe.recv_size);
+
+        assert(pipe.status == .idle);
+        pipe.status = .send;
+
+        pipe.io.send(
+            *Pipe,
+            pipe,
+            send_callback,
+            &pipe.send_completion,
+            pipe.output.?,
+            pipe.buffer[pipe.send_size..pipe.recv_size],
+        );
+    }
+
+    fn send_callback(pipe: *Pipe, _: *IO.Completion, result: IO.SendError!usize) void {
+        assert(pipe.send_size < pipe.recv_size);
+        assert(pipe.connection.state != .free);
+        assert(pipe.connection.state != .accepting);
+        assert(pipe.connection.state != .connecting);
+
+        assert(pipe.status == .send);
+        pipe.status = .idle;
+
+        if (pipe.connection.state != .proxying) return;
+
+        const send_size = result catch |err| {
+            log.warn("send error ({d},{d}): {any}", .{
+                pipe.connection.replica_index,
+                pipe.connection.connection_index,
+                err,
+            });
+            return pipe.connection.try_close();
+        };
+        pipe.send_size += @intCast(send_size);
+
+        if (pipe.send_size < pipe.recv_size) {
+            pipe.send();
+        } else {
+            assert(pipe.send_size == pipe.recv_size);
+            pipe.recv();
+        }
+    }
+};
+
+const Connection = struct {
+    io: *IO,
+    network: *Network,
+    state: enum {
+        free,
+        accepting,
+        connecting,
+        proxying,
+        closing,
+        closing_origin,
+        closing_remote,
+    } = .free,
+
+    replica_index: usize,
+    connection_index: usize,
+
+    origin_fd: ?std.posix.socket_t = null,
+    remote_fd: ?std.posix.socket_t = null,
+
+    origin_to_remote_pipe: Pipe,
+    remote_to_origin_pipe: Pipe,
+
+    remote_address: ?stdx.SocketAddress = null,
+
+    accept_completion: IO.Completion = undefined,
+    connect_completion: IO.Completion = undefined,
+    close_completion: IO.Completion = undefined,
+
+    fn accept_callback(
+        connection: *Connection,
+        _: *IO.Completion,
+        result: IO.AcceptError!std.posix.socket_t,
+    ) void {
+        assert(connection.state == .accepting);
+        assert(connection.origin_fd == null);
+        assert(connection.remote_fd == null);
+        assert(connection.remote_address != null);
+
+        const fd = result catch |err| {
+            log.warn("accept failed ({d},{d}): {}", .{
+                connection.replica_index,
+                connection.connection_index,
+                err,
+            });
+            return connection.try_close();
+        };
+        connection.origin_fd = fd;
+
+        const remote_fd = connection.io.open_socket_tcp(
+            connection.remote_address.?.ip.family(),
+            tcp_options,
+        ) catch |err| {
+            log.warn("couldn't open socket for remote ({d},{d}): {}", .{
+                connection.replica_index,
+                connection.connection_index,
+                err,
+            });
+            return connection.try_close();
+        };
+
+        connection.remote_fd = remote_fd;
+        connection.state = .connecting;
+
+        connection.io.connect(
+            *Connection,
+            connection,
+            Connection.connect_callback,
+            &connection.connect_completion,
+            connection.remote_fd.?,
+            connection.remote_address.?,
+        );
+    }
+
+    fn connect_callback(
+        connection: *Connection,
+        _: *IO.Completion,
+        result: IO.ConnectError!void,
+    ) void {
+        assert(connection.state == .connecting);
+        assert(connection.origin_fd != null);
+        assert(connection.remote_fd != null);
+
+        result catch |err| {
+            log.warn("connect failed ({d},{d}): {}", .{
+                connection.replica_index,
+                connection.connection_index,
+                err,
+            });
+            return connection.try_close();
+        };
+        connection.state = .proxying;
+        connection.origin_to_remote_pipe.open(connection.origin_fd.?, connection.remote_fd.?);
+        connection.remote_to_origin_pipe.open(connection.remote_fd.?, connection.origin_fd.?);
+    }
+
+    fn try_close(connection: *Connection) void {
+        assert(connection.state != .free);
+
+        if (connection.state == .closing_origin or
+            connection.state == .closing_remote) return;
+
+        const has_inflight_operations =
+            connection.origin_to_remote_pipe.status != .idle or
+            connection.remote_to_origin_pipe.status != .idle;
+
+        if (connection.state != .closing and has_inflight_operations) {
+            log.debug("try_close ({d},{d}): marking connection as closing", .{
+                connection.replica_index,
+                connection.connection_index,
+            });
+            connection.state = .closing;
+            std.posix.shutdown(connection.origin_fd.?, .both) catch |err| switch (err) {
+                error.SocketNotConnected => {},
+                else => log.warn("shutdown origin_fd ({d},{d}) failed: {}", .{
+                    connection.replica_index, connection.connection_index, err,
+                }),
+            };
+            std.posix.shutdown(connection.remote_fd.?, .both) catch |err| switch (err) {
+                error.SocketNotConnected => {},
+                else => log.warn("shutdown remote_fd ({d},{d}) failed: {}", .{
+                    connection.replica_index, connection.connection_index, err,
+                }),
+            };
+        }
+
+        if (has_inflight_operations) {
+            // Network.tick() will keep calling try_close().
+            assert(connection.state == .closing);
+        } else {
+            // Kick off the close sequence.
+            connection.state = .closing_origin;
+            connection.io.close(
+                *Connection,
+                connection,
+                close_origin_callback,
+                &connection.close_completion,
+                connection.origin_fd.?,
+            );
+        }
+    }
+
+    fn close_origin_callback(
+        connection: *Connection,
+        _: *IO.Completion,
+        result: IO.CloseError!void,
+    ) void {
+        assert(connection.state == .closing_origin);
+        defer assert(connection.state == .closing_remote);
+
+        assert(connection.origin_fd != null);
+        defer assert(connection.origin_fd == null);
+
+        result catch |err| {
+            log.warn("close_origin_callback ({d},{d}) error: {any}", .{
+                connection.replica_index,
+                connection.connection_index,
+                err,
+            });
+        };
+
+        connection.state = .closing_remote;
+        connection.origin_fd = null;
+        connection.io.close(
+            *Connection,
+            connection,
+            close_remote_callback,
+            &connection.close_completion,
+            connection.remote_fd.?,
+        );
+    }
+
+    fn close_remote_callback(
+        connection: *Connection,
+        _: *IO.Completion,
+        result: IO.CloseError!void,
+    ) void {
+        assert(connection.state == .closing_remote);
+        defer assert(connection.state == .free);
+
+        assert(connection.remote_fd != null);
+        defer assert(connection.remote_fd == null);
+
+        result catch |err| {
+            log.warn("close_remote_callback ({d},{d}) error: {any}", .{
+                connection.replica_index,
+                connection.connection_index,
+                err,
+            });
+        };
+
+        log.debug("close_remote_callback ({d},{d}): marking connection as free", .{
+            connection.replica_index,
+            connection.connection_index,
+        });
+        connection.state = .free;
+        connection.remote_fd = null;
+        connection.remote_address = null;
+        connection.origin_to_remote_pipe = .{ .io = connection.io, .connection = connection };
+        connection.remote_to_origin_pipe = .{ .io = connection.io, .connection = connection };
+    }
+};
+
+const Proxy = struct {
+    io: *IO,
+    accept_fd: std.posix.socket_t,
+    origin_address: stdx.SocketAddress, // The proxy's address.
+    remote_address: stdx.SocketAddress, // The replica's address.
+    connections: [constants.vortex.connections_count_max]Connection,
+
+    fn deinit(proxy: *Proxy) void {
+        proxy.io.close_socket(proxy.accept_fd);
+        proxy.* = undefined;
+    }
+};
+
+const tcp_options: IO.TCPOptions = .{
+    .rcvbuf = 0,
+    .sndbuf = 0,
+    .keepalive = null,
+    .user_timeout_ms = 0,
+    .nodelay = false,
+};
+
+pub const Network = struct {
+    io: *IO,
+    prng: *stdx.PRNG,
+    proxies: []Proxy,
+    faults: Faults,
+
+    pub fn listen(
+        allocator: std.mem.Allocator,
+        prng: *stdx.PRNG,
+        io: *IO,
+        replica_ports: []const u16,
+    ) !*Network {
+        const network = try allocator.create(Network);
+        errdefer allocator.destroy(network);
+
+        const proxies = try allocator.alloc(Proxy, replica_ports.len);
+        errdefer allocator.free(proxies);
+
+        network.* = .{
+            .io = io,
+            .prng = prng,
+            .proxies = proxies,
+            .faults = std.mem.zeroes(Faults),
+        };
+
+        var proxies_initialized: usize = 0;
+        errdefer for (proxies[0..proxies_initialized]) |*proxy| proxy.deinit();
+
+        // Proxies get an unused port from the ephemeral port range (usually 32768-60999; see
+        // /proc/sys/net/ipv4/ip_local_port_range) by listening on port=0.
+        // We assume that replicas' ports are from outside of that range and cannot conflict.
+        for (proxies, replica_ports, 0..) |*proxy, replica_port, replica_index| {
+            const replica_address: stdx.SocketAddress = .{
+                .ip = .@"127.0.0.1",
+                .port = replica_port,
+            };
+            const listen_address: stdx.SocketAddress = .{ .ip = .@"127.0.0.1", .port = 0 };
+            const listen_fd = try io.open_socket_tcp(.IPv4, tcp_options);
+            errdefer io.close_socket(listen_fd);
+
+            const origin_address = try io.listen(listen_fd, listen_address, .{ .backlog = 64 });
+            proxy.* = .{
+                .io = io,
+                .accept_fd = listen_fd,
+                .origin_address = origin_address,
+                .remote_address = replica_address,
+                .connections = undefined,
+            };
+
+            for (&proxy.connections, 0..) |*connection, connection_index| {
+                connection.* = .{
+                    .io = io,
+                    .network = network,
+                    .state = .free,
+                    .replica_index = replica_index,
+                    .connection_index = connection_index,
+                    .origin_to_remote_pipe = .{ .io = io, .connection = connection },
+                    .remote_to_origin_pipe = .{ .io = io, .connection = connection },
+                };
+            }
+            proxies_initialized += 1;
+
+            log.debug("proxying {any} -> {any}", .{ origin_address, replica_address });
+        }
+
+        return network;
+    }
+
+    pub fn destroy(network: *Network, allocator: std.mem.Allocator) void {
+        for (network.proxies) |*proxy| proxy.deinit();
+        allocator.free(network.proxies);
+        allocator.destroy(network);
+    }
+
+    pub fn tick(network: *Network) void {
+        for (network.proxies, 0..) |*proxy, replica_index| {
+            for (&proxy.connections) |*connection| {
+                assert(connection.replica_index == replica_index);
+
+                if (connection.state == .closing) {
+                    connection.try_close();
+                    continue;
+                }
+                // This proxy tries to accept with connections that are free. The pipes must also
+                // have no outstanding IO submissions racing with reusing the pipes for new
+                // connections.
+                if (connection.state == .free) {
+                    assert(connection.origin_to_remote_pipe.status == .idle);
+                    assert(connection.remote_to_origin_pipe.status == .idle);
+                    assert(connection.origin_fd == null);
+                    assert(connection.remote_fd == null);
+                    assert(connection.remote_address == null);
+
+                    log.debug("accepting ({d},{d})", .{
+                        connection.replica_index,
+                        connection.connection_index,
+                    });
+
+                    connection.state = .accepting;
+                    connection.remote_address = proxy.remote_address;
+
+                    network.io.accept(
+                        *Connection,
+                        connection,
+                        Connection.accept_callback,
+                        &connection.accept_completion,
+                        proxy.accept_fd,
+                    );
+                }
+            }
+        }
+    }
+};

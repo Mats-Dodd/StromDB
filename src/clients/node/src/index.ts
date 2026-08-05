@@ -1,0 +1,232 @@
+export * from './bindings'
+import {
+  Account,
+  Transfer,
+  CreateAccountResult,
+  CreateTransferResult,
+  Operation,
+  AccountFilter,
+  AccountBalance,
+  QueryFilter,
+} from './bindings'
+import { randomFillSync } from 'node:crypto'
+
+const binding: Binding = (() => {
+  const { arch, platform } = process
+
+  const archMap = {
+    "arm64": "aarch64",
+    "x64": "x86_64"
+  }
+
+  const platformMap = {
+    "linux": "linux",
+    "darwin": "macos",
+    "win32" : "windows",
+  }
+
+  if (! (arch in archMap)) {
+    throw new Error(`Unsupported arch: ${arch}`)
+  }
+
+  if (! (platform in platformMap)) {
+    throw new Error(`Unsupported platform: ${platform}`)
+  }
+
+  let linuxABI = ''
+
+  /**
+   * We need to detect during runtime which libc we're running on to load the correct NAPI.
+   * binary.
+   */
+  if (platform === 'linux') {
+    const glibcVersionRuntime = (process.report.getReport() as any).header.glibcVersionRuntime
+    if (glibcVersionRuntime) {
+      linuxABI = '-gnu'
+    } else {
+      linuxABI = '-musl'
+    }
+  }
+
+  const filename = `./bin/${archMap[arch as keyof typeof archMap]}-` +
+                    `${platformMap[platform as keyof typeof platformMap]}${linuxABI}/client.node`
+  return require(filename)
+})()
+
+export type Context = object // tb_client
+export type AccountID = bigint // u128
+export type TransferID = bigint // u128
+export type Event = Account | Transfer | AccountID | TransferID | AccountFilter | QueryFilter
+export type Result = CreateAccountResult | CreateTransferResult | Account | Transfer | AccountBalance
+export type ResultCallback = (error: Error | null, results: Result[] | null) => void
+
+export const amount_max: bigint = (2n ** 128n) - 1n
+
+// Error codes returned by the client.
+export const ErrorCodes = {
+  ERR_CLIENT_CLOSED: 'ERR_CLIENT_CLOSED',
+  ERR_CLIENT_EVICTED: 'ERR_CLIENT_EVICTED',
+  ERR_CLIENT_RELEASE_TOO_LOW: 'ERR_CLIENT_RELEASE_TOO_LOW',
+  ERR_CLIENT_RELEASE_TOO_HIGH: 'ERR_CLIENT_RELEASE_TOO_HIGH',
+  ERR_TOO_MUCH_DATA: 'ERR_TOO_MUCH_DATA',
+} as const;
+
+export type ErrorCodes = typeof ErrorCodes[keyof typeof ErrorCodes];
+
+export class RequestError extends Error {
+  code: ErrorCodes;
+
+  constructor(code: ErrorCodes) {
+    super(RequestError.errorMessage(code));
+    this.name = 'RequestError';
+    this.code = code;
+  }
+
+  static errorMessage(code: ErrorCodes): string {
+    switch (code) {
+      case ErrorCodes.ERR_CLIENT_CLOSED:
+        return 'Client was closed.'
+      case ErrorCodes.ERR_CLIENT_EVICTED:
+        return 'Client was evicted.'
+      case ErrorCodes.ERR_CLIENT_RELEASE_TOO_LOW:
+        return 'Client was evicted: release too old.'
+      case ErrorCodes.ERR_CLIENT_RELEASE_TOO_HIGH:
+        return 'Client was evicted: release too new.'
+      case ErrorCodes.ERR_TOO_MUCH_DATA:
+        return 'Too much data was sent or requested in this batch.'
+      default:
+        throw new Error("Unknown error code.")
+    }
+  }
+
+}
+
+interface BindingInitArgs {
+  cluster_id: bigint, // u128
+  replica_addresses: Buffer,
+  request_error_class: typeof RequestError,
+}
+
+interface Binding {
+  init: (args: BindingInitArgs) => Context
+  submit: (context: Context, operation: Operation, batch: Event[], callback: ResultCallback) => void
+  deinit: (context: Context) => void,
+}
+
+export interface ClientInitArgs {
+  cluster_id: bigint, // u128
+  replica_addresses: Array<string | number>,
+}
+
+export interface Client {
+  createAccounts: (batch: Account[]) => Promise<CreateAccountResult[]>
+  createTransfers: (batch: Transfer[]) => Promise<CreateTransferResult[]>
+  lookupAccounts: (batch: AccountID[]) => Promise<Account[]>
+  lookupTransfers: (batch: TransferID[]) => Promise<Transfer[]>
+  getAccountTransfers: (filter: AccountFilter) => Promise<Transfer[]>
+  getAccountBalances: (filter: AccountFilter) => Promise<AccountBalance[]>
+  queryAccounts: (filter: QueryFilter) => Promise<Account[]>
+  queryTransfers: (filter: QueryFilter) => Promise<Transfer[]>
+  destroy: () => void
+}
+
+export function createClient (args: ClientInitArgs): Client {
+  // Context becomes null when `destroy` is called. After that point, further `request` Promises
+  // throw a shutdown Error. This prevents tb_client calls from happening after tb_client_deinit().
+  let context: Context | null = binding.init({
+    cluster_id: args.cluster_id,
+    replica_addresses: Buffer.from(args.replica_addresses.join(',')),
+    request_error_class: RequestError,
+  })
+
+  const destroy = () => {
+    if (context) binding.deinit(context)
+    context = null;
+  }
+
+  const request = <T extends Result>(operation: Operation, batch: Event[]): Promise<T[]> => {
+    return new Promise((resolve, reject) => {
+      try {
+        if (!context) throw new RequestError(ErrorCodes.ERR_CLIENT_CLOSED);
+
+        binding.submit(context, operation, batch, (error, result) => {
+          if (error) {
+            reject(error)
+          } else if (result) {
+            resolve(result as T[])
+          } else {
+            throw new Error("UB: Binding invoked callback without error or result")
+          }
+        })
+      } catch (err) {
+        reject(err)
+      }
+    })
+  }
+
+  return {
+    createAccounts(batch) { return request(Operation.create_accounts, batch) },
+    createTransfers(batch) { return request(Operation.create_transfers, batch) },
+    lookupAccounts(batch) { return request(Operation.lookup_accounts, batch) },
+    lookupTransfers(batch) { return request(Operation.lookup_transfers, batch) },
+    getAccountTransfers(filter) { return request(Operation.get_account_transfers, [filter]) },
+    getAccountBalances(filter) { return request(Operation.get_account_balances, [filter]) },
+    queryAccounts(filter) { return request(Operation.query_accounts, [filter]) },
+    queryTransfers(filter) { return request(Operation.query_transfers, [filter]) },
+    destroy,
+  }
+}
+
+let idLastTimestamp = 0;
+
+// These are two references to the same buffer.
+// We only need the `Uint8Array` because in Node.js 24, but not earlier, `crypto.randomFillSync`
+// rejects `DataView` typed arguments.
+const idLastBuffer = new DataView(new ArrayBuffer(16));
+const idLastBufferArray = new Uint8Array(
+    idLastBuffer.buffer, idLastBuffer.byteOffset, idLastBuffer.byteLength
+);
+
+/**
+ * Generates a Universally Unique and Sortable Identifier as a u128 bigint.
+ *
+ * @remarks
+ * Based on {@link https://github.com/ulid/spec}, IDs returned are guaranteed to be monotonically
+ * increasing.
+ */
+export function id(): bigint {
+  // Ensure timestamp monotonically increases and generate a new random on each new timestamp.
+  let timestamp = Date.now()
+  if (timestamp <= idLastTimestamp) {
+    timestamp = idLastTimestamp
+  } else {
+    idLastTimestamp = timestamp
+    randomFillSync(idLastBufferArray)
+  }
+
+  // Increment the u80 in idLastBuffer using carry arithmetic on u32s (as JS doesn't have fast u64).
+  const littleEndian = true
+  const randomLo32 = idLastBuffer.getUint32(0, littleEndian) + 1
+  const randomHi32 = idLastBuffer.getUint32(4, littleEndian) + (randomLo32 > 0xFFFF_FFFF ? 1 : 0)
+  const randomHi16 = idLastBuffer.getUint16(8, littleEndian) + (randomHi32 > 0xFFFF_FFFF ? 1 : 0)
+  if (randomHi16 > 0xFFFF) {
+    timestamp += 1
+    idLastTimestamp = timestamp
+
+    if (timestamp === 0x1_0000_0000_0000) {
+        throw new Error('timestamp overflow on monotonic increment')
+    }
+  }
+
+  // Store the incremented random monotonic and the timestamp into the buffer.
+  idLastBuffer.setUint32(0, randomLo32 & 0xFFFF_FFFF, littleEndian)
+  idLastBuffer.setUint32(4, randomHi32 & 0xFFFF_FFFF, littleEndian)
+  idLastBuffer.setUint16(8, randomHi16, littleEndian) // No need to mask since checked above.
+  idLastBuffer.setUint16(10, timestamp & 0xFFFF, littleEndian) // timestamp lo.
+  idLastBuffer.setUint32(12, (timestamp / 0x10000) | 0, littleEndian) // timestamp hi.
+
+  // Then return the buffer's contents as a little-endian u128 bigint.
+  const lo = idLastBuffer.getBigUint64(0, littleEndian)
+  const hi = idLastBuffer.getBigUint64(8, littleEndian)
+  return (hi << 64n) | lo
+}
