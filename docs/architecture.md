@@ -1,4 +1,4 @@
-# Durable streams server architecture
+# durable streams server architecture
 
 This document specifies StromDb's storage engine.  Its correctness protocol, storage layout, program shape, writes, reads, maintenance and garbage collection. 
 
@@ -71,3 +71,35 @@ family must route together so lineage, pins, retention, and inherited reads can
 remain one bounded fact protocol. V1 may deploy one partition; later partition
 placement and movement belong to the router/control plane and must not create
 a second storage authority. 
+
+
+## system anatomy
+
+The system is built around 4 primitives who compose into our corrctness protocol and performance characteristics. 
+
+```text
+Seal       commits
+WAL        remembers
+LSM forest organizes
+packs      carry bytes
+```
+
+The seal is our clean serialization point for the many trees in our lsm forest. It is our immutable serving manifest. 
+
+The wal is our linearization point, it carries the data for all stores into one point of linearizibility for a write.  
+
+The LSM forest is a set of individual LSM stores tuned to the different requirements of workload prescribed to servers in the durable streams protocol.  
+
+payloads are payloads, our machinery revolves around serving these correctly and efficiently.
+
+Every materialized state change follows one S3 publication shape:
+
+```text
+zero or more fresh immutable children
+    -> one complete exact-successor immutable Seal
+```
+
+S3 has no multi-object transaction or atomic rename. The conditional Seal
+create is both manifest publication and transaction commit: children written
+before it are either selected together or remain unreachable garbage. There
+is no intermediate root object.
