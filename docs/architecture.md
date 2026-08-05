@@ -103,3 +103,35 @@ S3 has no multi-object transaction or atomic rename. The conditional Seal
 create is both manifest publication and transaction commit: children written
 before it are either selected together or remain unreachable garbage. There
 is no intermediate root object.
+
+## 4. Protocol state and physical projections
+
+The public protocol exposes one stream abstraction. The engine represents its
+state through three ordered projections because their workloads differ. They
+are not three transactions or three authorities. One `OperationFact` can
+change all three atomically at one WAL coordinate.
+
+
+### 4.1 Ledger: ordered identity and lifecycle
+
+
+Ledger is keyed primarily by canonical stream path and stores cold identity:
+
+```text
+stream path
+    -> stream identity
+       content type and configuration
+       creation and permanent path tombstone
+       open/closed/soft-deleted lifecycle
+       TTL or absolute-expiry policy
+       parent stream and exact fork boundary
+```
+
+Its dominant operations are exact lookup, ordered prefix scan, glob build,
+fork-lineage traversal, and rare lifecycle mutation. Lexical range order is
+part of the workload rather than an incidental implementation property.
+
+Path tombstones are permanent logical values because the protocol discourages
+reusing a deleted stream URL. Compaction does not silently erase that fact.
+
+
