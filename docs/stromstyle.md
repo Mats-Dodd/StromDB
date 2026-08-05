@@ -186,6 +186,11 @@ read back from durable storage are foreign again and re-enter the path at the to
 
 -Assert liberally inside the engine. The simulation finds bugs only when some check fails loudly.
 
+- Give assertions a cost budget by plane (§10). The control plane may spend much to
+  verify little: an O(N) assertion guarding an O(1) decision is money well spent. The
+  data plane gets O(1) assertions per element; hoist anything more expensive out of the
+  loop and into the surrounding control plane.
+
 - Assertions run in every build. `assert!` is the default; `debug_assert!` MUST NOT be
   used except with a measured cost justification carried in an
   `#[expect(clippy::disallowed_macros, reason = "...")]`.
@@ -327,7 +332,8 @@ pure transformation.
   concrete case.
 
 - Keep control-plane operations such as stream creation and configuration distinct from
-  data-plane operations such as append, read, trim, flush, and recovery.
+  data-plane operations such as append, read, trim, flush, and recovery. §10 gives the
+  two planes separate cost and assertion budgets.
 
 - Default to concrete signatures: borrowed parameters (`&str`, `&[u8]`, `&StreamName`) and
   owned returns. Use generic bounds such as `impl AsRef<_>` or `impl IntoIterator<Item = _>`
@@ -514,6 +520,15 @@ or delete it.
 - All fan-out, queues, buffers, retries, and background work MUST be bounded by named
   limits, not allowed to grow with input without constraint.
 
+- Limits are the design, not a defense. Derive each limit up front from configuration as
+  a worst-case count per object type, and let every component honor its neighbors'
+  limits. When everything is bounded, nothing grows without bound, and backpressure
+  exists without explicit backpressure code.
+
+- A hot path SHOULD NOT allocate after startup: pre-size buffers, pools, and queues from
+  the named limits. Full static allocation is not the goal in async Rust; bounded,
+  pre-sized working memory is. State the reason where a hot path must allocate.
+
 - Do not do work directly in reaction to external events. Queue or shed the event and let the
   system drain at its own pace. Keeping control flow under the program's control is what
   makes bounds on work per unit time enforceable, and batching falls out for free.
@@ -553,9 +568,13 @@ or delete it.
   batching, or background work. Consider storage I/O, memory, CPU, and, where applicable,
   network costs in both latency and bandwidth.
 
+- Name the speed of light before designing a hot path: the cost of the simplest possible
+  model of the operation, such as "an append is one memcpy and one queued write". Judge
+  every layer added on top by its distance from that baseline.
+
 - Optimize the slowest resource first. For embedded durable streams, persistence latency,
   write amplification, recovery work, and read amplification generally deserve attention
-  before CPU micro-optimizations; verify with measurement. That said, where appropriate, data oriented design can be useful, have mechanical sympathy where valid.  
+  before CPU micro-optimizations; verify with measurement.
 
 - Batch storage work where the durability contract permits, but keep batches bounded and
   make their visibility and durability semantics explicit.
@@ -565,6 +584,42 @@ or delete it.
 
 - Put bounds on all work: record and batch sizes, segments, scans, retries, queues, buffers,
   recovery, and background tasks have caller-imposed limits.
+
+### Control plane and data plane
+
+- Label each path. The control plane decides—stream creation, batch admission, plan
+  selection—and is O(1). The data plane moves bytes—encode, copy, checksum, flush—and is
+  O(N). §6 keeps the planes in separate operations; this section gives them separate
+  budgets: the control plane may be lavish with checks (§3), the data plane must stay
+  lean and straight.
+
+- Keep control-plane `if`s out of data-plane `for`s. Branching, error mapping, and policy
+  run before the loop; the inner loop runs straight-line over homogeneous data. This is
+  the macro form of "push `if`s up and `for`s down" (§5).
+
+- Prefer homogeneous batches. A batch of one kind moves the per-element type branch out
+  of the inner loop and turns N decisions into one.
+
+### Mechanical sympathy
+
+Hardware rewards code shaped to how it actually works. Four resources matter, and each
+gets its own rule:
+
+- Storage sustains parallel I/O. Keep the device saturated with concurrent operations
+  under a named limit (§8), rather than issuing one request and waiting.
+
+- Memory is slow; caches are what make it fast. Think in cache lines: keep hot structs
+  compact and place the data one operation needs together rather than spread across
+  allocations. Pin the intended size of a hot struct with
+  `const _: () = assert!(size_of::<T>() == ...)` (§3) so a field addition cannot
+  silently spill it across another line.
+
+- The CPU sprints on straight-line code and staggers on unpredictable branches. Keep
+  unpredictable `if`s out of inner loops; sort, partition, or batch homogeneously so the
+  loop body stays branch-free.
+
+- The network charges for bandwidth and for round trips. Count both in the cost sketch
+  when an operation crosses a process or machine boundary.
 
 
 ## 11. Naming and comments

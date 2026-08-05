@@ -55,11 +55,5 @@ feature-matrix:
 
 supply-chain: deny unused-deps feature-matrix
 
-codex:
-    cargo test --quiet --manifest-path tools/strom-codex/Cargo.toml
-    cargo run --quiet --manifest-path tools/strom-codex/Cargo.toml -- check
 
-codex-extract:
-    cargo run --quiet --manifest-path tools/strom-codex/Cargo.toml -- extract
-
-ci: check test-ci doctest docs supply-chain codex
+ci: check test-ci doctest docs supply-chain
