@@ -25,3 +25,4 @@ Layering: protocol types stay in `strom-domain`; storage spelling stays in
 `strom-storage-domain`; I/O stays in `strom-object-store`; the engine owns
 typed stores, fold, and the correctness protocol.
 
+As you work on this codebase, if you encounter any friction in the development environment you can record it in [docs/nits.md](docs/nits.md).  Contributors will review these to help improve the lives of all devs and "make the world a better place".  
