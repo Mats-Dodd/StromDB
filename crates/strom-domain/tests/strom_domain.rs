@@ -213,6 +213,21 @@ fn content_type_length_boundary_is_exact() {
     );
 }
 
+#[test]
+fn content_type_bound_covers_its_canonical_spelling() {
+    let source = format!("a/{};charset=x", "b".repeat(244));
+    assert_eq!(
+        source.len(),
+        CONTENT_TYPE_BYTES_MAX,
+        "the regression input reaches the request bound exactly"
+    );
+    assert_eq!(
+        source.parse::<StreamContentType>(),
+        Err(ContentTypeError::OverMaxBytes),
+        "normalizing parameter whitespace must not manufacture an over-bound domain value"
+    );
+}
+
 proptest! {
     #[test]
     fn content_type_parse_is_total_and_display_reparses(input in any::<String>()) {

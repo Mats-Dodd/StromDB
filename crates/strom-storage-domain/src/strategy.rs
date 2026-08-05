@@ -1,0 +1,140 @@
+//! Proptest strategies for valid storage-domain values.
+
+use std::num::NonZeroU64;
+
+use proptest::prelude::{Just, Strategy, prop_oneof};
+
+use crate::{
+    BatchId, BoundedNonEmptyVec, LedgerKey, LedgerRecord, OperationFact, OwnerToken, PartitionId,
+    PathTombstone, Seal, SealFormat, SealGeneration, StreamRecord, StreamUid, TreeVersion,
+    WalFence, WalObject, WalReplayPoint, WalRun,
+};
+
+pub fn partition_id() -> impl Strategy<Value = PartitionId> {
+    proptest::array::uniform16(proptest::num::u8::ANY)
+        .prop_filter_map("nil is reserved", |bytes| PartitionId::try_from(bytes).ok())
+}
+
+/// # Panics
+///
+/// Panics if a value drawn from one upwards stops constructing a nonzero value.
+pub fn seal_generation() -> impl Strategy<Value = SealGeneration> {
+    (1u64..).prop_map(|raw| {
+        SealGeneration::from(NonZeroU64::new(raw).expect("the generation strategy starts at one"))
+    })
+}
+
+/// # Panics
+///
+/// Panics if a value drawn from one upwards stops constructing a nonzero value.
+pub fn batch_id() -> impl Strategy<Value = BatchId> {
+    (1u64..).prop_map(|raw| {
+        BatchId::from(NonZeroU64::new(raw).expect("the batch strategy starts at one"))
+    })
+}
+
+pub fn owner_token() -> impl Strategy<Value = OwnerToken> {
+    seal_generation().prop_map(OwnerToken::from)
+}
+
+/// # Panics
+///
+/// Panics if a value drawn from one upwards stops constructing a nonzero value.
+pub fn stream_uid() -> impl Strategy<Value = StreamUid> {
+    (1u64..).prop_map(|raw| {
+        StreamUid::from(NonZeroU64::new(raw).expect("the uid strategy starts at one"))
+    })
+}
+
+pub fn ledger_key() -> impl Strategy<Value = LedgerKey> {
+    strom_domain::strategy::stream_id().prop_map(|stream_id| LedgerKey::from(&stream_id))
+}
+
+pub fn operation_fact() -> impl Strategy<Value = OperationFact> {
+    prop_oneof![
+        (
+            ledger_key(),
+            stream_uid(),
+            strom_domain::strategy::stream_content_type(),
+            strom_domain::strategy::expiry_policy(),
+        )
+            .prop_map(
+                |(path, uid, content_type, expiry)| OperationFact::StreamCreated {
+                    path,
+                    uid,
+                    content_type,
+                    expiry,
+                }
+            ),
+        (ledger_key(), stream_uid())
+            .prop_map(|(path, uid)| OperationFact::StreamClosed { path, uid }),
+        (ledger_key(), stream_uid())
+            .prop_map(|(path, uid)| OperationFact::StreamDeleted { path, uid }),
+    ]
+}
+
+/// # Panics
+///
+/// Panics if a generated fact vector within `1..=16` violates the published
+/// WAL fact-count bound.
+pub fn wal_object() -> impl Strategy<Value = WalObject> {
+    (
+        partition_id(),
+        batch_id(),
+        owner_token(),
+        proptest::collection::vec(operation_fact(), 1..=16),
+    )
+        .prop_flat_map(|(partition, batch, owner, facts)| {
+            let facts = BoundedNonEmptyVec::try_from(facts)
+                .expect("the generated fact count is inside the WAL bound");
+            prop_oneof![
+                Just(WalObject::Run(WalRun::new(partition, batch, owner, facts,))),
+                Just(WalObject::Fence(WalFence::new(partition, batch, owner))),
+            ]
+        })
+}
+
+pub fn seal() -> impl Strategy<Value = Seal> {
+    (
+        partition_id(),
+        seal_generation(),
+        proptest::option::of((batch_id(), owner_token())),
+    )
+        .prop_map(|(partition, generation, replay)| {
+            let replay = match replay {
+                Some((batch, owner)) => WalReplayPoint::Through { batch, owner },
+                None => WalReplayPoint::Genesis,
+            };
+            Seal::new(
+                partition,
+                generation,
+                replay,
+                SealFormat::V1,
+                TreeVersion::empty(),
+                TreeVersion::empty(),
+                TreeVersion::empty(),
+            )
+        })
+}
+
+pub fn ledger_record() -> impl Strategy<Value = LedgerRecord> {
+    prop_oneof![
+        (
+            stream_uid(),
+            strom_domain::strategy::stream_content_type(),
+            strom_domain::strategy::expiry_policy(),
+            strom_domain::strategy::stream_lifecycle(),
+            batch_id(),
+        )
+            .prop_map(|(uid, content_type, expiry, lifecycle, created_at)| {
+                LedgerRecord::Live(StreamRecord::new(
+                    uid,
+                    content_type,
+                    expiry,
+                    lifecycle,
+                    created_at,
+                ))
+            }),
+        stream_uid().prop_map(|uid| LedgerRecord::Tombstone(PathTombstone::new(uid))),
+    ]
+}

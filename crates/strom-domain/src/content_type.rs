@@ -87,6 +87,19 @@ impl FromStr for StreamContentType {
             type_raw.to_ascii_lowercase(),
             subtype_raw.to_ascii_lowercase()
         );
+        let parameter_bytes = charset.as_ref().map_or(0, |value| {
+            "; charset="
+                .len()
+                .checked_add(value.len())
+                .expect("two substrings from one bounded input cannot overflow usize")
+        });
+        let canonical_bytes = essence
+            .len()
+            .checked_add(parameter_bytes)
+            .expect("substrings from one bounded input cannot overflow usize");
+        if canonical_bytes > CONTENT_TYPE_BYTES_MAX {
+            return Err(ContentTypeError::OverMaxBytes);
+        }
         Ok(Self { essence, charset })
     }
 }
