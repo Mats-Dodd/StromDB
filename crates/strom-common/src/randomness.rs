@@ -1,7 +1,6 @@
 //! The randomness capability seam (stromstyle §4). No trait: production and
 //! deterministic runs use the same types and differ only in the root seed.
 
-
 use std::collections::BTreeSet;
 
 use rand::{SeedableRng as _, TryRngCore as _};

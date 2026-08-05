@@ -1,1 +1,1 @@
-//! Object store for StromDB.
+//! Object store for `StromDB`.

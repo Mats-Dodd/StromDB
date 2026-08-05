@@ -1,4 +1,5 @@
 /target
+/tools/strom-codex/target
 /mutants.out*
 .DS_Store
 
