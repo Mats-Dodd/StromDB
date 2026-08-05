@@ -15,7 +15,7 @@ clippy:
 
 lint-style:
     ast-grep test --skip-snapshot-tests
-    ast-grep scan
+    ast-grep scan --globs '!reference/**'
 
 dylint:
     DYLINT_RUSTFLAGS="--deny warnings" cargo dylint --all --workspace -- --all-targets --all-features
