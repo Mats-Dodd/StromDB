@@ -135,3 +135,40 @@ Path tombstones are permanent logical values because the protocol discourages
 reusing a deleted stream URL. Compaction does not silently erase that fact.
 
 
+### 4.2 Tally: current state and admission
+
+### 4.2 Tally: current state and admission
+
+NB the exact semantics/ layout of the tally LSM are still subejct to change by a further RFC.  They still adhere to the currect correctness protocol though. 
+
+Tally is a set of ordered last-value namespaces:
+
+```text
+stream/<stream>
+producer/<stream>/<producer>
+subscription/<subscription>
+link-by-sub/<subscription>/<stream>
+link-by-stream/<stream>/<subscription>
+deadline/<bucket>/<deadline>/<identity>
+```
+
+It contains stream tails, closure and retention versions, producer epochs and
+sequences, per-writer `Stream-Seq` state, cumulative positions, fork pins,
+logical capacity, subscription cursors, wake generations, leases, retry
+schedules, and bidirectional stream membership.
+
+Tally is the authoritative logical capacity projection. Admission-critical
+Tally and Ledger state is rebuilt locally before a partition becomes Ready.
+
+For fork accounting, a stream row distinguishes:
+
+```text
+visible_retained_*          bytes/extents readable through this stream,
+                            including an inherited prefix
+
+owned_unique_referenced_*  canonical Annals bytes/extents owned by this
+                            stream and retained by it or descendants
+```
+
+Forking increases logical visibility but creates no duplicate Annals row and
+therefore adds no owned-unique bytes.
