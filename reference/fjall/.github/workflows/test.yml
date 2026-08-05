@@ -1,0 +1,133 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - "**"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  examples:
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        rust_version:
+          - stable # We cannot run with MSRV because some deps may require a higher MSRV
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust_version }}
+      - name: Set up cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ runner.os }}-cargo
+          workspaces: >
+            . -> target
+            examples/actix-kv -> target
+            examples/axum-kv -> target
+            examples/basic -> target
+            examples/gc-simple -> target
+            examples/permuterm -> target
+            examples/rolling-log -> target
+            examples/secondary-index -> target
+            examples/structured -> target
+            examples/suffix-search -> target
+            examples/tokio -> target
+            examples/triplestore -> target
+            examples/tx-atomic-counter -> target
+            examples/tx-blob-cas
+            examples/tx-mpmc-queue -> target
+            examples/tx-keyspace-move -> target
+            examples/tx-ssi-atomic-counter -> target
+            examples/tx-ssi-cc -> target
+            examples/tx-ssi-mpmc-queue -> target
+            examples/tx-ssi-keyspace-move -> target
+            examples/unique-index -> target
+      - name: Build & test examples
+        run: node compile_examples.mjs
+  test:
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        rust_version:
+          - stable
+          - "1.90.0" # MSRV
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust_version }}
+      - name: Add rustfmt
+        run: rustup component add rustfmt
+      - name: Add clippy
+        run: rustup component add clippy
+      - name: Set up cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ runner.os }}-cargo
+          workspaces: >
+            . -> target
+      - name: Install cargo-all-features
+        run: cargo install cargo-all-features
+      - uses: taiki-e/install-action@nextest
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy
+      - name: Build permutations
+        run: cargo build-all-features
+      - name: Run whitebox tests
+        run: cargo test --features __internal_whitebox -- whitebox_ --test-threads=1
+        env:
+          RUST_LOG: trace
+      - name: Run tests
+        run: cargo nextest run --features lz4
+      - name: Run doc tests
+        run: cargo test --doc
+  codecov:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - name: Set up cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: ${{ runner.os }}-cargo
+          workspaces: >
+            . -> target
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@nextest
+      - name: Run tests
+        run: cargo llvm-cov --no-report nextest --features lz4
+      - name: Run doc tests
+        run: cargo llvm-cov --no-report --doc
+      - name: Create code coverage report
+        run: cargo llvm-cov report --doctests --lcov --output-path lcov.info
+      - name: Upload coverage data to codecov
+        uses: codecov/codecov-action@v7
+        with:
+          files: lcov.info
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

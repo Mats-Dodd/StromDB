@@ -1,0 +1,32 @@
+use fjall::{Database, FormatVersion, JournalRecoveryError};
+use test_log::test;
+
+#[test]
+fn db_load_v2() -> fjall::Result<()> {
+    let folder = "test_fixture/v2_keyspace";
+
+    let result = Database::builder(folder).open();
+
+    matches!(
+        result,
+        Err(fjall::Error::InvalidVersion(Some(FormatVersion::V2)))
+    );
+
+    Ok(())
+}
+
+#[test]
+fn db_load_v2_corrupt_journal() -> fjall::Result<()> {
+    let folder = "test_fixture/v2_keyspace_corrupt_journal";
+
+    let result = Database::builder(folder).open();
+
+    matches!(
+        result,
+        Err(fjall::Error::JournalRecovery(
+            JournalRecoveryError::ChecksumMismatch
+        )),
+    );
+
+    Ok(())
+}
