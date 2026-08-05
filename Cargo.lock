@@ -1727,6 +1727,7 @@ dependencies = [
  "jiff",
  "proptest",
  "serde",
+ "thiserror",
 ]
 
 [[package]]
@@ -1737,6 +1738,7 @@ dependencies = [
  "crc32c",
  "futures",
  "object_store",
+ "thiserror",
  "tokio",
 ]
 
@@ -1749,6 +1751,7 @@ dependencies = [
  "proptest",
  "serde",
  "strom-domain",
+ "thiserror",
 ]
 
 [[package]]

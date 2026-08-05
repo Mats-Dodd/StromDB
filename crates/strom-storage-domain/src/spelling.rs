@@ -131,33 +131,16 @@ fn parse_reverse_ordinal(input: &str) -> Result<u64, KeySpellingError> {
         .map_err(|_detail| KeySpellingError::ReverseOrdinal)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum KeySpellingError {
+    #[error("durable key has the wrong segment shape")]
     Shape,
+    #[error("durable key namespace version is unsupported")]
     UnsupportedNamespace,
-    Partition(PartitionIdError),
+    #[error("durable key partition is invalid: {0}")]
+    Partition(#[source] PartitionIdError),
+    #[error("durable key reverse ordinal is not a fixed-width 20-digit u64")]
     ReverseOrdinal,
+    #[error("durable key spells reserved coordinate zero")]
     ZeroCoordinate,
 }
-
-impl fmt::Display for KeySpellingError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Shape => formatter.write_str("durable key has the wrong segment shape"),
-            Self::UnsupportedNamespace => {
-                formatter.write_str("durable key namespace version is unsupported")
-            }
-            Self::Partition(error) => {
-                write!(formatter, "durable key partition is invalid: {error}")
-            }
-            Self::ReverseOrdinal => {
-                formatter.write_str("durable key reverse ordinal is not a fixed-width 20-digit u64")
-            }
-            Self::ZeroCoordinate => {
-                formatter.write_str("durable key spells reserved coordinate zero")
-            }
-        }
-    }
-}
-
-impl std::error::Error for KeySpellingError {}

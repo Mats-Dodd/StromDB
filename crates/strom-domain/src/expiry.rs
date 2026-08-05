@@ -43,16 +43,9 @@ impl serde::Serialize for ExpiryPolicy {
 }
 
 /// Both `Stream-TTL` and `Stream-Expires-At` were supplied (§5.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("Stream-TTL and Stream-Expires-At are mutually exclusive")]
 pub struct ExpiryPolicyConflict;
-
-impl fmt::Display for ExpiryPolicyConflict {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Stream-TTL and Stream-Expires-At are mutually exclusive")
-    }
-}
-
-impl std::error::Error for ExpiryPolicyConflict {}
 
 /// Sliding idle window in seconds (`Stream-TTL`, §5.1).
 ///
@@ -118,25 +111,15 @@ impl serde::Serialize for StreamTtl {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum StreamTtlError {
+    #[error("stream TTL is not a plain decimal integer without leading zeros")]
     Malformed,
+    #[error("stream TTL of zero seconds is not accepted")]
     Zero,
+    #[error("stream TTL exceeds the representable maximum")]
     OverMax,
 }
-
-impl fmt::Display for StreamTtlError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Malformed => formatter
-                .write_str("stream TTL is not a plain decimal integer without leading zeros"),
-            Self::Zero => formatter.write_str("stream TTL of zero seconds is not accepted"),
-            Self::OverMax => formatter.write_str("stream TTL exceeds the representable maximum"),
-        }
-    }
-}
-
-impl std::error::Error for StreamTtlError {}
 
 /// Absolute expiry instant (`Stream-Expires-At`, RFC 3339, §5.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -179,24 +162,10 @@ impl serde::Serialize for ExpiresAt {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("expires-at is not a valid RFC 3339 timestamp")]
 pub struct ExpiresAtError;
 
-impl fmt::Display for ExpiresAtError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("expires-at is not a valid RFC 3339 timestamp")
-    }
-}
-
-impl std::error::Error for ExpiresAtError {}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("expires-at nanoseconds lie outside the representable instant range")]
 pub struct ExpiresAtRangeError;
-
-impl fmt::Display for ExpiresAtRangeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("expires-at nanoseconds lie outside the representable instant range")
-    }
-}
-
-impl std::error::Error for ExpiresAtRangeError {}

@@ -134,30 +134,12 @@ const fn is_token_char(character: char) -> bool {
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ContentTypeError {
+    #[error("content type exceeds {CONTENT_TYPE_BYTES_MAX} bytes")]
     OverMaxBytes,
+    #[error("content type is not `type/subtype` with an optional `charset=token` parameter")]
     Malformed,
+    #[error("content type has a parameter other than `charset`")]
     UnsupportedParameter,
 }
-
-impl fmt::Display for ContentTypeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OverMaxBytes => {
-                write!(
-                    formatter,
-                    "content type exceeds {CONTENT_TYPE_BYTES_MAX} bytes"
-                )
-            }
-            Self::Malformed => formatter.write_str(
-                "content type is not `type/subtype` with an optional `charset=token` parameter",
-            ),
-            Self::UnsupportedParameter => {
-                formatter.write_str("content type has a parameter other than `charset`")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ContentTypeError {}

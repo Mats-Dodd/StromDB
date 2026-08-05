@@ -1,7 +1,5 @@
 //! Checksummed framing shared by Seal and WAL objects.
 
-use std::fmt;
-
 use serde::Serialize;
 
 const MAGIC: &[u8; 4] = b"STRM";
@@ -31,112 +29,48 @@ impl ObjectKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum EncodeError {
+    #[error("domain value could not be serialized")]
     Serialization,
+    #[error("encoded value is {bytes_actual} bytes; the bound is {bytes_max}")]
     EncodedBytesOverMax {
         bytes_max: usize,
         bytes_actual: usize,
     },
 }
 
-impl fmt::Display for EncodeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Serialization => formatter.write_str("domain value could not be serialized"),
-            Self::EncodedBytesOverMax {
-                bytes_max,
-                bytes_actual,
-            } => write!(
-                formatter,
-                "encoded value is {bytes_actual} bytes; the bound is {bytes_max}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for EncodeError {}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DecodeError {
+    #[error("encoded value is {bytes_actual} bytes; the bound is {bytes_max}")]
     EncodedBytesOverMax {
         bytes_max: usize,
         bytes_actual: usize,
     },
+    #[error("frame is {bytes_actual} bytes; at least {bytes_min} are required")]
     FrameTooShort {
         bytes_min: usize,
         bytes_actual: usize,
     },
-    MagicMismatch {
-        observed: [u8; 4],
-    },
-    ChecksumMismatch {
-        declared: u32,
-        computed: u32,
-    },
-    ObjectKindMismatch {
-        expected: u8,
-        observed: u8,
-    },
-    UnsupportedVersion {
-        observed: u8,
-    },
+    #[error("frame magic is {observed:?}; expected STRM")]
+    MagicMismatch { observed: [u8; 4] },
+    #[error("frame checksum is {declared:#010x}; computed {computed:#010x}")]
+    ChecksumMismatch { declared: u32, computed: u32 },
+    #[error("object kind is {observed}; expected {expected} at this location")]
+    ObjectKindMismatch { expected: u8, observed: u8 },
+    #[error("object format version {observed} is unsupported")]
+    UnsupportedVersion { observed: u8 },
+    #[error("postcard body is malformed")]
     MalformedBody,
+    #[error("postcard body violates a domain invariant")]
     InvalidBody,
+    #[error("body identity differs from the durable location")]
     IdentityMismatch,
+    #[error("body format does not match the envelope version")]
     FormatMismatch,
-    TrailingBytes {
-        bytes_actual: usize,
-    },
+    #[error("postcard body has {bytes_actual} trailing bytes")]
+    TrailingBytes { bytes_actual: usize },
 }
-
-impl fmt::Display for DecodeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EncodedBytesOverMax {
-                bytes_max,
-                bytes_actual,
-            } => write!(
-                formatter,
-                "encoded value is {bytes_actual} bytes; the bound is {bytes_max}"
-            ),
-            Self::FrameTooShort {
-                bytes_min,
-                bytes_actual,
-            } => write!(
-                formatter,
-                "frame is {bytes_actual} bytes; at least {bytes_min} are required"
-            ),
-            Self::MagicMismatch { observed } => {
-                write!(formatter, "frame magic is {observed:?}; expected STRM")
-            }
-            Self::ChecksumMismatch { declared, computed } => write!(
-                formatter,
-                "frame checksum is {declared:#010x}; computed {computed:#010x}"
-            ),
-            Self::ObjectKindMismatch { expected, observed } => write!(
-                formatter,
-                "object kind is {observed}; expected {expected} at this location"
-            ),
-            Self::UnsupportedVersion { observed } => {
-                write!(formatter, "object format version {observed} is unsupported")
-            }
-            Self::MalformedBody => formatter.write_str("postcard body is malformed"),
-            Self::InvalidBody => formatter.write_str("postcard body violates a domain invariant"),
-            Self::IdentityMismatch => {
-                formatter.write_str("body identity differs from the durable location")
-            }
-            Self::FormatMismatch => {
-                formatter.write_str("body format does not match the envelope version")
-            }
-            Self::TrailingBytes { bytes_actual } => {
-                write!(formatter, "postcard body has {bytes_actual} trailing bytes")
-            }
-        }
-    }
-}
-
-impl std::error::Error for DecodeError {}
 
 #[expect(
     clippy::big_endian_bytes,

@@ -18,6 +18,8 @@ postcard = { workspace = true }
 proptest = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }
 strom-domain = { path = "../strom-domain", version = "0.1.0" }
+thiserror = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -3,7 +3,6 @@
 mod codec;
 mod fact;
 
-use std::fmt;
 use std::num::NonZeroU64;
 
 use serde::Serialize;
@@ -199,22 +198,10 @@ impl<Value> TryFrom<Vec<Value>> for BoundedNonEmptyVec<Value> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BoundedNonEmptyVecError {
+    #[error("WAL run has no operation facts")]
     Empty,
+    #[error("WAL run has {facts_actual} facts; the bound is {WAL_RUN_FACTS_MAX}")]
     OverMax { facts_actual: usize },
 }
-
-impl fmt::Display for BoundedNonEmptyVecError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => formatter.write_str("WAL run has no operation facts"),
-            Self::OverMax { facts_actual } => write!(
-                formatter,
-                "WAL run has {facts_actual} facts; the bound is {WAL_RUN_FACTS_MAX}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for BoundedNonEmptyVecError {}

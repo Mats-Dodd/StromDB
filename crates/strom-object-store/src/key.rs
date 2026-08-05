@@ -86,40 +86,19 @@ const fn is_key_character(character: char) -> bool {
 }
 
 /// Why a raw string is not a canonical object key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ObjectKeyError {
+    #[error("object key is empty")]
     Empty,
+    #[error("object key is {bytes_actual} bytes; the bound is {KEY_BYTES_MAX}")]
     TooLong { bytes_actual: usize },
+    #[error("object key contains forbidden character {character:?}")]
     ForbiddenCharacter { character: char },
+    #[error("object key contains an empty segment")]
     EmptySegment,
+    #[error("object key contains a `.` or `..` segment")]
     RelativeSegment,
 }
-
-impl fmt::Display for ObjectKeyError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => formatter.write_str("object key is empty"),
-            Self::TooLong { bytes_actual } => {
-                write!(
-                    formatter,
-                    "object key is {bytes_actual} bytes; the bound is {KEY_BYTES_MAX}"
-                )
-            }
-            Self::ForbiddenCharacter { character } => {
-                write!(
-                    formatter,
-                    "object key contains forbidden character {character:?}"
-                )
-            }
-            Self::EmptySegment => formatter.write_str("object key contains an empty segment"),
-            Self::RelativeSegment => {
-                formatter.write_str("object key contains a `.` or `..` segment")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ObjectKeyError {}
 
 #[cfg(test)]
 mod tests {

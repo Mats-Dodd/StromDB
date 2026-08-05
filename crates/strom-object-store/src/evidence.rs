@@ -1,6 +1,5 @@
 //! Operation results the engine treats as evidence.
 
-use std::fmt;
 use std::num::NonZeroUsize;
 
 use crate::bounds::LIST_KEYS_MAX;
@@ -97,27 +96,13 @@ impl TryFrom<usize> for KeysBound {
 }
 
 /// Why a raw count is not a legal list page bound.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum KeysBoundError {
+    #[error("keys bound is zero")]
     Zero,
+    #[error("keys bound is {keys_actual}; the bound is {LIST_KEYS_MAX}")]
     OverListBound { keys_actual: usize },
 }
-
-impl fmt::Display for KeysBoundError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Zero => formatter.write_str("keys bound is zero"),
-            Self::OverListBound { keys_actual } => {
-                write!(
-                    formatter,
-                    "keys bound is {keys_actual}; the bound is {LIST_KEYS_MAX}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for KeysBoundError {}
 
 /// One ordered, bounded list page.
 #[derive(Debug, Clone)]

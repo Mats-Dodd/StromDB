@@ -182,9 +182,14 @@ read back from durable storage are foreign again and re-enter the path at the to
 - Error enums MUST mirror the caller's decisions, not implementation details. Separate
   variants when callers respond differently—for example invalid input, optimistic
   concurrency conflict, retryable storage failure, corrupt durable data, or a bounded-work
-  limit. Merge variants callers always handle identically.  Too many error variants is just as bad, if not worse than too few.  
+  limit. Merge variants callers always handle identically.  Too many error variants is just as bad, if not worse than too few.
 
--Assert liberally inside the engine. The simulation finds bugs only when some check fails loudly.
+- Owned error types MUST derive `thiserror::Error`. Keep `Display` text stable and
+  attach `#[source]` when a variant wraps another owned error. Adapter code MUST still
+  translate foreign dependency errors into domain variants at the boundary (§9); do not
+  expose foreign error types in the public API via `#[from]`.
+
+- Assert liberally inside the engine. The simulation finds bugs only when some check fails loudly.
 
 - Give assertions a cost budget by plane (§10). The control plane may spend much to
   verify little: an O(N) assertion guarding an O(1) decision is money well spent. The

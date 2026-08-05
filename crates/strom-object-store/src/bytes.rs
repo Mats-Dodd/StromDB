@@ -53,31 +53,15 @@ impl TryFrom<Vec<u8>> for FrozenBytes {
 }
 
 /// Why a raw body cannot become a durable object candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum FrozenBytesError {
     /// Every durable object carries an envelope; an empty body is illegal in
     /// every namespace.
+    #[error("object body is empty")]
     Empty,
-    OverPutBound {
-        bytes_actual: u64,
-    },
+    #[error("object body is {bytes_actual} bytes; the bound is {PUT_BYTES_MAX}")]
+    OverPutBound { bytes_actual: u64 },
 }
-
-impl fmt::Display for FrozenBytesError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => formatter.write_str("object body is empty"),
-            Self::OverPutBound { bytes_actual } => {
-                write!(
-                    formatter,
-                    "object body is {bytes_actual} bytes; the bound is {PUT_BYTES_MAX}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for FrozenBytesError {}
 
 /// A caller-imposed ceiling on how many bytes one read may materialize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,16 +83,9 @@ impl TryFrom<u64> for ByteBound {
 }
 
 /// A byte bound of zero can never admit an object body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("byte bound is zero")]
 pub struct ZeroByteBound;
-
-impl fmt::Display for ZeroByteBound {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("byte bound is zero")
-    }
-}
-
-impl std::error::Error for ZeroByteBound {}
 
 /// A non-empty, overflow-checked byte range inside one object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,27 +132,13 @@ impl TryFrom<(u64, u64)> for ByteRange {
 }
 
 /// Why a `(start, length)` pair is not a legal byte range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ByteRangeError {
+    #[error("byte range has zero length")]
     ZeroLength,
+    #[error("byte range {start}+{length} overflows the address space")]
     EndOverflow { start: u64, length: u64 },
 }
-
-impl fmt::Display for ByteRangeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ZeroLength => formatter.write_str("byte range has zero length"),
-            Self::EndOverflow { start, length } => {
-                write!(
-                    formatter,
-                    "byte range {start}+{length} overflows the address space"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for ByteRangeError {}
 
 /// A CRC-32C checksum over one bounded byte span.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,16 +197,9 @@ impl TryFrom<String> for Etag {
 }
 
 /// An empty validator can never prove which object version was observed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("etag is empty")]
 pub struct EmptyEtag;
-
-impl fmt::Display for EmptyEtag {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("etag is empty")
-    }
-}
-
-impl std::error::Error for EmptyEtag {}
 
 #[cfg(test)]
 mod tests {

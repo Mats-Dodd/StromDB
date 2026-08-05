@@ -21,6 +21,7 @@ proptest = { workspace = true, optional = true }
 # is deliberately absent so untrusted bytes must re-enter through the
 # canonical parsers (`FromStr` / `TryFrom`).
 serde = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

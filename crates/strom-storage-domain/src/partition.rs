@@ -97,21 +97,10 @@ const fn hex_nibble(character: u8) -> Option<u8> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PartitionIdError {
+    #[error("partition id is not a lowercase hyphenated UUID")]
     Malformed,
+    #[error("partition id is nil")]
     Nil,
 }
-
-impl fmt::Display for PartitionIdError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Malformed => {
-                formatter.write_str("partition id is not a lowercase hyphenated UUID")
-            }
-            Self::Nil => formatter.write_str("partition id is nil"),
-        }
-    }
-}
-
-impl std::error::Error for PartitionIdError {}

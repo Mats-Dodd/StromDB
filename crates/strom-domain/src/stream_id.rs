@@ -61,34 +61,16 @@ impl serde::Serialize for StreamId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum StreamIdError {
+    #[error("stream id exceeds {STREAM_ID_BYTES_MAX} bytes")]
     OverMaxBytes,
+    #[error("stream id contains a control character")]
     ControlCharacter,
+    #[error("stream id is empty or has an empty segment")]
     EmptySegment,
+    #[error("stream id contains a `.` or `..` segment")]
     RelativeSegment,
+    #[error("stream id starts with the reserved `{ROOT_SEGMENT_RESERVED}` segment")]
     ReservedRootSegment,
 }
-
-impl fmt::Display for StreamIdError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::OverMaxBytes => {
-                write!(formatter, "stream id exceeds {STREAM_ID_BYTES_MAX} bytes")
-            }
-            Self::ControlCharacter => formatter.write_str("stream id contains a control character"),
-            Self::EmptySegment => formatter.write_str("stream id is empty or has an empty segment"),
-            Self::RelativeSegment => {
-                formatter.write_str("stream id contains a `.` or `..` segment")
-            }
-            Self::ReservedRootSegment => {
-                write!(
-                    formatter,
-                    "stream id starts with the reserved `{ROOT_SEGMENT_RESERVED}` segment"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for StreamIdError {}
