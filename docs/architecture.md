@@ -300,3 +300,158 @@ length bound
 
 Foreign or noncanonical objects under a Courant-owned prefix are durable
 contradictions, not candidates to ignore.
+
+## 7 permanent seals
+
+The Seal is the only mutable-in-time authority, represented as an immutable
+permanent sequence. It is also the complete manifest for the current physical
+version:
+
+```rust
+struct Seal {
+    partition: PartitionId,
+    generation: SealGeneration,
+    through: WalCut,
+    wal_owner_at_through: ReplayOwner,
+    format: SealFormat,
+    ledger: TreeVersion,
+    tally: TreeVersion,
+    annals: TreeVersion,
+}
+
+enum ReplayOwner {
+    NoOwner,
+    Owner(OwnerToken),
+}
+```
+
+Every persisted field has one recovery obligation:
+
+| Field | Why it cannot be derived later |
+| --- | --- |
+| `partition`, `generation` | authenticate key/body identity and exact succession |
+| `through` | separate the materialized prefix from the readable WAL suffix and authorize covered-RUN collection |
+| `wal_owner_at_through` | resume strict owner folding after covered RUNs have been deleted |
+| `format` | choose the durable decoder and comparator semantics |
+| three `TreeVersion`s | name the complete current physical serving state |
+
+`WalCut` includes the virtual genesis cut zero. Real WAL objects use nonzero
+`BatchId` values. `ReplayOwner::NoOwner` is legal only at cut zero; every real
+cut records the owner in force after folding that coordinate.
+
+Genesis is generation 1 at cut zero with `NoOwner` and one canonical empty
+`TreeVersion` for each store. Every later Seal is the exact successor of one
+observed permanent Seal. Seal keys are never overwritten, deleted, or reused:
+
+```text
+1, 2, 3, ...
+```
+
+Every Seal carries a complete manifest and can serve while it is newest.  Serving and recovery never need to load an earlier Seal. The Seal generation
+is therefore the exact physical view identity; `through` remains only the
+logical WAL coverage boundary.
+
+“Self-contained” means that the Seal names the complete dependency graph
+without consulting a predecessor manifest. It does not mean SST footers,
+blocks, or payload bytes are embedded in the Seal.
+
+## 8. Legal Seal transitions
+
+Every candidate targets exactly `head.generation + 1`. Skipping a generation
+is illegal even if the skipped key appears absent.
+
+### 8.1 Genesis
+
+Provisioning creates one canonical generation-1 Seal with empty trees, cut
+zero, and `NoOwner`. Genesis grants no ownership.
+
+
+### 8.2 Claim
+
+A claim changes neither logical nor physical state. It copies the complete
+manifest:
+
+```text
+candidate.generation = head.generation + 1
+candidate.through = head.through
+candidate.wal_owner_at_through = head.wal_owner_at_through
+candidate.{ledger,tally,annals} = head.{ledger,tally,annals}
+```
+
+Only the caller receiving `Direct` may construct `AuthoredClaim`. A
+`DurableMatch` proves that the Seal exists but never proves which claimant
+created it. A claim authorizes takeover; it does not authorize serving.
+
+
+
+### 8.3 Advance
+
+A Ready writer may publish a Seal at a greater WAL cut:
+
+```text
+candidate.generation           = source.generation + 1
+candidate.through              > source.through
+candidate.wal_owner_at_through = owner produced by exact fold through candidate.through
+logical(candidate)             = fold(logical(source), selected WAL prefix)
+candidate children             = source-carried or candidate-generation-fresh
+```
+
+When the source is genesis, its logical source is the empty state at virtual
+cut zero with `NoOwner`; the first advancing Seal ends at a nonzero occupied
+WAL coordinate and records the owner in force there.
+
+The stored owner is historical replay state. It need not equal the publisher's
+current owner token when a bounded checkpoint stops inside a suffix written by
+an earlier owner.
+
+Every fresh table and retained payload pack is durable before the Seal create
+is attempted. Only a `Direct` Seal result grants a continuing
+`PublishedCheckpoint` capability.
+
+
+### 8.4 Maintain
+
+A Ready writer may select a new physical version at the same cut:
+
+```text
+candidate.generation           = source.generation + 1
+candidate.through              = source.through
+candidate.wal_owner_at_through = source.wal_owner_at_through
+logical(candidate)             = logical(source)
+candidate children             = source-carried or candidate-generation-fresh
+```
+
+There is no useful same-cut physical rewrite while all three genesis trees are
+empty.
+
+Maintenance may compact SSTs, rewrite range boundaries, or move payload bytes.
+It must preserve every logical key, extent identity, payload byte, capacity
+value, and ordering rule. A result is tied to its exact source Seal identity
+and is never rebased onto a newer Seal.
+
+
+Claims, advances, and maintenance all contend for the same next permanent
+Seal coordinate.
+
+
+### 8.5 Publication outcomes
+
+One prepared Seal candidate is sent once. Transition handling is:
+
+| Evidence | Claim | Advance or maintain |
+| --- | --- | --- |
+| `Direct` | provisional `AuthoredClaim` | `PublishedCheckpoint` |
+| `DurableMatch` | no ownership; rediscover or stop | no continuing capability; stop and bootstrap |
+| `NotOurs` | rediscover the permanent head | fenced or contested; stop |
+| `Unresolved` | never serve; stop | poison; bootstrap resolves history |
+
+There is no post-create newest-generation query after `Direct`. Permanent
+contiguous Seal keys plus exact succession prove that the directly created
+candidate was the maximum at its create linearization point: no legal later
+Seal can exist while its predecessor coordinate is absent. A successor may be
+created before the response returns; that is ordinary asynchronous fencing.
+
+A directly published Advance or Maintain updates the writer's locally owned
+head generation while retaining the owner token from its authored claim. That
+capability records valid lineage, not a clock lease or promise that the route
+can never be superseded.
