@@ -11,3 +11,17 @@ The current architecture is still being refined, broad strokes exist in [docs/ar
 Run `just ci` before committing changes. All workspace crates must inherit the
 workspace package metadata and lint configuration.
 
+## Crate outline
+
+```text
+strom-common            clock and entropy seams
+strom-domain            Durable Streams protocol vocabulary
+strom-storage-domain    storage vocabulary and durable codecs
+strom-object-store      object-store adapter (opaque bytes)
+stromdb                 engine (joins the crates above)
+```
+
+Layering: protocol types stay in `strom-domain`; storage spelling stays in
+`strom-storage-domain`; I/O stays in `strom-object-store`; the engine owns
+typed stores, fold, and the correctness protocol.
+
