@@ -1,0 +1,79 @@
+# @durable-streams/proxy
+
+## 0.1.6
+
+### Patch Changes
+
+- Updated dependencies [[`92c0821`](https://github.com/durable-streams/durable-streams/commit/92c082152f7be8327f0c055d8b224494e5e71f76)]:
+  - @durable-streams/client@0.2.6
+
+## 0.1.5
+
+### Patch Changes
+
+- Updated dependencies [[`6afab5f`](https://github.com/durable-streams/durable-streams/commit/6afab5f8258999ff1794749ad9d0d9bd0c823625)]:
+  - @durable-streams/client@0.2.5
+
+## 0.1.4
+
+### Patch Changes
+
+- Updated dependencies [[`a3ed371`](https://github.com/durable-streams/durable-streams/commit/a3ed371a56b28ec6abc00ecdd149e2e030710cf6), [`346bc42`](https://github.com/durable-streams/durable-streams/commit/346bc426f5e13705cdd5e0cc5f7a759c7735a888)]:
+  - @durable-streams/client@0.2.4
+
+## 0.1.3
+
+### Patch Changes
+
+- Updated dependencies [[`5f50195`](https://github.com/durable-streams/durable-streams/commit/5f501950e7f9e3ffcd3c077b4ba90ce405d9f066)]:
+  - @durable-streams/client@0.2.3
+
+## 0.1.2
+
+### Patch Changes
+
+- Updated dependencies [[`6d50b29`](https://github.com/durable-streams/durable-streams/commit/6d50b29b544a48cca161232d881a06b44cdebcb8), [`054de99`](https://github.com/durable-streams/durable-streams/commit/054de99b0a3b97009a55e94d6f829ef38b520d41), [`054de99`](https://github.com/durable-streams/durable-streams/commit/054de99b0a3b97009a55e94d6f829ef38b520d41)]:
+  - @durable-streams/client@0.2.2
+
+## 0.1.1
+
+### Patch Changes
+
+- Add comprehensive SSE proxy e2e test suite covering data integrity, SSE format preservation, encoding, chunking, offset-based resumption, content-type handling, and edge cases. ([#233](https://github.com/durable-streams/durable-streams/pull/233))
+
+- Remove `encoding` option from SSE reads. Servers now automatically base64-encode binary content types and signal this via the `Stream-SSE-Data-Encoding: base64` response header. Clients decode automatically when this header is present. ([#231](https://github.com/durable-streams/durable-streams/pull/231))
+
+- Updated dependencies [[`5ceafb8`](https://github.com/durable-streams/durable-streams/commit/5ceafb896944e869f943f121dc9701c1aee4cb78), [`334a4fc`](https://github.com/durable-streams/durable-streams/commit/334a4fc80fc1483cebf9c0a02959f14875519a13), [`82a566a`](https://github.com/durable-streams/durable-streams/commit/82a566ace620b1b8d0d43cdf181356e6a6f6f4aa)]:
+  - @durable-streams/client@0.2.1
+
+## 0.1.0
+
+### Minor Changes
+
+- Bump all packages to version 0.2.0 ([#206](https://github.com/durable-streams/durable-streams/pull/206))
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @durable-streams/client@0.2.0
+
+## 0.0.3
+
+### Patch Changes
+
+- Updated dependencies [[`447e102`](https://github.com/durable-streams/durable-streams/commit/447e10235a1732ec24e1d906487d6b2750a16063), [`095944a`](https://github.com/durable-streams/durable-streams/commit/095944a5fefdef0cbc87eef532c871cdd46ee7d8), [`e47081e`](https://github.com/durable-streams/durable-streams/commit/e47081e553e1e98466bca25faf929ac346816e6b)]:
+  - @durable-streams/client@0.2.0
+
+## 0.0.2
+
+### Patch Changes
+
+- Add new proxy package for durable AI streaming. Includes: ([#179](https://github.com/durable-streams/durable-streams/pull/179))
+  - Proxy server with endpoints for creating, reading, and aborting streams
+  - Client-side `createDurableFetch` wrapper with credential persistence and auto-resume
+  - AI SDK transports for Vercel AI SDK (`createDurableChatTransport`) and TanStack (`createDurableAdapter`)
+  - JWT-based read token authentication
+  - URL allowlist with glob pattern support and URL normalization
+  - Security hardening: SSRF redirect blocking, path traversal prevention, scoped storage keys
+  - Comprehensive README with full API documentation
+  - 70 conformance and integration tests with external server support (PROXY_CONFORMANCE_URL)

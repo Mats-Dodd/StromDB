@@ -1,0 +1,13 @@
+linkWorkspacePackages: true
+preferWorkspacePackages: true
+
+packages:
+  - docs
+  - packages/*
+  - examples/*
+  - examples/**/*
+
+ignoredBuiltDependencies:
+  - "@parcel/watcher"
+  - "@swc/core"
+  - lmdb

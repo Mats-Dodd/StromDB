@@ -1,0 +1,111 @@
+# @durable-streams/benchmarks
+
+## 0.2.6
+
+### Patch Changes
+
+- Updated dependencies [[`92c0821`](https://github.com/durable-streams/durable-streams/commit/92c082152f7be8327f0c055d8b224494e5e71f76)]:
+  - @durable-streams/client@0.2.6
+
+## 0.2.5
+
+### Patch Changes
+
+- Updated dependencies [[`6afab5f`](https://github.com/durable-streams/durable-streams/commit/6afab5f8258999ff1794749ad9d0d9bd0c823625)]:
+  - @durable-streams/client@0.2.5
+
+## 0.2.4
+
+### Patch Changes
+
+- Updated dependencies [[`a3ed371`](https://github.com/durable-streams/durable-streams/commit/a3ed371a56b28ec6abc00ecdd149e2e030710cf6), [`346bc42`](https://github.com/durable-streams/durable-streams/commit/346bc426f5e13705cdd5e0cc5f7a759c7735a888)]:
+  - @durable-streams/client@0.2.4
+
+## 0.2.3
+
+### Patch Changes
+
+- Updated dependencies [[`5f50195`](https://github.com/durable-streams/durable-streams/commit/5f501950e7f9e3ffcd3c077b4ba90ce405d9f066)]:
+  - @durable-streams/client@0.2.3
+
+## 0.2.2
+
+### Patch Changes
+
+- Updated dependencies [[`6d50b29`](https://github.com/durable-streams/durable-streams/commit/6d50b29b544a48cca161232d881a06b44cdebcb8), [`054de99`](https://github.com/durable-streams/durable-streams/commit/054de99b0a3b97009a55e94d6f829ef38b520d41), [`054de99`](https://github.com/durable-streams/durable-streams/commit/054de99b0a3b97009a55e94d6f829ef38b520d41)]:
+  - @durable-streams/client@0.2.2
+
+## 0.2.1
+
+### Patch Changes
+
+- Updated dependencies [[`5ceafb8`](https://github.com/durable-streams/durable-streams/commit/5ceafb896944e869f943f121dc9701c1aee4cb78), [`334a4fc`](https://github.com/durable-streams/durable-streams/commit/334a4fc80fc1483cebf9c0a02959f14875519a13), [`82a566a`](https://github.com/durable-streams/durable-streams/commit/82a566ace620b1b8d0d43cdf181356e6a6f6f4aa)]:
+  - @durable-streams/client@0.2.1
+
+## 0.2.0
+
+### Minor Changes
+
+- Bump all packages to version 0.2.0 ([#206](https://github.com/durable-streams/durable-streams/pull/206))
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @durable-streams/client@0.2.0
+
+## 0.1.7
+
+### Patch Changes
+
+- Updated dependencies [[`447e102`](https://github.com/durable-streams/durable-streams/commit/447e10235a1732ec24e1d906487d6b2750a16063), [`095944a`](https://github.com/durable-streams/durable-streams/commit/095944a5fefdef0cbc87eef532c871cdd46ee7d8), [`e47081e`](https://github.com/durable-streams/durable-streams/commit/e47081e553e1e98466bca25faf929ac346816e6b)]:
+  - @durable-streams/client@0.2.0
+
+## 0.1.6
+
+### Patch Changes
+
+- Updated dependencies [[`a5ce923`](https://github.com/durable-streams/durable-streams/commit/a5ce923bf849bdde47a651be8200b560053f4997)]:
+  - @durable-streams/client@0.1.5
+
+## 0.1.5
+
+### Patch Changes
+
+- Updated dependencies [[`67b5a4d`](https://github.com/durable-streams/durable-streams/commit/67b5a4dcaae69dbe651dc6ede3cac72d3390567f)]:
+  - @durable-streams/client@0.1.4
+
+## 0.1.4
+
+### Patch Changes
+
+- Updated dependencies [[`8d06625`](https://github.com/durable-streams/durable-streams/commit/8d06625eba26d79b7c5d317adf89047f6b44c8ce), [`8f500cf`](https://github.com/durable-streams/durable-streams/commit/8f500cf720e59ada83188ed67f244a40c4b04422)]:
+  - @durable-streams/client@0.1.3
+
+## 0.1.3
+
+### Patch Changes
+
+- Upgrade vitest from v3 to v4 for improved performance and compatibility with the latest testing features. ([#105](https://github.com/durable-streams/durable-streams/pull/105))
+
+## 0.1.2
+
+### Patch Changes
+
+- Standardize package.json exports across all packages ([`bf9bc19`](https://github.com/durable-streams/durable-streams/commit/bf9bc19ef13eb22b2c0f98a175fad02b221d7860))
+  - Add dual ESM/CJS exports to all packages
+  - Fix export order to have "." first, then "./package.json"
+  - Add proper main/module/types fields
+  - Add sideEffects: false
+  - Remove duplicate fields
+
+- Updated dependencies [[`bf9bc19`](https://github.com/durable-streams/durable-streams/commit/bf9bc19ef13eb22b2c0f98a175fad02b221d7860)]:
+  - @durable-streams/client@0.1.2
+
+## 0.1.1
+
+### Patch Changes
+
+- new version to fix local manual release ([#97](https://github.com/durable-streams/durable-streams/pull/97))
+
+- Updated dependencies [[`1873789`](https://github.com/durable-streams/durable-streams/commit/187378923ed743255ba741252b1617b13cbbab16)]:
+  - @durable-streams/client@0.1.1

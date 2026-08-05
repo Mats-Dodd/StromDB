@@ -1,0 +1,209 @@
+# @durable-streams/state
+
+## 0.3.1
+
+### Patch Changes
+
+- Mark `@tanstack/db` as an optional peer dependency. The TanStack DB surface lives behind the `@durable-streams/state/db` subpath and the main entry is db-free, so consumers that don't use the reactive layer no longer get unmet-peer warnings (or errors under strict pnpm). ([#383](https://github.com/durable-streams/durable-streams/pull/383))
+
+- Updated dependencies []:
+  - @durable-streams/client@0.2.6
+
+## 0.3.0
+
+### Minor Changes
+
+- feat(state)!: move the TanStack DB-backed surface to a `@durable-streams/state/db` subpath ([#382](https://github.com/durable-streams/durable-streams/pull/382))
+
+  The main `@durable-streams/state` entry is now free of `@tanstack/db`. It exposes only the db-free protocol surface — `createStateSchema` and its change-event helpers, `MaterializedState`, and the state-event types/guards — so producers and backends (e.g. `@durable-streams/server`) can depend on it without the `@tanstack/db` peer dependency installed. Previously the entry eagerly re-exported `@tanstack/db`, so importing anything from the package forced that peer to be resolvable, breaking publishable dependents that don't use the reactive layer.
+
+  The reactive, TanStack DB-backed layer now lives at `@durable-streams/state/db`:
+  - `createStreamDB`, `getStreamDBCollectionId`, and the `StreamDB*` / `Action*` types
+  - the convenience re-exports of `@tanstack/db` (`createCollection`, `createOptimisticAction`, `eq`, `and`, `count`, …)
+
+  The subpath is a strict superset of the main entry (it also re-exports `createStateSchema`), so existing reactive consumers only change the import path:
+
+  ```diff
+  -import { createStateSchema, createStreamDB } from "@durable-streams/state"
+  +import { createStateSchema, createStreamDB } from "@durable-streams/state/db"
+  ```
+
+  BREAKING CHANGE: `createStreamDB`, `getStreamDBCollectionId`, the StreamDB/Action types, and the `@tanstack/db` re-exports are no longer exported from `@durable-streams/state`. Import them from `@durable-streams/state/db` instead. The db-free APIs (`createStateSchema`, `MaterializedState`, event types/guards) are unchanged on the main entry.
+
+- Move `@tanstack/db` from a regular dependency to a peer dependency (`>=0.6.0 <1.0.0`). ([#381](https://github.com/durable-streams/durable-streams/pull/381))
+
+  `@tanstack/db` is a singleton: collections, transactions, and live queries rely on `instanceof` checks and module-level shared state, so two copies in a dependency tree don't interoperate. Pinning it as a regular dependency (`^0.6.0`) meant that as soon as a consuming app upgraded `@tanstack/react-db` (which pins `@tanstack/db` at an exact version per release) past the `0.6` line, the app's copy and `state`'s copy diverged into two instances — breaking StreamDB collections at runtime.
+
+  Declaring it as a peer dependency makes `state` bind to the single `@tanstack/db` the consuming app already has, and the permissive range keeps that binding valid as the app moves across `0.x` minors.
+
+  **Breaking change:** consumers must now install `@tanstack/db` themselves (any `>=0.6.0 <1.0.0`). Apps already depending on `@tanstack/db` or `@tanstack/react-db` are unaffected.
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @durable-streams/client@0.2.6
+
+## 0.2.9
+
+### Patch Changes
+
+- Fix idempotent producer auto-claim sequencing so later batches wait for the ([#371](https://github.com/durable-streams/durable-streams/pull/371))
+  first running batch to claim its epoch before reserving and sending subsequent
+  sequence numbers. `flush()` now also waits for batches held behind the initial
+  auto-claim barrier.
+- Updated dependencies [[`92c0821`](https://github.com/durable-streams/durable-streams/commit/92c082152f7be8327f0c055d8b224494e5e71f76)]:
+  - @durable-streams/client@0.2.6
+
+## 0.2.8
+
+### Patch Changes
+
+- Updated dependencies [[`6afab5f`](https://github.com/durable-streams/durable-streams/commit/6afab5f8258999ff1794749ad9d0d9bd0c823625)]:
+  - @durable-streams/client@0.2.5
+
+## 0.2.7
+
+### Patch Changes
+
+- feat(state): expose StreamDB offsets and subscription hooks ([#365](https://github.com/durable-streams/durable-streams/pull/365))
+
+  StreamDB can now reuse an existing DurableStream instance, expose the latest
+  consumed offset, and notify callers around JSON stream batches. Collection IDs
+  are scoped by stream URL to avoid cross-stream collisions, and live replayed
+  inserts are normalized to updates when they match existing rows.
+
+- Updated dependencies []:
+  - @durable-streams/client@0.2.4
+
+## 0.2.6
+
+### Patch Changes
+
+- Add first-class live mode configuration to `createStreamDB()` so callers can force `"sse"` or `"long-poll"`, and add `headers` to `IdempotentProducerOptions` for producer batch and close requests. ([#353](https://github.com/durable-streams/durable-streams/pull/353))
+
+- Updated dependencies [[`a3ed371`](https://github.com/durable-streams/durable-streams/commit/a3ed371a56b28ec6abc00ecdd149e2e030710cf6), [`346bc42`](https://github.com/durable-streams/durable-streams/commit/346bc426f5e13705cdd5e0cc5f7a759c7735a888)]:
+  - @durable-streams/client@0.2.4
+
+## 0.2.5
+
+### Patch Changes
+
+- docs(stream-db): show list query pattern for useLiveQuery ([#333](https://github.com/durable-streams/durable-streams/pull/333))
+
+  Added list query example with `{ data }` destructuring and default empty array alongside the existing findOne pattern. Prevents agents from writing `allSessions.map(...)` instead of `const { data: allSessions = [] } = useLiveQuery(...)`.
+
+- Updated dependencies []:
+  - @durable-streams/client@0.2.3
+
+## 0.2.4
+
+### Patch Changes
+
+- Remove verbose debug logging from StreamDB stream consumer ([#328](https://github.com/durable-streams/durable-streams/pull/328))
+
+- Updated dependencies []:
+  - @durable-streams/client@0.2.3
+
+## 0.2.3
+
+### Patch Changes
+
+- Updated dependencies [[`5f50195`](https://github.com/durable-streams/durable-streams/commit/5f501950e7f9e3ffcd3c077b4ba90ce405d9f066)]:
+  - @durable-streams/client@0.2.3
+
+## 0.2.2
+
+### Patch Changes
+
+- Add TanStack Intent skills for AI coding agents. Skills cover getting started, reading streams, writing data, server deployment, go-to-production checklist, state schema, stream-db, and Yjs sync. Fix `live: "auto"` references in README to `live: true`. ([#270](https://github.com/durable-streams/durable-streams/pull/270))
+
+- Updated dependencies [[`6d50b29`](https://github.com/durable-streams/durable-streams/commit/6d50b29b544a48cca161232d881a06b44cdebcb8), [`054de99`](https://github.com/durable-streams/durable-streams/commit/054de99b0a3b97009a55e94d6f829ef38b520d41), [`054de99`](https://github.com/durable-streams/durable-streams/commit/054de99b0a3b97009a55e94d6f829ef38b520d41)]:
+  - @durable-streams/client@0.2.2
+
+## 0.2.1
+
+### Patch Changes
+
+- Updated dependencies [[`5ceafb8`](https://github.com/durable-streams/durable-streams/commit/5ceafb896944e869f943f121dc9701c1aee4cb78), [`334a4fc`](https://github.com/durable-streams/durable-streams/commit/334a4fc80fc1483cebf9c0a02959f14875519a13), [`82a566a`](https://github.com/durable-streams/durable-streams/commit/82a566ace620b1b8d0d43cdf181356e6a6f6f4aa)]:
+  - @durable-streams/client@0.2.1
+
+## 0.2.0
+
+### Minor Changes
+
+- **BREAKING**: Make `@tanstack/db` a peer dependency instead of a regular dependency. ([#187](https://github.com/durable-streams/durable-streams/pull/187))
+
+  This fixes TypeScript type compatibility issues when using StreamDB collections with TanStack DB's query utilities like `useLiveQuery` from `@tanstack/react-db`.
+
+  **Migration**: Users must now install `@tanstack/db` alongside `@durable-streams/state`:
+
+  ```bash
+  pnpm add @durable-streams/state @tanstack/db
+  ```
+
+  **Why this change?**
+
+  The `Collection` class in `@tanstack/db` has private properties. TypeScript uses nominal typing for private properties, meaning when two packages bundle the same class, TypeScript treats them as distinct types. This caused type errors like:
+
+  ```
+  Type 'Collection<...>' is not assignable to type 'CollectionImpl<...>'.
+  Types have separate declarations of a private property '_events'.
+  ```
+
+  By making `@tanstack/db` a peer dependency, there's only one copy installed, and all packages reference the same module - making the types compatible.
+
+  **Convenience re-exports**: Key utilities from `@tanstack/db` are now re-exported for convenience:
+  - Types: `Collection`, `SyncConfig`
+  - Comparison operators: `eq`, `gt`, `gte`, `lt`, `lte`, `like`, `ilike`, `inArray`
+  - Logical operators: `and`, `or`, `not`
+  - Null checking: `isNull`, `isUndefined`
+  - Aggregate functions: `count`, `sum`, `avg`, `min`, `max`
+
+### Patch Changes
+
+- Updated dependencies [[`447e102`](https://github.com/durable-streams/durable-streams/commit/447e10235a1732ec24e1d906487d6b2750a16063), [`095944a`](https://github.com/durable-streams/durable-streams/commit/095944a5fefdef0cbc87eef532c871cdd46ee7d8), [`e47081e`](https://github.com/durable-streams/durable-streams/commit/e47081e553e1e98466bca25faf929ac346816e6b)]:
+  - @durable-streams/client@0.2.0
+
+## 0.1.5
+
+### Patch Changes
+
+- Updated dependencies [[`a5ce923`](https://github.com/durable-streams/durable-streams/commit/a5ce923bf849bdde47a651be8200b560053f4997)]:
+  - @durable-streams/client@0.1.5
+
+## 0.1.4
+
+### Patch Changes
+
+- Updated dependencies [[`67b5a4d`](https://github.com/durable-streams/durable-streams/commit/67b5a4dcaae69dbe651dc6ede3cac72d3390567f)]:
+  - @durable-streams/client@0.1.4
+
+## 0.1.3
+
+### Patch Changes
+
+- Updated dependencies [[`8d06625`](https://github.com/durable-streams/durable-streams/commit/8d06625eba26d79b7c5d317adf89047f6b44c8ce), [`8f500cf`](https://github.com/durable-streams/durable-streams/commit/8f500cf720e59ada83188ed67f244a40c4b04422)]:
+  - @durable-streams/client@0.1.3
+
+## 0.1.2
+
+### Patch Changes
+
+- Standardize package.json exports across all packages ([`bf9bc19`](https://github.com/durable-streams/durable-streams/commit/bf9bc19ef13eb22b2c0f98a175fad02b221d7860))
+  - Add dual ESM/CJS exports to all packages
+  - Fix export order to have "." first, then "./package.json"
+  - Add proper main/module/types fields
+  - Add sideEffects: false
+  - Remove duplicate fields
+
+- Updated dependencies [[`bf9bc19`](https://github.com/durable-streams/durable-streams/commit/bf9bc19ef13eb22b2c0f98a175fad02b221d7860)]:
+  - @durable-streams/client@0.1.2
+
+## 0.1.1
+
+### Patch Changes
+
+- new version to fix local manual release ([#97](https://github.com/durable-streams/durable-streams/pull/97))
+
+- Updated dependencies [[`1873789`](https://github.com/durable-streams/durable-streams/commit/187378923ed743255ba741252b1617b13cbbab16)]:
+  - @durable-streams/client@0.1.1
