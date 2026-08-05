@@ -5,8 +5,10 @@ use strom_domain::StreamId;
 
 use crate::envelope::DecodeError;
 
+/// The key is immutable after construction, so a boxed slice drops the
+/// capacity word a `Vec` would carry through every fact and row.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LedgerKey(Vec<u8>);
+pub struct LedgerKey(Box<[u8]>);
 
 impl LedgerKey {
     #[must_use]
@@ -17,7 +19,7 @@ impl LedgerKey {
 
 impl From<&StreamId> for LedgerKey {
     fn from(stream_id: &StreamId) -> Self {
-        Self(stream_id.as_str().as_bytes().to_vec())
+        Self(stream_id.as_str().as_bytes().into())
     }
 }
 
@@ -36,7 +38,7 @@ impl TryFrom<LedgerKeyWire> for LedgerKey {
         let bytes = wire.0;
         let raw = std::str::from_utf8(&bytes).map_err(|_detail| DecodeError::InvalidBody)?;
         raw.parse::<StreamId>()
-            .map(|_stream_id| Self(bytes))
+            .map(|_stream_id| Self(bytes.into_boxed_slice()))
             .map_err(|_detail| DecodeError::InvalidBody)
     }
 }

@@ -5,9 +5,24 @@ use std::str::FromStr;
 
 /// Stream content type in canonical form (`type/subtype` plus optional `charset`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct StreamContentType {
-    essence: String,
-    charset: Option<String>,
+pub struct StreamContentType(MediaType);
+
+/// The two named media types cover almost every stream, so they live inline
+/// and never touch the heap. Every other media type is boxed, which keeps the
+/// hot struct one tag and one pointer wide. `FromStr` canonicalizes the named
+/// charset-free spellings to their unit variants, so the derived equality and
+/// hash stay structural.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum MediaType {
+    OctetStream,
+    Json,
+    General(Box<GeneralMediaType>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GeneralMediaType {
+    essence: Box<str>,
+    charset: Option<Box<str>>,
 }
 
 /// Upper bound on a content-type string, in bytes.
@@ -26,26 +41,35 @@ const _: () = assert!(
     "the default content type must be a value this type can also parse back"
 );
 
+const _: () = assert!(
+    size_of::<StreamContentType>() == 16,
+    "a content type is a hot ledger-row field and stays one tag and one pointer wide"
+);
+
 impl StreamContentType {
     /// Default when stream creation omits `Content-Type` (§5.1).
     #[must_use]
-    pub fn octet_stream() -> Self {
-        Self {
-            essence: String::from(ESSENCE_OCTET_STREAM),
-            charset: None,
-        }
+    pub const fn octet_stream() -> Self {
+        Self(MediaType::OctetStream)
     }
 
     /// True for `application/json` (JSON-mode message boundaries, §9.1).
     #[must_use]
     pub fn is_json(&self) -> bool {
-        self.essence == ESSENCE_JSON
+        match &self.0 {
+            MediaType::Json => true,
+            MediaType::OctetStream => false,
+            MediaType::General(general) => &*general.essence == ESSENCE_JSON,
+        }
     }
 
     /// True for any `text/*` type (SSE text encoding, §5.8).
     #[must_use]
     pub fn is_text(&self) -> bool {
-        self.essence.starts_with(ESSENCE_TEXT_PREFIX)
+        match &self.0 {
+            MediaType::OctetStream | MediaType::Json => false,
+            MediaType::General(general) => general.essence.starts_with(ESSENCE_TEXT_PREFIX),
+        }
     }
 }
 
@@ -82,33 +106,51 @@ impl FromStr for StreamContentType {
             }
             charset = Some(value.to_ascii_lowercase());
         }
-        let essence = format!(
-            "{}/{}",
-            type_raw.to_ascii_lowercase(),
-            subtype_raw.to_ascii_lowercase()
-        );
         let parameter_bytes = charset.as_ref().map_or(0, |value| {
             "; charset="
                 .len()
                 .checked_add(value.len())
                 .expect("two substrings from one bounded input cannot overflow usize")
         });
-        let canonical_bytes = essence
+        let canonical_bytes = essence_raw
             .len()
             .checked_add(parameter_bytes)
             .expect("substrings from one bounded input cannot overflow usize");
         if canonical_bytes > CONTENT_TYPE_BYTES_MAX {
             return Err(ContentTypeError::OverMaxBytes);
         }
-        Ok(Self { essence, charset })
+        if charset.is_none() {
+            if essence_raw.eq_ignore_ascii_case(ESSENCE_OCTET_STREAM) {
+                return Ok(Self(MediaType::OctetStream));
+            }
+            if essence_raw.eq_ignore_ascii_case(ESSENCE_JSON) {
+                return Ok(Self(MediaType::Json));
+            }
+        }
+        let essence = format!(
+            "{}/{}",
+            type_raw.to_ascii_lowercase(),
+            subtype_raw.to_ascii_lowercase()
+        )
+        .into_boxed_str();
+        Ok(Self(MediaType::General(Box::new(GeneralMediaType {
+            essence,
+            charset: charset.map(String::into_boxed_str),
+        }))))
     }
 }
 
 impl fmt::Display for StreamContentType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.charset {
-            Some(charset) => write!(formatter, "{}; charset={}", self.essence, charset),
-            None => formatter.write_str(&self.essence),
+        match &self.0 {
+            MediaType::OctetStream => formatter.write_str(ESSENCE_OCTET_STREAM),
+            MediaType::Json => formatter.write_str(ESSENCE_JSON),
+            MediaType::General(general) => match &general.charset {
+                Some(charset) => {
+                    write!(formatter, "{}; charset={}", general.essence, charset)
+                }
+                None => formatter.write_str(&general.essence),
+            },
         }
     }
 }

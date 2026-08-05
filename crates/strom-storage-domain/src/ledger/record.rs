@@ -20,6 +20,11 @@ pub struct StreamRecord {
     created_at: BatchId,
 }
 
+const _: () = assert!(
+    size_of::<StreamRecord>() == 64,
+    "a live ledger row is what resident-state scans touch; it stays within one cache line"
+);
+
 impl StreamRecord {
     #[must_use]
     pub const fn new(
