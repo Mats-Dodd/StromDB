@@ -1,0 +1,148 @@
+[
+  {
+    "mode": "ursula-disk",
+    "stream_count": 100,
+    "pods": 4,
+    "throughput": 2438.5,
+    "p50": 14.415,
+    "p99": 87.999,
+    "pod_mem_mb": 1082,
+    "pod_mem_p50_mb": 1046,
+    "saturated": true,
+    "status": "ok",
+    "reason": "plateau",
+    "walk": [
+      [
+        4,
+        2438.5
+      ],
+      [
+        8,
+        1901.125
+      ]
+    ]
+  },
+  {
+    "mode": "ursula-memory",
+    "stream_count": 100,
+    "pods": 4,
+    "throughput": 62679.5,
+    "p50": 0.536,
+    "p99": 42.879,
+    "pod_mem_mb": 2580,
+    "pod_mem_p50_mb": 1960,
+    "saturated": true,
+    "status": "ok",
+    "reason": "plateau",
+    "walk": [
+      [
+        4,
+        62679.5
+      ],
+      [
+        8,
+        64881.375
+      ]
+    ]
+  },
+  {
+    "mode": "ursula-disk",
+    "stream_count": 1000,
+    "pods": 4,
+    "throughput": 6665.875,
+    "p50": 112.575,
+    "p99": 384.255,
+    "pod_mem_mb": 1631,
+    "pod_mem_p50_mb": 1475,
+    "saturated": true,
+    "status": "ok",
+    "reason": "plateau",
+    "walk": [
+      [
+        4,
+        6665.875
+      ],
+      [
+        8,
+        5369.25
+      ]
+    ]
+  },
+  {
+    "mode": "ursula-memory",
+    "stream_count": 1000,
+    "pods": 16,
+    "throughput": 110982.75,
+    "p50": null,
+    "p99": null,
+    "pod_mem_mb": 2359,
+    "pod_mem_p50_mb": 1956,
+    "saturated": false,
+    "status": "ok",
+    "reason": "ladder_exhausted",
+    "walk": [
+      [
+        4,
+        85666.375
+      ],
+      [
+        8,
+        99436.5
+      ],
+      [
+        16,
+        110982.75
+      ]
+    ]
+  },
+  {
+    "mode": "ursula-disk",
+    "stream_count": 10000,
+    "pods": 8,
+    "throughput": 12153.25,
+    "p50": 1184.767,
+    "p99": 2619.391,
+    "pod_mem_mb": 2486,
+    "pod_mem_p50_mb": 2351,
+    "saturated": true,
+    "status": "ok",
+    "reason": "plateau",
+    "walk": [
+      [
+        8,
+        12153.25
+      ],
+      [
+        16,
+        12170.25
+      ]
+    ]
+  },
+  {
+    "mode": "ursula-memory",
+    "stream_count": 10000,
+    "pods": 16,
+    "throughput": 146253.0,
+    "p50": 24.367,
+    "p99": 287.999,
+    "pod_mem_mb": 3496,
+    "pod_mem_p50_mb": 3159,
+    "saturated": true,
+    "status": "ok",
+    "reason": "plateau",
+    "walk": [
+      [
+        8,
+        126869.25
+      ],
+      [
+        16,
+        146253.0
+      ],
+      [
+        24,
+        156053.75
+      ]
+    ]
+  }
+]

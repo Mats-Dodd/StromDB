@@ -1,0 +1,31 @@
+{
+  "suite": "canonical-mixed-cal",
+  "workload": "mixed",
+  "cluster": {
+    "server_machine": "c4d-standard-16-lssd",
+    "client_machine": "n2d-standard-32",
+    "client_nodes": 2,
+    "region": "europe-west4",
+    "cluster_name": "bench-canon-mixed"
+  },
+  "mixed": {
+    "sweep": "writer_rate",
+    "levels": [
+      0
+    ],
+    "writers_per_stream": 1,
+    "readers": 0,
+    "subscribers": 0,
+    "duration_secs": 20,
+    "payload_bytes": 256,
+    "setup_concurrency": 16,
+    "pods": 1
+  },
+  "modes": [
+    "wal"
+  ],
+  "stream_counts": [
+    50
+  ],
+  "_doc": "CANONICAL mixed-workload calibration anchor: unthrottled writers -> single-pod mixed-shape ceiling; the interference sweeps pin writers at ~60% of this."
+}

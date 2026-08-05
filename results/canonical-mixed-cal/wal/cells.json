@@ -1,0 +1,40 @@
+{
+  "cells": {
+    "50": {
+      "stream_count": 50,
+      "image_digest": "92f4a6387253",
+      "complete": true,
+      "levels": {
+        "0": {
+          "write_ops_per_sec": 81564.35,
+          "write_p50": 0.457,
+          "write_p99": 1.845,
+          "read_ops_per_sec": 0.0,
+          "read_mib_per_sec": 0.0,
+          "read_p50": null,
+          "read_p99": null,
+          "events_per_sec": 0.0,
+          "delivery_p50": null,
+          "delivery_p99": null,
+          "write_ok": 1631287,
+          "write_bp": 0,
+          "write_err": 0,
+          "read_ok": 0,
+          "read_bp": 0,
+          "read_err": 0,
+          "events_received": 0,
+          "control_events_received": 0,
+          "elapsed_secs": 20.008877967,
+          "drive_secs": 20.0,
+          "level": 0,
+          "readers": 0,
+          "subscribers": 0,
+          "writer_rate": 0,
+          "read_rate": 0,
+          "status": "ok",
+          "reason": "complete"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+mode,stream_count,pods,throughput,p50,p99,pod_mem_mb,pod_mem_p50_mb,saturated,status,reason
+memory,100,16,446267.25,0.239,0.42,123,11,True,ok,plateau
+wal,100,24,501524.875,0.222,0.407,69,12,True,ok,plateau
+wal-tailcache,100,24,504778.375,0.222,0.404,93,44,True,ok,plateau
+memory,1000,16,499904.375,1.473,7.727,48,40,True,ok,plateau
+wal,1000,24,677649.75,1.181,6.607,43,35,True,ok,plateau
+wal-tailcache,1000,16,621426.125,1.184,7.863,61,51,True,ok,plateau
+memory,10000,32,583443.125,1.773,120.191,147,92,True,ok,plateau
+wal,10000,48,732617.25,1.43,93.567,193,103,True,ok,plateau
+wal-tailcache,10000,32,684709.0,1.426,93.055,194,136,True,ok,plateau
+memory,100000,110,1282158.375,,,726,481,False,ok,ladder_exhausted
+wal,100000,80,927583.5,40.575,737.279,854,545,True,ok,plateau
+wal-tailcache,100000,80,821769.875,8.959,504.319,909,510,True,ok,plateau

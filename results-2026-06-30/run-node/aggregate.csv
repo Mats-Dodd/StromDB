@@ -1,0 +1,4 @@
+mode,stream_count,pods,throughput,p50,p99,pod_mem_mb,pod_mem_p50_mb,saturated,status,reason
+node,100,16,65716.0,,,180,114,False,ok,ladder_exhausted
+node,1000,8,94615.125,5.035,19.119,436,229,True,ok,plateau
+node,10000,8,100566.25,76.607,123.263,969,787,True,ok,plateau

@@ -1,0 +1,73 @@
+# MinIO object store for Phase 2b, pinned to the NVMe role=server node.
+# Data lives on an emptyDir (medium "" → the node's local SSD ephemeral
+# storage) for fast fsync. Buckets:
+#   durable-streams  DS-rust cold tier
+#   ursula           ursula cold tier
+#   s2-bench         S2 Lite object substrate
+#   bench-results    per-pod HDR/JSON upload for the cross-node merge
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: ds-bench
+  labels: { app: minio }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: minio } }
+  template:
+    metadata: { labels: { app: minio } }
+    spec:
+      nodeSelector: ${NODESEL_SERVER}
+      containers:
+        - name: minio
+          image: minio/minio:latest
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - { name: MINIO_ROOT_USER, value: minioadmin }
+            - { name: MINIO_ROOT_PASSWORD, value: minioadmin }
+          ports: [{ containerPort: 9000 }, { containerPort: 9001 }]
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          resources:
+            # MinIO is the HDR-result store AND the object tier; at high cardinality
+            # the whole fleet uploads results at once. 500m bottlenecked (200 pods →
+            # dial timeouts → corrupted collection). It shares the server node with
+            # the durable server, which reserves only 500m and bursts to its 4-CPU
+            # limit ONLY during the measure window — which is sequential with (never
+            # overlaps) result-collection. So request 2 (a real floor that keeps
+            # durable's measure window isolated) with NO CPU limit, and MinIO bursts
+            # into the idle node during collection. Pairs with the c4d-8-lssd server
+            # node + ~64-pod fleets (MAX_FLEET_PODS in gke-bench.sh).
+            requests: { memory: "2Gi", cpu: "2" }
+            limits: { memory: "8Gi" }
+      volumes:
+        - name: data
+          emptyDir: { medium: "" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: ds-bench
+spec:
+  selector: { app: minio }
+  ports: [{ name: s3, port: 9000, targetPort: 9000 }]
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init
+  namespace: ds-bench
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: minio/mc:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - >
+              until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 2; done &&
+              mc mb -p local/durable-streams local/ursula local/s2-bench local/bench-results && echo buckets-ready

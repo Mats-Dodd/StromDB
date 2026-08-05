@@ -1,0 +1,30 @@
+/target
+**/target
+# The curated dataset + reports under results/ (cells.json, REPORT.md, *.csv) ARE
+# committed. Only the bulky raw per-cell artifacts a run produces are ignored.
+results/**/cells/
+results/**/samples.csv
+results/**/merged.json
+results/**/*.hdr
+results/**/verdict.txt
+results/trash/
+*.log
+.DS_Store
+__pycache__/
+*.pyc
+# cluster state + kubeconfigs (CREDENTIALS — never commit)
+.bench-state/
+# agent/session + local tooling dirs
+.claude/
+.superpowers/
+# env / key material (defensive — none should ever exist here)
+*.env
+.env
+*.pem
+*.key
+kubeconfig*
+*-credentials*.json
+service-account*.json
+
+# local beads/dolt issue-tracker state
+.beads/

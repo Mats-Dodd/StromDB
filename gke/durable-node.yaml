@@ -1,0 +1,85 @@
+# Node.js reference server (@durable-streams/server) — the protocol's reference
+# implementation, run under Node. Speaks the same Durable Streams protocol as the
+# Rust server, so ds-bench targets it with `--api-style durable`. In-memory storage
+# (no dataDir) — a pod restart gives fresh state, so no data volume / object store.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: durable-node
+  namespace: ds-bench
+  labels:
+    app: durable-node
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: durable-node
+  template:
+    metadata:
+      labels:
+        app: durable-node
+    spec:
+      nodeSelector: ${NODESEL_SERVER}
+      shareProcessNamespace: true   # so the metrics sidecar can read the node /proc/<pid>
+      containers:
+        - name: durable-node
+          image: ${IMG_NODE}
+          imagePullPolicy: ${PULL_POLICY}
+          env:
+            - name: PORT
+              value: "4438"
+          ports:
+            - containerPort: 4438
+          readinessProbe:
+            tcpSocket: { port: 4438 }
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 30
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "${SERVER_MEM}"
+              cpu: "${SERVER_CPU}"
+        # ── metrics sidecar — samples the node process RSS/CPU (see gke/metrics-sidecar.yaml)
+        - name: metrics
+          image: ${IMG_METRICS}
+          imagePullPolicy: ${PULL_POLICY}
+          command: [nice, "-n", "19", bash, /deploy/metrics/poller.sh]
+          env:
+            - { name: SERVER_PROC, value: node }
+            - { name: METRICS_INTERVAL_S, value: "1" }
+            - { name: METRICS_OUT, value: /metrics/samples.csv }
+            - { name: DATA_DIR, value: /tmp }
+            # POD_UID lets the poller find this pod's cgroup under the host cgroupfs
+            # to sample pod working-set memory (anon + active page cache).
+            - { name: POD_UID, valueFrom: { fieldRef: { fieldPath: metadata.uid } } }
+          volumeMounts:
+            - { name: metrics, mountPath: /metrics }
+            - { name: metrics-poller, mountPath: /deploy/metrics }
+            - { name: cgroup-host, mountPath: /host/cgroup, readOnly: true }
+          resources:
+            requests: { cpu: "10m", memory: "32Mi" }
+            limits: { cpu: "50m", memory: "64Mi" }
+      volumes:
+        - name: metrics
+          emptyDir: {}
+        - name: metrics-poller
+          configMap:
+            name: metrics-poller
+            defaultMode: 0755
+        - name: cgroup-host
+          hostPath: { path: /sys/fs/cgroup }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: durable-node
+  namespace: ds-bench
+spec:
+  selector:
+    app: durable-node
+  ports:
+    - port: 4438
+      targetPort: 4438

@@ -1,0 +1,92 @@
+# Cross-node ds-bench fleet (Phase 2b). Indexed Job on the role=client pool;
+# pods spread across the client nodes. Each pod runs ds-bench, writes its
+# .hdr/.json to a local emptyDir (/out), then uploads them to in-cluster MinIO
+# under s3://bench-results/${RUN_ID}/ — no shared volume, so it is multi-node
+# safe. The coordinator later downloads the run prefix and merges.
+#
+# Substituted by the run scripts before apply:
+#   ${PROJECT}      registry project
+#   ${RUN_ID}       unique run prefix in the bench-results bucket
+#   ${PARALLELISM}  number of fleet pods (= completions)
+#   ${BENCH_CMD}    ds-bench subcommand + flags (per-workload)
+#   ${OUT_PREFIX}   filename prefix for this workload's json (e.g. ms / fan-out)
+#   ${BARRIER_DIR}  non-empty (e.g. /barrier) enables the fleet START BARRIER: the
+#                   client holds after setup until every pod is ready and the
+#                   harness publishes a shared go time, so all measure windows
+#                   cover the same wall time (see src/barrier.rs). The relay
+#                   below bridges the client's local ready/go files to MinIO.
+#                   Empty = disabled (workloads that don't sum per-pod rates).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bench-fleet
+  namespace: ds-bench
+spec:
+  completions: ${PARALLELISM}
+  parallelism: ${PARALLELISM}
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeSelector: ${NODESEL_CLIENT}
+      containers:
+        - name: ds-bench
+          image: ${IMG_DSBENCH}
+          imagePullPolicy: ${PULL_POLICY}
+          env:
+            - { name: DS_BENCH_HDR_OUT, value: /out }
+            - { name: RUN_ID, value: "${RUN_ID}" }
+          command: ["/bin/sh", "-c"]
+          args:
+            - >
+              if [ -n "${BARRIER_DIR}" ]; then
+              mkdir -p "${BARRIER_DIR}";
+              ( while [ ! -f "${BARRIER_DIR}/ready" ]; do sleep 0.5; done;
+              for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+              mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null 2>&1 &&
+              mc cp "${BARRIER_DIR}/ready" "local/bench-results/${RUN_ID}/barrier/ready-$JOB_COMPLETION_INDEX" >/dev/null 2>&1 &&
+              break;
+              sleep $(( (JOB_COMPLETION_INDEX % 12) + 1 ));
+              done;
+              while :; do
+              mc cat "local/bench-results/${RUN_ID}/barrier/go" > "${BARRIER_DIR}/go.tmp" 2>/dev/null &&
+              [ -s "${BARRIER_DIR}/go.tmp" ] && break;
+              sleep 1;
+              done;
+              mv "${BARRIER_DIR}/go.tmp" "${BARRIER_DIR}/go" ) &
+              fi;
+              DS_BENCH_INSTANCE="$JOB_COMPLETION_INDEX"
+              DS_BENCH_SHARDS="${PARALLELISM}"
+              DS_BENCH_BARRIER_DIR="${BARRIER_DIR}"
+              DS_BENCH_BARRIER_TIMEOUT_SECS=3600
+              ds-bench ${BENCH_CMD}
+              > /out/${OUT_PREFIX}-${JOB_COMPLETION_INDEX}.json &&
+              up=0;
+              for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+              mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null 2>&1 &&
+              mc cp --recursive /out/ "local/bench-results/${RUN_ID}/" >/dev/null 2>&1 &&
+              { up=1; break; };
+              sleep $(( (JOB_COMPLETION_INDEX % 12) + i ));
+              done;
+              [ "$up" = 1 ] || { echo "RESULT UPLOAD to MinIO failed after retries" >&2; exit 1; }
+          volumeMounts:
+            - { name: out, mountPath: /out }
+          resources:
+            requests:
+              memory: "512Mi"
+              # cpu is the scheduling RESERVATION only (no cpu limit below, so a
+              # busy pod still bursts to the node's cores). Lower FLEET_CPU packs
+              # more (lighter) pods per node — the high-fan-out / low-density knob.
+              cpu: "${FLEET_CPU}"
+            limits:
+              # 24Gi cap: the 100k-reader mixed cell holds ~110k task futures +
+              # a per-reader HDR histogram + in-flight replay bodies (OOMKilled
+              # at 4Gi). A cap, not a reservation — requests stay at 512Mi and
+              # write fleets still pack many pods per node.
+              memory: "24Gi"
+              # no CPU limit on purpose — the load generator bursts to the node's
+              # cores (available_parallelism sizes the tokio runtime accordingly).
+      volumes:
+        - name: out
+          emptyDir: {}

@@ -1,0 +1,36 @@
+{
+  "suite": "canonical-reads-sse",
+  "workload": "reads",
+  "cluster": {
+    "server_machine": "c4d-standard-16-lssd",
+    "client_machine": "n2d-standard-32",
+    "client_nodes": 2,
+    "region": "europe-west4"
+  },
+  "reads": {
+    "mode": "sse",
+    "read_size_bytes": 256,
+    "append_rate_per_sec": 50,
+    "seed_bytes": 0,
+    "duration_secs": 15,
+    "warmup_secs": 5,
+    "settle_secs": 2,
+    "connection_levels": [
+      64,
+      256,
+      1024,
+      2048
+    ],
+    "pods": 1,
+    "repeats": 1
+  },
+  "modes": [
+    "wal",
+    "ursula"
+  ],
+  "stream_counts": [
+    10,
+    100
+  ],
+  "_doc": "CANONICAL SSE fan-out delivery benchmark \u2014 per-event delivery latency vs subscribers."
+}

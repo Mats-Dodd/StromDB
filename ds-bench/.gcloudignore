@@ -1,0 +1,6 @@
+# Keep the Cloud Build upload small + the Docker context clean. The image builds
+# the binary from source in-container (cargo build --release), so the local
+# target/ dir (~1.3G) must NOT be uploaded — it dominated the source tarball and
+# made `gcloud builds submit` upload for tens of minutes.
+target/
+.git/

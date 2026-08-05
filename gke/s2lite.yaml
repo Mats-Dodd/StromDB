@@ -1,0 +1,80 @@
+# S2 Lite (single-node). S2 is its own stream substrate (NOT durable-streams); it
+# persists to an S3-compatible object store — here the in-cluster MinIO `s2-bench`
+# bucket — so it shares the same
+# object-tier substrate as DS-rust/ursula (MinIO on local NVMe). The ds-bench
+# `--api-style s2` client speaks S2's REST: POST /v1/basins, /v1/streams,
+# /v1/streams/{s}/records with `Bearer ignored` (S2 Lite local does not validate
+# the token). Public image, anonymous pull.
+#
+# S2 is excluded from catch-up + mixed (the bench tool bails for those on S2);
+# the matrix runs only multi-stream + fan-out against it.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s2lite
+  namespace: ds-bench
+  labels: { app: s2lite }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: s2lite } }
+  template:
+    metadata: { labels: { app: s2lite } }
+    spec:
+      nodeSelector: ${NODESEL_SERVER}
+      shareProcessNamespace: true   # so the metrics sidecar can see the s2 process
+      containers:
+        - name: s2lite
+          image: ghcr.io/s2-streamstore/s2:latest
+          imagePullPolicy: Always
+          args: ["lite", "--bucket", "s2-bench", "--path", "s2lite", "--port", "80"]
+          env:
+            - { name: AWS_ENDPOINT_URL_S3, value: "http://minio:9000" }
+            - { name: AWS_ACCESS_KEY_ID, value: minioadmin }
+            - { name: AWS_SECRET_ACCESS_KEY, value: minioadmin }
+            - { name: AWS_REGION, value: us-east-1 }
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            tcpSocket: { port: 80 }
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 30
+          resources:
+            requests: { memory: "2Gi", cpu: "2" }
+            limits: { memory: "12Gi" }
+        # ── metrics sidecar — pod working-set memory (+ s2 process RSS if matched).
+        # See gke/metrics-sidecar.yaml. Pod memory is process-agnostic, so it works
+        # even though we don't pin s2's binary name.
+        - name: metrics
+          image: ${IMG_METRICS}
+          imagePullPolicy: ${PULL_POLICY}
+          command: [nice, "-n", "19", bash, /deploy/metrics/poller.sh]
+          env:
+            - { name: SERVER_PROC, value: s2 }
+            - { name: METRICS_INTERVAL_S, value: "1" }
+            - { name: METRICS_OUT, value: /metrics/samples.csv }
+            - { name: DATA_DIR, value: /tmp }
+            - { name: POD_UID, valueFrom: { fieldRef: { fieldPath: metadata.uid } } }
+          volumeMounts:
+            - { name: metrics, mountPath: /metrics }
+            - { name: metrics-poller, mountPath: /deploy/metrics }
+            - { name: cgroup-host, mountPath: /host/cgroup, readOnly: true }
+          resources:
+            requests: { cpu: "10m", memory: "32Mi" }
+            limits: { cpu: "50m", memory: "64Mi" }
+      volumes:
+        - name: metrics
+          emptyDir: {}
+        - name: metrics-poller
+          configMap: { name: metrics-poller, defaultMode: 0755 }
+        - name: cgroup-host
+          hostPath: { path: /sys/fs/cgroup }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s2lite
+  namespace: ds-bench
+spec:
+  selector: { app: s2lite }
+  ports: [{ port: 80, targetPort: 80 }]

@@ -1,0 +1,138 @@
+# ursula — single-node Deployment + an inline ursula-config ConfigMap. The storage
+# backend is selected at deploy time via the URSULA_WAL env (memory | disk).
+#
+# Matched durability: disk WAL Raft ([raft.wal] backend=disk) on the node's local
+# NVMe (emptyDir), cold tier → in-cluster MinIO `ursula` bucket (HMAC minioadmin).
+# Listens on :4437; ds-bench talks to it with `--api-style ursula`.
+#
+# The config is mounted from a ConfigMap; we override the image's default CMD to
+# point at it. ([raft.peers] omitted in the config → Topology::SingleNode.)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ursula-config
+  namespace: ds-bench
+data:
+  ursula.toml: |
+    [server]
+    listen = "0.0.0.0:4437"
+
+    [raft]
+    node_id = 1
+    # [raft.peers] intentionally omitted -> Topology::SingleNode
+
+    [raft.wal]
+    backend = "${URSULA_WAL}"
+    path = "/var/lib/ursula/data"
+
+    [storage.cold]
+    backend = "s3"
+
+    [storage.cold.s3]
+    bucket = "ursula"
+    endpoint = "http://minio:9000"
+    region = "us-east-1"
+    access_key_id = "minioadmin"
+    secret_access_key = "minioadmin"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ursula
+  namespace: ds-bench
+  labels: { app: ursula }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: ursula } }
+  strategy: { type: Recreate }
+  template:
+    # The WAL backend lives in the ursula-config ConfigMap, not the pod spec, so a
+    # backend change wouldn't restart the pod on its own. This annotation puts the
+    # backend in the pod template, so `kubectl apply` rolls a fresh pod (picking up
+    # the new ConfigMap) whenever the backend changes between server_configs.
+    metadata:
+      labels: { app: ursula }
+      annotations: { "ds-bench/wal-backend": "${URSULA_WAL}" }
+    spec:
+      nodeSelector: ${NODESEL_SERVER}
+      # Required so the metrics sidecar can read /proc/<pid>/stat of ursula.
+      shareProcessNamespace: true
+      # Wipe the data-dir between cells (see durable-streams.yaml). ursula's WAL
+      # lives under /var/lib/ursula/data on the `data` emptyDir.
+      initContainers:
+        - name: wipe-data
+          image: ${IMG_URSULA}
+          imagePullPolicy: ${PULL_POLICY}
+          command: ["sh", "-c", "rm -rf /var/lib/ursula/* /var/lib/ursula/.[!.]* 2>/dev/null; true"]
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/ursula }
+      containers:
+        - name: ursula
+          image: ${IMG_URSULA}
+          imagePullPolicy: ${PULL_POLICY}
+          command: ["/usr/local/bin/ursula"]
+          args: ["--config", "/etc/ursula/ursula.toml", "--node-id", "1", "--preset", "standard"]
+          ports:
+            - containerPort: 4437
+          # readinessProbe so `kubectl wait --for=condition=available` (and the
+          # matrix's deploy gate) only passes once ursula is actually serving on
+          # :4437 — without it the deployment reports available the moment the
+          # pod is Running, before the HTTP listener + Raft leader election are
+          # up, and the fleet hits "connection refused".
+          readinessProbe:
+            tcpSocket: { port: 4437 }
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 30
+          volumeMounts:
+            - { name: config, mountPath: /etc/ursula }
+            - { name: data, mountPath: /var/lib/ursula }
+          resources:
+            # Matched budget to the durable-streams server for a fair comparison:
+            # cgroup cpu.max = ${SERVER_CPU}, mem limit = ${SERVER_MEM}. Small cpu
+            # request floor so it still schedules on the dedicated server node.
+            requests: { memory: "2Gi", cpu: "500m" }
+            limits: { memory: "${SERVER_MEM}", cpu: "${SERVER_CPU}" }
+        # ── metrics sidecar (mirrors durable-streams.yaml) ──────────────────────
+        - name: metrics
+          image: ${IMG_METRICS}
+          imagePullPolicy: ${PULL_POLICY}
+          command: [nice, "-n", "19", bash, /deploy/metrics/poller.sh]
+          env:
+            - { name: SERVER_PROC, value: ursula }
+            - { name: METRICS_INTERVAL_S, value: "1" }
+            - { name: METRICS_OUT, value: /metrics/samples.csv }
+            - { name: DATA_DIR, value: /var/lib/ursula }
+            # POD_UID lets the poller find this pod's cgroup under the host cgroupfs
+            # to sample pod working-set memory (anon + active page cache).
+            - { name: POD_UID, valueFrom: { fieldRef: { fieldPath: metadata.uid } } }
+          volumeMounts:
+            - { name: metrics, mountPath: /metrics }
+            - { name: metrics-poller, mountPath: /deploy/metrics }
+            - { name: data, mountPath: /var/lib/ursula, readOnly: true }
+            - { name: cgroup-host, mountPath: /host/cgroup, readOnly: true }
+          resources:
+            requests: { cpu: "10m", memory: "32Mi" }
+            limits: { cpu: "50m", memory: "64Mi" }
+      volumes:
+        - name: config
+          configMap: { name: ursula-config }
+        - name: data
+          emptyDir: { medium: "" }
+        - name: metrics
+          emptyDir: {}
+        - name: metrics-poller
+          configMap:
+            name: metrics-poller
+            defaultMode: 0755
+        - name: cgroup-host
+          hostPath: { path: /sys/fs/cgroup }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ursula
+  namespace: ds-bench
+spec:
+  selector: { app: ursula }
+  ports: [{ port: 4437, targetPort: 4437 }]

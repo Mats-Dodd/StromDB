@@ -1,0 +1,87 @@
+# metrics-sidecar.yaml — reusable snippet for attaching the CPU/RSS poller
+# sidecar to any server Deployment in this benchmark fleet.
+#
+# HOW TO USE
+# ----------
+# 1. Create the ConfigMap from the poller script (run once per namespace):
+#
+#      kubectl -n ds-bench create configmap metrics-poller \
+#        --from-file=poller.sh=deploy/metrics/poller.sh
+#
+#    `ensure_metrics_configmap` (scripts/lib-bench.sh) does this before deploy, so no
+#    image rebuild is needed when the poller logic changes.
+#
+# 2. Paste the annotated sections below into your Deployment manifest.
+#    Replace SERVER_PROC with the binary name that appears in /proc/<pid>/stat
+#    (the comm field, max 15 chars, truncated by the kernel if longer).
+#
+# DESIGN NOTES
+# ------------
+# - shareProcessNamespace: true  → sidecar can read /proc/<pid>/stat of the
+#   server container within the same pod.
+# - nice -n 19 keeps the poller at the lowest CPU scheduling priority so it
+#   does not perturb latency measurements.
+# - 1-second poll interval; adjust METRICS_INTERVAL_S for coarser/finer data.
+# - The `${IMG_METRICS}` image just needs bash, pgrep (procps), and coreutils;
+#   ds-bench:dev (the default) already carries them — no extra image required.
+# - Output is written to a shared emptyDir (/metrics/samples.csv); the run
+#   harness collects it via `kubectl cp` after the benchmark completes.
+# - SERVER_PROC parameterises the process name so ursula, S2, and future
+#   servers can reuse this sidecar unchanged.
+#
+# CPU field note: /proc/<pid>/stat fields 14+15 (1-indexed) are utime+stime.
+# The awk expression strips everything up to and including the closing ')' of
+# the comm field, then counts space-separated tokens — this handles spaces in
+# comm; assumes no literal ') ' inside the process name.
+
+# ── pod-level (under spec.template.spec) ─────────────────────────────────────
+#
+#   shareProcessNamespace: true
+#
+# ── volumes (under spec.template.spec.volumes) ───────────────────────────────
+#
+#   - name: metrics
+#     emptyDir: {}
+#   - name: metrics-poller
+#     configMap:
+#       name: metrics-poller
+#       defaultMode: 0755
+#
+# ── sidecar container (append to spec.template.spec.containers) ──────────────
+
+- name: metrics
+  image: ${IMG_METRICS}   # a small image with bash + procps (defaults to ds-bench:dev)
+  imagePullPolicy: Always
+  command:
+    - nice
+    - "-n"
+    - "19"
+    - bash
+    - /deploy/metrics/poller.sh
+  env:
+    - name: SERVER_PROC
+      value: durable-streams-server   # override per workload
+    - name: METRICS_INTERVAL_S
+      value: "1"
+    - name: METRICS_OUT
+      value: /metrics/samples.csv
+  volumeMounts:
+    - name: metrics
+      mountPath: /metrics
+    - name: metrics-poller
+      mountPath: /deploy/metrics
+  resources:
+    requests:
+      cpu: "10m"
+      memory: "32Mi"
+    limits:
+      cpu: "50m"
+      memory: "64Mi"
+
+# ── ConfigMap (created by run script; shown here for reference only) ──────────
+#
+# kubectl -n ds-bench create configmap metrics-poller \
+#   --from-file=poller.sh=deploy/metrics/poller.sh
+#
+# Do NOT embed the ConfigMap object in the Deployment manifest — keep it
+# created by the run script so poller.sh edits never require manifest changes.
