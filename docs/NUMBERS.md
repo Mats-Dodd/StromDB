@@ -11,4 +11,5 @@ Read 1MB over 100 Gbps network           100,000 ns
 Read 1MB from SSD                      1,000,000 ns
 Disk seek                              5,000,000 ns
 Read 1MB sequentially from disk       10,000,000 ns
+Trip from server to AWS S3 and back   100,000,000 ns
 Send packet CA->Netherlands->CA      150,000,000 ns

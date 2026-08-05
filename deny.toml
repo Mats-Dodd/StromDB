@@ -13,6 +13,12 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "Unicode-3.0",
+    # Permissive licenses carried by the rustls TLS stack beneath object_store:
+    # ISC (rustls-webpki, untrusted, aws-lc), BSD-3-Clause (subtle, aws-lc-sys),
+    # CDLA-Permissive-2.0 (webpki-root-certs data).
+    "ISC",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
 ]
 
 [bans]
