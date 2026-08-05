@@ -1,0 +1,2691 @@
+/**
+ * Yjs Durable Streams Protocol Conformance Tests
+ *
+ * These tests verify the Yjs protocol implementation by:
+ * 1. Starting a durable streams server (underlying storage)
+ * 2. Starting a Yjs server (protocol layer)
+ * 3. Testing various scenarios with the YjsProvider
+ *
+ * Protocol: https://github.com/durable-streams/durable-streams/blob/main/packages/y-durable-streams/YJS-PROTOCOL.md
+ */
+
+import {
+  request as createHttpRequest,
+  createServer as createHttpServer,
+} from "node:http"
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest"
+import { DurableStreamTestServer } from "@durable-streams/server"
+import * as Y from "yjs"
+import { Awareness } from "y-protocols/awareness"
+import { YjsProvider } from "../src"
+import { YjsServer, YjsStreamPaths } from "../src/server"
+
+const DEFAULT_TIMEOUT_MS = 10000
+const POLL_INTERVAL_MS = 50
+
+async function createWebhookReceiver(): Promise<{
+  url: string
+  waitForRequest: (timeoutMs?: number) => Promise<{
+    body: Record<string, unknown>
+    signature: string | null
+  }>
+  requestCount: () => number
+  close: () => Promise<void>
+}> {
+  const received: Array<{
+    body: Record<string, unknown>
+    signature: string | null
+  }> = []
+  const waiters: Array<() => void> = []
+
+  const server = createHttpServer((req, res) => {
+    const chunks: Array<Buffer> = []
+    req.on(`data`, (chunk: Buffer) => chunks.push(chunk))
+    req.on(`end`, () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString(`utf8`)) as Record<
+        string,
+        unknown
+      >
+      const signatureHeader = req.headers[`webhook-signature`]
+      received.push({
+        body,
+        signature: typeof signatureHeader === `string` ? signatureHeader : null,
+      })
+      for (const waiter of waiters.splice(0)) waiter()
+      res.writeHead(200, { "content-type": `application/json` })
+      res.end(JSON.stringify({ done: true }))
+    })
+  })
+
+  await new Promise<void>((resolve, reject) => {
+    server.on(`error`, reject)
+    server.listen(0, `127.0.0.1`, resolve)
+  })
+
+  const address = server.address()
+  if (!address || typeof address === `string`) {
+    throw new Error(`Failed to start webhook receiver`)
+  }
+
+  return {
+    url: `http://127.0.0.1:${address.port}/webhook`,
+    waitForRequest: async (timeoutMs = DEFAULT_TIMEOUT_MS) => {
+      if (received.length === 0) {
+        await new Promise<void>((resolve, reject) => {
+          const timeout = setTimeout(
+            () => reject(new Error(`Timed out waiting for webhook request`)),
+            timeoutMs
+          )
+          waiters.push(() => {
+            clearTimeout(timeout)
+            resolve()
+          })
+        })
+      }
+      return received[received.length - 1]!
+    },
+    requestCount: () => received.length,
+    close: async () => {
+      server.closeAllConnections()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    },
+  }
+}
+
+async function waitForCondition(
+  condition: () => boolean | Promise<boolean>,
+  options: {
+    timeoutMs?: number
+    intervalMs?: number
+    label?: string
+  } = {}
+): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+  const intervalMs = options.intervalMs ?? POLL_INTERVAL_MS
+  const start = Date.now()
+
+  while (Date.now() - start < timeoutMs) {
+    if (await condition()) return
+    await new Promise((resolve) => setTimeout(resolve, intervalMs))
+  }
+
+  throw new Error(
+    options.label
+      ? `Timeout waiting for ${options.label}`
+      : `Timeout waiting for condition`
+  )
+}
+
+function waitForSync(
+  provider: YjsProvider,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error(`Sync timeout`)),
+      timeoutMs
+    )
+
+    if (provider.synced) {
+      clearTimeout(timeout)
+      resolve()
+      return
+    }
+
+    const handler = (synced: boolean) => {
+      if (synced) {
+        provider.off(`synced`, handler)
+        clearTimeout(timeout)
+        resolve()
+      }
+    }
+    provider.on(`synced`, handler)
+  })
+}
+
+async function waitForDocText(
+  doc: Y.Doc,
+  name: string,
+  expected: string
+): Promise<void> {
+  await waitForCondition(() => doc.getText(name).toString() === expected, {
+    label: `doc text ${name} to be "${expected}"`,
+  })
+}
+
+async function waitForAwarenessState(
+  awareness: Awareness,
+  clientId: number,
+  predicate: (state: unknown | undefined) => boolean,
+  label: string
+): Promise<void> {
+  await waitForCondition(
+    () => {
+      const state = awareness.getStates().get(clientId)
+      return predicate(state)
+    },
+    { label }
+  )
+}
+
+async function ensureAwarenessDelivery(
+  sender: Awareness,
+  receiver: Awareness,
+  update: { key: string; value: unknown },
+  predicate: (state: unknown | undefined) => boolean,
+  label: string,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS
+): Promise<void> {
+  const start = Date.now()
+
+  while (Date.now() - start < timeoutMs) {
+    sender.setLocalStateField(update.key, update.value)
+    const state = receiver.getStates().get(sender.clientID)
+    if (predicate(state)) return
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+
+  throw new Error(`Timeout waiting for ${label}`)
+}
+
+async function appendWithSync(
+  provider: YjsProvider,
+  text: Y.Text,
+  chunk: string,
+  count: number
+): Promise<void> {
+  for (let i = 0; i < count; i++) {
+    text.insert(text.length, chunk)
+    await waitForCondition(() => provider.synced, {
+      timeoutMs: 3000,
+      label: `provider sync after update`,
+    })
+  }
+}
+
+/**
+ * Wait for a snapshot to exist by checking if offset=snapshot redirects to a _snapshot URL.
+ */
+async function waitForSnapshot(
+  baseUrl: string,
+  docId: string,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS
+): Promise<string> {
+  const start = Date.now()
+
+  while (Date.now() - start < timeoutMs) {
+    const response = await fetch(`${baseUrl}/docs/${docId}?offset=snapshot`, {
+      method: `GET`,
+      redirect: `manual`,
+    })
+
+    if (response.status === 307) {
+      const location = response.headers.get(`location`)
+      if (location && location.includes(`_snapshot`)) {
+        // Extract the snapshot offset from the URL
+        const match = location.match(/offset=([^&]+_snapshot)/)
+        if (match) {
+          return match[1]!
+        }
+      }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
+  }
+
+  throw new Error(`Timeout waiting for snapshot`)
+}
+
+/**
+ * Create a document on the Yjs server via PUT.
+ * Must be called before reading or writing to a document.
+ */
+async function createDocument(baseUrl: string, docId: string): Promise<void> {
+  const response = await fetch(`${baseUrl}/docs/${docId}`, {
+    method: `PUT`,
+  })
+
+  if (
+    response.status !== 201 &&
+    response.status !== 200 &&
+    response.status !== 409
+  ) {
+    throw new Error(
+      `Failed to create document: ${response.status} ${await response.text()}`
+    )
+  }
+}
+
+/**
+ * To run against an external Yjs server, set the YJS_CONFORMANCE_URL env var:
+ *   YJS_CONFORMANCE_URL=http://localhost:4438/v1/yjs/test pnpm vitest run
+ *
+ * If not set, local test servers will be started automatically.
+ */
+const externalServerUrl = process.env.YJS_CONFORMANCE_URL
+
+describe(`Yjs Durable Streams Protocol`, () => {
+  let dsServer: DurableStreamTestServer | null = null
+  let yjsServer: YjsServer | null = null
+  let baseUrl: string
+
+  beforeAll(async () => {
+    if (externalServerUrl) {
+      // Use external server - skip local server startup
+      baseUrl = externalServerUrl
+      console.log(`Using external Yjs server: ${baseUrl}`)
+    } else {
+      // Start local servers for testing
+      dsServer = new DurableStreamTestServer({ port: 0, webhooks: true })
+      await dsServer.start()
+
+      yjsServer = new YjsServer({
+        port: 0,
+        dsServerUrl: dsServer.url,
+        compactionThreshold: 1500, // Threshold for testing (~7 updates)
+      })
+      await yjsServer.start()
+
+      baseUrl = `${yjsServer.url}/v1/yjs/test`
+    }
+  })
+
+  afterAll(async () => {
+    // Stop local servers if we started them
+    if (yjsServer) {
+      yjsServer.stop().catch(() => {})
+    }
+    if (dsServer) {
+      dsServer.stop().catch(() => {})
+    }
+    // Give a moment for cleanup
+    await new Promise((r) => setTimeout(r, 200))
+  }, 5000)
+
+  describe.skipIf(!!externalServerUrl)(`Snapshot Subscriptions`, () => {
+    it(`snapshot-subscription.lifecycle creates, reads, and deletes a webhook subscription`, async () => {
+      const receiver = await createWebhookReceiver()
+      const subscriptionId = `snapshot-lifecycle-${Date.now()}`
+      const subscriptionUrl = `${baseUrl}/__ds/subscriptions/${subscriptionId}`
+      const request = {
+        type: `webhook`,
+        events: [`snapshot.available`],
+        document_pattern: `projects/**`,
+        webhook: { url: receiver.url },
+        lease_ttl_ms: 1000,
+        description: `Archive project snapshots`,
+      }
+
+      try {
+        const createdResponse = await fetch(subscriptionUrl, {
+          method: `PUT`,
+          headers: { "content-type": `application/json` },
+          body: JSON.stringify(request),
+        })
+        expect(createdResponse.status).toBe(201)
+        const created = (await createdResponse.json()) as {
+          id: string
+          subscription_id: string
+          delivery_subscription_id: string
+          service: string
+          events: Array<string>
+          document_pattern: string
+          webhook: {
+            url: string
+            signing: { alg: string; jwks_url: string }
+          }
+        }
+        expect(created.id).toBe(subscriptionId)
+        expect(created.subscription_id).toBe(subscriptionId)
+        expect(created.delivery_subscription_id).toMatch(/^yjs:/)
+        expect(created.service).toBe(`test`)
+        expect(created.events).toEqual([`snapshot.available`])
+        expect(created.document_pattern).toBe(`projects/**`)
+        expect(created.webhook.url).toBe(receiver.url)
+        expect(created.webhook.signing.alg).toBe(`ed25519`)
+        expect(created.webhook.signing.jwks_url).toContain(
+          `/v1/stream/__ds/jwks.json`
+        )
+
+        const confirmedResponse = await fetch(subscriptionUrl, {
+          method: `PUT`,
+          headers: { "content-type": `application/json` },
+          body: JSON.stringify(request),
+        })
+        expect(confirmedResponse.status).toBe(200)
+
+        const normalizedResponse = await fetch(subscriptionUrl, {
+          method: `PUT`,
+          headers: { "content-type": `application/json` },
+          body: JSON.stringify({
+            ...request,
+            document_pattern: `/projects/**/`,
+          }),
+        })
+        expect(normalizedResponse.status).toBe(200)
+
+        const conflictResponse = await fetch(subscriptionUrl, {
+          method: `PUT`,
+          headers: { "content-type": `application/json` },
+          body: JSON.stringify({
+            ...request,
+            webhook: { url: `${receiver.url}/different` },
+          }),
+        })
+        expect(conflictResponse.status).toBe(409)
+
+        const getResponse = await fetch(subscriptionUrl)
+        expect(getResponse.status).toBe(200)
+        const subscription = (await getResponse.json()) as {
+          id: string
+          events: Array<string>
+          document_pattern: string
+        }
+        expect(subscription.id).toBe(subscriptionId)
+        expect(subscription.events).toEqual([`snapshot.available`])
+        expect(subscription.document_pattern).toBe(`projects/**`)
+
+        const deleteResponse = await fetch(subscriptionUrl, {
+          method: `DELETE`,
+        })
+        expect(deleteResponse.status).toBe(204)
+
+        const deletedResponse = await fetch(subscriptionUrl)
+        expect(deletedResponse.status).toBe(404)
+      } finally {
+        await fetch(subscriptionUrl, { method: `DELETE` })
+        await receiver.close()
+      }
+    })
+
+    it(`snapshot-subscription.delivery wakes a webhook for a matching document`, async () => {
+      const receiver = await createWebhookReceiver()
+      const subscriptionId = `snapshot-delivery-${Date.now()}`
+      const subscriptionUrl = `${baseUrl}/__ds/subscriptions/${subscriptionId}`
+      const docId = `projects/webhook-${Date.now()}`
+      let provider: YjsProvider | null = null
+
+      try {
+        const createSubscriptionResponse = await fetch(subscriptionUrl, {
+          method: `PUT`,
+          headers: { "content-type": `application/json` },
+          body: JSON.stringify({
+            type: `webhook`,
+            events: [`snapshot.available`],
+            document_pattern: `projects/**`,
+            webhook: { url: receiver.url },
+            lease_ttl_ms: 1000,
+          }),
+        })
+        expect(createSubscriptionResponse.status).toBe(201)
+        const subscription = (await createSubscriptionResponse.json()) as {
+          delivery_subscription_id: string
+        }
+
+        const doc = new Y.Doc()
+        provider = new YjsProvider({ doc, baseUrl, docId })
+        await waitForSync(provider)
+
+        const reservedAwarenessResponse = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=.index`,
+          { method: `PUT` }
+        )
+        expect(reservedAwarenessResponse.status).toBe(400)
+        expect(await reservedAwarenessResponse.json()).toEqual({
+          error: {
+            code: `INVALID_REQUEST`,
+            message: `Invalid awareness name`,
+          },
+        })
+
+        const awarenessResponse = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=presence`,
+          { method: `PUT` }
+        )
+        expect(awarenessResponse.status).toBe(201)
+        await new Promise((resolve) => setTimeout(resolve, 500))
+        expect(receiver.requestCount()).toBe(0)
+
+        const text = doc.getText(`content`)
+        await appendWithSync(provider, text, `W`.repeat(200), 10)
+        await waitForSnapshot(baseUrl, docId)
+
+        const delivery = await receiver.waitForRequest()
+        expect(delivery.signature).toMatch(
+          /^t=\d+,kid=.+,ed25519=[A-Za-z0-9_-]+$/
+        )
+        expect(delivery.body.subscription_id).toBe(
+          subscription.delivery_subscription_id
+        )
+        const stream = (
+          delivery.body.streams as Array<{
+            path: string
+            has_pending: boolean
+          }>
+        ).find(
+          (candidate) => candidate.path === `yjs/test/docs/${docId}/.index`
+        )
+        expect(stream).toEqual(
+          expect.objectContaining({
+            path: `yjs/test/docs/${docId}/.index`,
+            has_pending: true,
+          })
+        )
+
+        const snapshotDiscovery = await fetch(
+          `${baseUrl}/docs/${docId}?offset=snapshot`,
+          { redirect: `manual` }
+        )
+        expect(snapshotDiscovery.status).toBe(307)
+        const snapshotLocation = snapshotDiscovery.headers.get(`location`)
+        expect(snapshotLocation).toContain(`_snapshot`)
+
+        const snapshotResponse = await fetch(
+          new URL(snapshotLocation!, `${baseUrl}/docs/${docId}`).toString()
+        )
+        expect(snapshotResponse.status).toBe(200)
+        expect(
+          (await snapshotResponse.arrayBuffer()).byteLength
+        ).toBeGreaterThan(0)
+      } finally {
+        provider?.destroy()
+        await fetch(subscriptionUrl, { method: `DELETE` })
+        await receiver.close()
+      }
+    })
+
+    it(`snapshot-subscription.invalid-filter rejects unsupported events`, async () => {
+      const response = await fetch(
+        `${baseUrl}/__ds/subscriptions/invalid-${Date.now()}`,
+        {
+          method: `PUT`,
+          headers: { "content-type": `application/json` },
+          body: JSON.stringify({
+            type: `webhook`,
+            events: [`snapshot.created`],
+            document_pattern: `**`,
+            webhook: { url: `http://127.0.0.1:1/webhook` },
+          }),
+        }
+      )
+      expect(response.status).toBe(400)
+      expect(await response.json()).toEqual({
+        error: {
+          code: `INVALID_REQUEST`,
+          message: `events must contain only snapshot.available`,
+        },
+      })
+
+      const invalidPatternResponse = await fetch(
+        `${baseUrl}/__ds/subscriptions/invalid-pattern-${Date.now()}`,
+        {
+          method: `PUT`,
+          headers: { "content-type": `application/json` },
+          body: JSON.stringify({
+            type: `webhook`,
+            events: [`snapshot.available`],
+            document_pattern: `projects/[invalid]`,
+            webhook: { url: `http://127.0.0.1:1/webhook` },
+          }),
+        }
+      )
+      expect(invalidPatternResponse.status).toBe(400)
+      expect(await invalidPatternResponse.json()).toEqual({
+        error: {
+          code: `INVALID_REQUEST`,
+          message: `document_pattern must be a valid document glob`,
+        },
+      })
+    })
+
+    it(`snapshot-subscription.service supports dotted service names`, async () => {
+      const receiver = await createWebhookReceiver()
+      const subscriptionId = `snapshot-dotted-service-${Date.now()}`
+      const subscriptionUrl = `${yjsServer!.url}/v1/yjs/my.svc/__ds/subscriptions/${subscriptionId}`
+      const request = {
+        type: `webhook`,
+        events: [`snapshot.available`],
+        document_pattern: `**`,
+        webhook: { url: receiver.url },
+      }
+
+      try {
+        const response = await fetch(subscriptionUrl, {
+          method: `PUT`,
+          headers: { "content-type": `application/json` },
+          body: JSON.stringify(request),
+        })
+        expect(response.status).toBe(201)
+
+        const encodedServiceResponse = await fetch(
+          `${yjsServer!.url}/v1/yjs/my%2Esvc/__ds/subscriptions/encoded-service`,
+          {
+            method: `PUT`,
+            headers: { "content-type": `application/json` },
+            body: JSON.stringify(request),
+          }
+        )
+        expect(encodedServiceResponse.status).toBe(400)
+      } finally {
+        await fetch(subscriptionUrl, { method: `DELETE` })
+        await receiver.close()
+      }
+    })
+
+    it(`snapshot-subscription.proxy preserves configured headers and reports outages`, async () => {
+      let authorization: string | undefined
+      let transferEncoding: string | undefined
+      const upstream = createHttpServer((req, res) => {
+        authorization = req.headers.authorization
+        transferEncoding = req.headers[`transfer-encoding`]
+        req.resume()
+        res.writeHead(201, { "content-type": `application/json` })
+        res.end(
+          JSON.stringify({
+            id: `delivery-id`,
+            subscription_id: `delivery-id`,
+            type: `webhook`,
+            pattern: `malformed-upstream-pattern`,
+            webhook: { url: `http://127.0.0.1:1/webhook` },
+          })
+        )
+      })
+      await new Promise<void>((resolve, reject) => {
+        upstream.on(`error`, reject)
+        upstream.listen(0, `127.0.0.1`, resolve)
+      })
+      const address = upstream.address()
+      if (!address || typeof address === `string`) {
+        throw new Error(`Failed to start fake Durable Streams server`)
+      }
+
+      const facade = new YjsServer({
+        port: 0,
+        dsServerUrl: `http://127.0.0.1:${address.port}`,
+        dsServerHeaders: { authorization: `Bearer configured` },
+      })
+      await facade.start()
+      const subscriptionUrl = `${facade.url}/v1/yjs/test/__ds/subscriptions/proxy-test`
+
+      try {
+        const requestBody = JSON.stringify({
+          type: `webhook`,
+          events: [`snapshot.available`],
+          document_pattern: `**`,
+          webhook: { url: `http://127.0.0.1:1/webhook` },
+        })
+        const created = await new Promise<{
+          status: number
+          body: Record<string, unknown>
+        }>((resolve, reject) => {
+          const request = createHttpRequest(
+            subscriptionUrl,
+            {
+              method: `PUT`,
+              headers: {
+                authorization: `Bearer caller`,
+                "content-type": `application/json`,
+              },
+            },
+            (response) => {
+              const chunks: Array<Buffer> = []
+              response.on(`data`, (chunk: Buffer) => chunks.push(chunk))
+              response.on(`end`, () => {
+                try {
+                  resolve({
+                    status: response.statusCode ?? 0,
+                    body: JSON.parse(
+                      Buffer.concat(chunks).toString(`utf8`)
+                    ) as Record<string, unknown>,
+                  })
+                } catch (error) {
+                  reject(error)
+                }
+              })
+            }
+          )
+          request.on(`error`, reject)
+          const splitAt = Math.floor(requestBody.length / 2)
+          request.write(requestBody.slice(0, splitAt))
+          request.end(requestBody.slice(splitAt))
+        })
+
+        expect(created.status).toBe(201)
+        expect(authorization).toBe(`Bearer configured`)
+        expect(transferEncoding).toBeUndefined()
+        expect(created.body).not.toHaveProperty(`document_pattern`)
+
+        upstream.closeAllConnections()
+        await new Promise<void>((resolve) => upstream.close(() => resolve()))
+
+        const unavailable = await fetch(subscriptionUrl)
+        expect(unavailable.status).toBe(502)
+        expect(await unavailable.json()).toEqual({
+          error: {
+            code: `PROXY_ERROR`,
+            message: `Failed to reach Durable Streams server`,
+          },
+        })
+      } finally {
+        await facade.stop()
+        if (upstream.listening) {
+          upstream.closeAllConnections()
+          await new Promise<void>((resolve) => upstream.close(() => resolve()))
+        }
+      }
+    })
+  })
+
+  describe(`Awareness registry`, () => {
+    it(`does not collide with a dot-prefixed awareness name`, async () => {
+      const docId = `aw-registry-name-${Date.now()}`
+      await createDocument(baseUrl, docId)
+
+      const first = await fetch(`${baseUrl}/docs/${docId}?awareness=presence`, {
+        method: `PUT`,
+      })
+      expect(first.status).toBe(201)
+
+      const named = await fetch(
+        `${baseUrl}/docs/${docId}?awareness=.registry`,
+        {
+          method: `PUT`,
+        }
+      )
+      expect(named.status).toBe(201)
+
+      const posted = await fetch(
+        `${baseUrl}/docs/${docId}?awareness=.registry`,
+        {
+          method: `POST`,
+          headers: { "content-type": `application/octet-stream` },
+          body: new Uint8Array([1, 2, 3]),
+        }
+      )
+      expect(posted.status).toBe(204)
+    })
+  })
+
+  describe(`Snapshot Discovery`, () => {
+    describe(`snapshot.discovery-new-doc`, () => {
+      it(`should redirect to offset=-1 for new document`, async () => {
+        const docId = `discovery-new-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        const response = await fetch(
+          `${baseUrl}/docs/${docId}?offset=snapshot`,
+          {
+            method: `GET`,
+            redirect: `manual`,
+          }
+        )
+
+        expect(response.status).toBe(307)
+        const location = response.headers.get(`location`)
+        expect(location).toContain(`offset=-1`)
+      })
+    })
+
+    describe(`snapshot.discovery-cached`, () => {
+      it(`should include Cache-Control header`, async () => {
+        const docId = `discovery-cached-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        const response = await fetch(
+          `${baseUrl}/docs/${docId}?offset=snapshot`,
+          {
+            method: `GET`,
+            redirect: `manual`,
+          }
+        )
+
+        expect(response.status).toBe(307)
+        const cacheControl = response.headers.get(`cache-control`)
+        expect(cacheControl).toBe(`private, max-age=5`)
+      })
+    })
+
+    describe(`snapshot.discovery-requires-put`, () => {
+      it(`should return 404 for non-existent document`, async () => {
+        const docId = `discovery-no-put-${Date.now()}`
+
+        const response = await fetch(
+          `${baseUrl}/docs/${docId}?offset=snapshot`,
+          {
+            method: `GET`,
+            redirect: `manual`,
+          }
+        )
+
+        expect(response.status).toBe(404)
+        const body = await response.json()
+        expect(body.error.code).toBe(`DOCUMENT_NOT_FOUND`)
+      })
+    })
+
+    describe(`snapshot.not-found`, () => {
+      it(`should return 404 with SNAPSHOT_NOT_FOUND for invalid snapshot offset`, async () => {
+        const docId = `snapshot-notfound-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        const response = await fetch(
+          `${baseUrl}/docs/${docId}?offset=9999999999999999_9999999999999999_snapshot`,
+          { method: `GET` }
+        )
+
+        expect(response.status).toBe(404)
+        const body = await response.json()
+        expect(body.error).toBeDefined()
+        expect(body.error.code).toBe(`SNAPSHOT_NOT_FOUND`)
+      })
+    })
+  })
+
+  describe(`Document Operations`, () => {
+    let providers: Array<YjsProvider> = []
+
+    afterEach(() => {
+      for (const provider of providers) {
+        provider.destroy()
+      }
+      providers = []
+    })
+
+    async function createProviderWithDoc(
+      docId: string,
+      options?: {
+        doc?: Y.Doc
+        awareness?: Awareness
+        connect?: boolean
+      }
+    ): Promise<YjsProvider> {
+      const doc = options?.doc ?? new Y.Doc()
+
+      const provider = new YjsProvider({
+        doc,
+        baseUrl,
+        docId,
+        awareness: options?.awareness,
+        connect: options?.connect,
+      })
+
+      providers.push(provider)
+      return provider
+    }
+
+    describe(`write.requires-put`, () => {
+      it(`should sync document after PUT`, async () => {
+        const docId = `create-on-write-${Date.now()}`
+        const doc = new Y.Doc()
+        const provider = await createProviderWithDoc(docId, { doc })
+
+        await waitForSync(provider)
+
+        // Make a change
+        const text = doc.getText(`content`)
+        text.insert(0, `Hello World`)
+
+        await waitForCondition(() => provider.synced, {
+          label: `provider synced after write`,
+        })
+        expect(provider.synced).toBe(true)
+      })
+
+      it(`should return 404 on POST without prior PUT`, async () => {
+        const docId = `no-put-post-${Date.now()}`
+
+        const response = await fetch(`${baseUrl}/docs/${docId}`, {
+          method: `POST`,
+          headers: { "content-type": `application/octet-stream` },
+          body: new Uint8Array([1, 2, 3]),
+        })
+
+        expect(response.status).toBe(404)
+      })
+    })
+
+    describe(`updates.read-from-offset`, () => {
+      it(`should sync document between two providers`, async () => {
+        const docId = `sync-${Date.now()}`
+
+        // Provider 1 creates content
+        const doc1 = new Y.Doc()
+        const provider1 = await createProviderWithDoc(docId, { doc: doc1 })
+        await waitForSync(provider1)
+
+        const text1 = doc1.getText(`content`)
+        text1.insert(0, `Hello from doc1`)
+
+        await waitForCondition(() => provider1.synced, {
+          label: `provider1 synced after update`,
+        })
+
+        // Provider 2 joins and should receive the content (doc already exists)
+        const doc2 = new Y.Doc()
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+        })
+        await waitForSync(provider2)
+
+        const text2 = doc2.getText(`content`)
+        expect(text2.toString()).toBe(`Hello from doc1`)
+      })
+    })
+
+    describe(`updates.live-polling`, () => {
+      it(`should receive live updates via long-poll`, async () => {
+        const docId = `live-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const doc2 = new Y.Doc()
+
+        const provider1 = await createProviderWithDoc(docId, { doc: doc1 })
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+        })
+
+        await waitForSync(provider1)
+        await waitForSync(provider2)
+
+        const text1 = doc1.getText(`content`)
+        doc2.getText(`content`) // Ensure text type exists
+
+        // Make changes in doc1
+        text1.insert(0, `First`)
+
+        await waitForDocText(doc2, `content`, `First`)
+
+        // Make more changes
+        text1.insert(5, ` Second`)
+        await waitForDocText(doc2, `content`, `First Second`)
+      })
+    })
+
+    describe(`doc.path-with-slashes`, () => {
+      it(`should support document paths with forward slashes`, async () => {
+        const docId = `project-${Date.now()}/chapter-1/section-a`
+
+        const doc1 = new Y.Doc()
+        const provider1 = await createProviderWithDoc(docId, { doc: doc1 })
+        await waitForSync(provider1)
+
+        const text = doc1.getText(`content`)
+        text.insert(0, `Nested path works`)
+
+        await waitForCondition(() => provider1.synced, {
+          label: `provider synced after update`,
+        })
+
+        // Second provider should also sync
+        const doc2 = new Y.Doc()
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+        })
+        await waitForSync(provider2)
+
+        expect(doc2.getText(`content`).toString()).toBe(`Nested path works`)
+      })
+    })
+
+    describe(`Concurrent edits`, () => {
+      it(`should handle concurrent edits with CRDT convergence`, async () => {
+        const docId = `concurrent-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const doc2 = new Y.Doc()
+
+        const provider1 = await createProviderWithDoc(docId, { doc: doc1 })
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+        })
+
+        await waitForSync(provider1)
+        await waitForSync(provider2)
+
+        // Ensure both start empty
+        expect(doc1.getText(`content`).toString()).toBe(``)
+        expect(doc2.getText(`content`).toString()).toBe(``)
+
+        // Make concurrent edits
+        doc1.getText(`content`).insert(0, `AAA`)
+        doc2.getText(`content`).insert(0, `BBB`)
+
+        await waitForCondition(
+          () => {
+            const content1 = doc1.getText(`content`).toString()
+            const content2 = doc2.getText(`content`).toString()
+            return (
+              content1 === content2 &&
+              content1.includes(`AAA`) &&
+              content1.includes(`BBB`)
+            )
+          },
+          { label: `concurrent edits converge` }
+        )
+
+        // Both should converge to the same state (CRDT property)
+        const content1 = doc1.getText(`content`).toString()
+        const content2 = doc2.getText(`content`).toString()
+
+        expect(content1).toBe(content2)
+        expect(content1).toContain(`AAA`)
+        expect(content1).toContain(`BBB`)
+      })
+    })
+
+    describe(`write.rapid-batched-updates`, () => {
+      it(`should handle rapid writes that trigger batching`, async () => {
+        // This test validates that lib0 framing on the client works correctly
+        // when the IdempotentProducer batches multiple append() calls into
+        // a single HTTP request (concatenating the bytes).
+        const docId = `rapid-writes-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const provider1 = await createProviderWithDoc(docId, { doc: doc1 })
+        await waitForSync(provider1)
+
+        const text = doc1.getText(`content`)
+
+        // Simulate rapid typing - insert many characters without awaiting
+        // This will trigger batching in the IdempotentProducer
+        const chars = `The quick brown fox jumps over the lazy dog. `.repeat(5)
+        for (let i = 0; i < chars.length; i++) {
+          text.insert(i, chars[i]!)
+        }
+
+        // Wait for producer to flush all batches
+        await provider1.flush()
+
+        // Give time for updates to be stored and echoed back
+        await new Promise((r) => setTimeout(r, 500))
+
+        // Verify local document has all content
+        expect(text.toString()).toBe(chars)
+
+        // Now verify a second client can read all the batched updates correctly
+        const doc2 = new Y.Doc()
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+        })
+        await waitForSync(provider2)
+
+        // Second client should have identical content
+        await waitForCondition(
+          () => doc2.getText(`content`).toString() === chars,
+          { label: `second client syncs all batched updates` }
+        )
+
+        expect(doc2.getText(`content`).toString()).toBe(chars)
+      })
+
+      it(`should handle multiple rapid bursts`, async () => {
+        const docId = `rapid-bursts-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const provider1 = await createProviderWithDoc(docId, { doc: doc1 })
+        await waitForSync(provider1)
+
+        const text = doc1.getText(`content`)
+
+        // Burst 1: rapid inserts
+        for (let i = 0; i < 50; i++) {
+          text.insert(text.length, `A`)
+        }
+
+        // Small pause to let some batches complete
+        await new Promise((r) => setTimeout(r, 20))
+
+        // Burst 2: more rapid inserts
+        for (let i = 0; i < 50; i++) {
+          text.insert(text.length, `B`)
+        }
+
+        // Flush and wait
+        await provider1.flush()
+        await new Promise((r) => setTimeout(r, 300))
+
+        const expected = `A`.repeat(50) + `B`.repeat(50)
+        expect(text.toString()).toBe(expected)
+
+        // Verify second client gets correct content
+        const doc2 = new Y.Doc()
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+        })
+        await waitForSync(provider2)
+
+        await waitForCondition(
+          () => doc2.getText(`content`).toString() === expected,
+          { label: `second client syncs burst updates` }
+        )
+
+        expect(doc2.getText(`content`).toString()).toBe(expected)
+      })
+    })
+
+    describe(`Y.Map and Y.Array support`, () => {
+      it(`should sync Y.Map`, async () => {
+        const docId = `map-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const provider1 = await createProviderWithDoc(docId, { doc: doc1 })
+        await waitForSync(provider1)
+
+        const map1 = doc1.getMap(`settings`)
+
+        // Set both properties in a single transaction
+        doc1.transact(() => {
+          map1.set(`theme`, `dark`)
+          map1.set(`fontSize`, 14)
+        })
+
+        // Wait for the update to be synced
+        await waitForCondition(() => provider1.synced, {
+          label: `provider1 synced after map updates`,
+        })
+
+        // Give a bit of time for the write to propagate
+        await new Promise((r) => setTimeout(r, 200))
+
+        const doc2 = new Y.Doc()
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+        })
+        await waitForSync(provider2)
+
+        const map2 = doc2.getMap(`settings`)
+        expect(map2.get(`theme`)).toBe(`dark`)
+        expect(map2.get(`fontSize`)).toBe(14)
+      })
+
+      it(`should sync Y.Array`, async () => {
+        const docId = `array-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const provider1 = await createProviderWithDoc(docId, { doc: doc1 })
+        await waitForSync(provider1)
+
+        const array1 = doc1.getArray(`items`)
+        array1.push([`item1`, `item2`, `item3`])
+
+        await waitForCondition(() => provider1.synced, {
+          label: `provider1 synced after array updates`,
+        })
+
+        const doc2 = new Y.Doc()
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+        })
+        await waitForSync(provider2)
+
+        const array2 = doc2.getArray(`items`)
+        expect(array2.toArray()).toEqual([`item1`, `item2`, `item3`])
+      })
+    })
+  })
+
+  describe(`Presence`, () => {
+    let providers: Array<YjsProvider> = []
+
+    afterEach(() => {
+      for (const provider of providers) {
+        provider.destroy()
+      }
+      providers = []
+    })
+
+    async function createProviderWithDoc(
+      docId: string,
+      options?: {
+        doc?: Y.Doc
+        awareness?: Awareness
+      }
+    ): Promise<YjsProvider> {
+      const doc = options?.doc ?? new Y.Doc()
+      const awareness = options?.awareness ?? new Awareness(doc)
+
+      const provider = new YjsProvider({
+        doc,
+        baseUrl,
+        docId,
+        awareness,
+      })
+
+      providers.push(provider)
+      return provider
+    }
+
+    describe(`presence.broadcast`, () => {
+      it(`should sync awareness between providers`, async () => {
+        const docId = `awareness-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const awareness1 = new Awareness(doc1)
+        const provider1 = await createProviderWithDoc(docId, {
+          doc: doc1,
+          awareness: awareness1,
+        })
+        await waitForSync(provider1)
+
+        const doc2 = new Y.Doc()
+        const awareness2 = new Awareness(doc2)
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+          awareness: awareness2,
+        })
+        await waitForSync(provider2)
+
+        await ensureAwarenessDelivery(
+          awareness2,
+          awareness1,
+          {
+            key: `user`,
+            value: { name: `Bob`, color: `#00aa00` },
+          },
+          (state) =>
+            (state as { user?: { name?: string } } | undefined)?.user?.name ===
+            `Bob`,
+          `provider1 sees provider2 awareness`
+        )
+
+        await ensureAwarenessDelivery(
+          awareness1,
+          awareness2,
+          {
+            key: `user`,
+            value: { name: `Alice`, color: `#ff0000` },
+          },
+          (state) =>
+            (state as { user?: { name?: string } } | undefined)?.user?.name ===
+            `Alice`,
+          `provider2 sees provider1 awareness`
+        )
+
+        const client1State = awareness2.getStates().get(awareness1.clientID)
+
+        expect(client1State).toBeDefined()
+        expect(client1State?.user).toEqual({
+          name: `Alice`,
+          color: `#ff0000`,
+        })
+      })
+    })
+
+    describe(`presence.created-with-doc`, () => {
+      it(`should sync awareness when document created via PUT`, async () => {
+        const docId = `awareness-implicit-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const awareness1 = new Awareness(doc1)
+        const provider1 = await createProviderWithDoc(docId, {
+          doc: doc1,
+          awareness: awareness1,
+        })
+        await waitForSync(provider1)
+
+        const doc2 = new Y.Doc()
+        const awareness2 = new Awareness(doc2)
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+          awareness: awareness2,
+        })
+        await waitForSync(provider2)
+
+        await ensureAwarenessDelivery(
+          awareness1,
+          awareness2,
+          { key: `user`, value: { name: `Implicit` } },
+          (state) =>
+            (state as { user?: { name?: string } } | undefined)?.user?.name ===
+            `Implicit`,
+          `provider2 sees provider1 awareness without PUT`
+        )
+      })
+    })
+
+    describe(`presence.rapid-updates`, () => {
+      it(`should deliver multiple rapid awareness updates correctly`, async () => {
+        const docId = `awareness-rapid-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const awareness1 = new Awareness(doc1)
+        const provider1 = await createProviderWithDoc(docId, {
+          doc: doc1,
+          awareness: awareness1,
+        })
+        await waitForSync(provider1)
+
+        const doc2 = new Y.Doc()
+        const awareness2 = new Awareness(doc2)
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+          awareness: awareness2,
+        })
+        await waitForSync(provider2)
+
+        // Send multiple rapid updates to exercise lib0 framing under batching
+        for (let i = 0; i < 5; i++) {
+          awareness1.setLocalStateField(`cursor`, { x: i * 10, y: i * 20 })
+        }
+
+        // The final state should arrive at provider2
+        await waitForAwarenessState(
+          awareness2,
+          awareness1.clientID,
+          (state) =>
+            (state as { cursor?: { x?: number } } | undefined)?.cursor?.x ===
+            40,
+          `provider2 sees final rapid awareness update`
+        )
+
+        const finalState = awareness2.getStates().get(awareness1.clientID) as {
+          cursor: { x: number; y: number }
+        }
+        expect(finalState.cursor).toEqual({ x: 40, y: 80 })
+      })
+    })
+
+    describe(`presence.cleanup`, () => {
+      it(`should remove awareness state after disconnect`, async () => {
+        const docId = `awareness-cleanup-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const awareness1 = new Awareness(doc1)
+        const provider1 = await createProviderWithDoc(docId, {
+          doc: doc1,
+          awareness: awareness1,
+        })
+        await waitForSync(provider1)
+
+        const doc2 = new Y.Doc()
+        const awareness2 = new Awareness(doc2)
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+          awareness: awareness2,
+        })
+        await waitForSync(provider2)
+
+        await ensureAwarenessDelivery(
+          awareness1,
+          awareness2,
+          { key: `user`, value: { name: `Alice` } },
+          (state) => Boolean((state as { user?: object } | undefined)?.user),
+          `provider2 sees provider1 awareness`
+        )
+
+        // Store client ID before destroy
+        const client1Id = awareness1.clientID
+
+        // Remove from tracked providers first to prevent auto-cleanup
+        const idx = providers.indexOf(provider1)
+        if (idx > -1) providers.splice(idx, 1)
+
+        provider1.destroy()
+
+        // Awareness uses a 30-second timeout by default. The removal notification
+        // should be sent immediately on disconnect, but we might need to wait
+        // for it to propagate.
+        await waitForAwarenessState(
+          awareness2,
+          client1Id,
+          (state) => state === undefined,
+          `provider2 observes provider1 removal`
+        )
+      }, 10000)
+    })
+  })
+
+  describe(`Awareness Stream Management`, () => {
+    describe(`awareness.put-creates-stream`, () => {
+      it(`should create awareness stream via PUT and POST to it`, async () => {
+        const docId = `aw-put-create-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        // PUT to create a custom awareness stream
+        const putResponse = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=cursors`,
+          { method: `PUT` }
+        )
+        expect(putResponse.status).toBe(201)
+        await putResponse.arrayBuffer()
+
+        // POST to the new awareness stream should succeed
+        const postResponse = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=cursors`,
+          {
+            method: `POST`,
+            headers: { "content-type": `application/octet-stream` },
+            body: new Uint8Array([1, 2, 3]),
+          }
+        )
+        expect(postResponse.status).toBe(204)
+      })
+    })
+
+    describe(`awareness.put-idempotent`, () => {
+      it(`should return 201 on first PUT and 200 on subsequent PUT`, async () => {
+        const docId = `aw-put-idempotent-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        const firstPut = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=presence`,
+          { method: `PUT` }
+        )
+        expect(firstPut.status).toBe(201)
+        await firstPut.arrayBuffer()
+
+        const secondPut = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=presence`,
+          { method: `PUT` }
+        )
+        expect(secondPut.status).toBe(200)
+        await secondPut.arrayBuffer()
+      })
+    })
+
+    describe(`awareness.put-requires-document`, () => {
+      it(`should return 404 when PUTting awareness for non-existent document`, async () => {
+        const docId = `aw-put-no-doc-${Date.now()}`
+
+        const response = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=default`,
+          { method: `PUT` }
+        )
+        expect(response.status).toBe(404)
+        const body = await response.json()
+        expect(body.error.code).toBe(`DOCUMENT_NOT_FOUND`)
+      })
+    })
+
+    describe(`awareness.post-auto-creates`, () => {
+      it(`should auto-create awareness stream on POST if it does not exist`, async () => {
+        const docId = `aw-autocreate-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        // POST directly without prior PUT — should auto-create and succeed
+        const postResponse = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=ephemeral`,
+          {
+            method: `POST`,
+            headers: { "content-type": `application/octet-stream` },
+            body: new Uint8Array([1, 2, 3]),
+          }
+        )
+        expect(postResponse.status).toBe(204)
+      })
+
+      it(`should recover from TTL expiry by re-creating stream on POST`, async () => {
+        const docId = `aw-ttl-recover-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        // Create awareness stream via PUT
+        const putResponse = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=cursors`,
+          { method: `PUT` }
+        )
+        expect(putResponse.status).toBe(201)
+        await putResponse.arrayBuffer()
+
+        // POST should work
+        const post1 = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=cursors`,
+          {
+            method: `POST`,
+            headers: { "content-type": `application/octet-stream` },
+            body: new Uint8Array([1, 2, 3]),
+          }
+        )
+        expect(post1.status).toBe(204)
+
+        // Simulate TTL expiry by deleting the stream directly at DS level
+        const dsPath = `/v1/stream/yjs/test/docs/${docId}/.awareness/cursors`
+        const deleteResponse = await fetch(`${dsServer!.url}${dsPath}`, {
+          method: `DELETE`,
+        })
+        expect(deleteResponse.ok).toBe(true)
+
+        // POST again — should auto-create and succeed
+        const post2 = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=cursors`,
+          {
+            method: `POST`,
+            headers: { "content-type": `application/octet-stream` },
+            body: new Uint8Array([4, 5, 6]),
+          }
+        )
+        expect(post2.status).toBe(204)
+      })
+
+      it(`should handle concurrent POSTs to non-existent stream`, async () => {
+        const docId = `aw-concurrent-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        // Fire two concurrent POSTs without prior PUT
+        const [res1, res2] = await Promise.all([
+          fetch(`${baseUrl}/docs/${docId}?awareness=concurrent`, {
+            method: `POST`,
+            headers: { "content-type": `application/octet-stream` },
+            body: new Uint8Array([1, 2, 3]),
+          }),
+          fetch(`${baseUrl}/docs/${docId}?awareness=concurrent`, {
+            method: `POST`,
+            headers: { "content-type": `application/octet-stream` },
+            body: new Uint8Array([4, 5, 6]),
+          }),
+        ])
+
+        // Both should succeed
+        expect(res1.status).toBe(204)
+        expect(res2.status).toBe(204)
+      })
+    })
+
+    describe(`awareness.named-streams-separate`, () => {
+      it(`should keep named awareness streams separate`, async () => {
+        const docId = `aw-multi-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        // Create two custom awareness streams
+        const put1 = await fetch(`${baseUrl}/docs/${docId}?awareness=cursors`, {
+          method: `PUT`,
+        })
+        expect(put1.status).toBe(201)
+        await put1.arrayBuffer()
+
+        const put2 = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=presence`,
+          { method: `PUT` }
+        )
+        expect(put2.status).toBe(201)
+        await put2.arrayBuffer()
+
+        // POST to cursors
+        const postCursors = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=cursors`,
+          {
+            method: `POST`,
+            headers: { "content-type": `application/octet-stream` },
+            body: new Uint8Array([10, 20, 30]),
+          }
+        )
+        expect(postCursors.status).toBe(204)
+
+        // POST to presence
+        const postPresence = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=presence`,
+          {
+            method: `POST`,
+            headers: { "content-type": `application/octet-stream` },
+            body: new Uint8Array([40, 50, 60]),
+          }
+        )
+        expect(postPresence.status).toBe(204)
+
+        // Read cursors stream — should only have its data
+        const cursorsPath = `/v1/stream/yjs/test/docs/${docId}/.awareness/cursors`
+        const cursorsResponse = await fetch(
+          `${dsServer!.url}${cursorsPath}?offset=-1`
+        )
+        expect(cursorsResponse.status).toBe(200)
+        const cursorsData = new Uint8Array(await cursorsResponse.arrayBuffer())
+
+        // Read presence stream — should only have its data
+        const presencePath = `/v1/stream/yjs/test/docs/${docId}/.awareness/presence`
+        const presenceResponse = await fetch(
+          `${dsServer!.url}${presencePath}?offset=-1`
+        )
+        expect(presenceResponse.status).toBe(200)
+        const presenceData = new Uint8Array(
+          await presenceResponse.arrayBuffer()
+        )
+
+        // Verify they contain different data
+        expect(cursorsData).not.toEqual(presenceData)
+      })
+    })
+  })
+
+  describe(`Document Deletion`, () => {
+    describe(`delete.doc-returns-204`, () => {
+      it(`should delete an existing document and return 204`, async () => {
+        const docId = `del-doc-204-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        const response = await fetch(`${baseUrl}/docs/${docId}`, {
+          method: `DELETE`,
+        })
+        expect(response.status).toBe(204)
+      })
+    })
+
+    describe(`delete.doc-returns-404`, () => {
+      it(`should return 404 when deleting non-existent document`, async () => {
+        const docId = `del-doc-404-${Date.now()}`
+        const response = await fetch(`${baseUrl}/docs/${docId}`, {
+          method: `DELETE`,
+        })
+        expect(response.status).toBe(404)
+        const body = await response.json()
+        expect(body.error.code).toBe(`DOCUMENT_NOT_FOUND`)
+      })
+    })
+
+    describe(`delete.doc-then-get-returns-404`, () => {
+      it(`should return 404 on GET after document deletion`, async () => {
+        const docId = `del-doc-get-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        await fetch(`${baseUrl}/docs/${docId}`, { method: `DELETE` })
+
+        const getResponse = await fetch(`${baseUrl}/docs/${docId}?offset=-1`)
+        expect(getResponse.status).toBe(404)
+      })
+    })
+
+    describe(`delete.doc-then-post-returns-404`, () => {
+      it(`should return 404 on POST after document deletion`, async () => {
+        const docId = `del-doc-post-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        await fetch(`${baseUrl}/docs/${docId}`, { method: `DELETE` })
+
+        const postResponse = await fetch(`${baseUrl}/docs/${docId}`, {
+          method: `POST`,
+          headers: { "content-type": `application/octet-stream` },
+          body: new Uint8Array([1, 2, 3]),
+        })
+        expect(postResponse.status).toBe(404)
+      })
+    })
+
+    describe(`delete.doc-then-put-creates-fresh`, () => {
+      it(`should create a fresh document after deletion`, async () => {
+        const docId = `del-doc-recreate-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        await fetch(`${baseUrl}/docs/${docId}`, { method: `DELETE` })
+
+        const putResponse = await fetch(`${baseUrl}/docs/${docId}`, {
+          method: `PUT`,
+        })
+        expect(putResponse.status).toBe(201)
+      })
+    })
+
+    describe(`delete.awareness-returns-204`, () => {
+      it(`should delete an existing awareness stream and return 204`, async () => {
+        const docId = `del-aw-204-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        // Create a named awareness stream
+        const putRes = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=cursors`,
+          { method: `PUT` }
+        )
+        expect(putRes.status).toBe(201)
+        await putRes.arrayBuffer()
+
+        const deleteRes = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=cursors`,
+          { method: `DELETE` }
+        )
+        expect(deleteRes.status).toBe(204)
+      })
+    })
+
+    describe(`delete.awareness-returns-404`, () => {
+      it(`should return 404 when deleting non-existent awareness stream`, async () => {
+        const docId = `del-aw-404-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        const response = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=nonexistent`,
+          { method: `DELETE` }
+        )
+        expect(response.status).toBe(404)
+        const body = await response.json()
+        expect(body.error.code).toBe(`STREAM_NOT_FOUND`)
+      })
+    })
+
+    describe(`delete.awareness-preserves-document`, () => {
+      it(`should not affect the parent document when deleting awareness`, async () => {
+        const docId = `del-aw-preserve-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        // Delete default awareness
+        const deleteRes = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=default`,
+          { method: `DELETE` }
+        )
+        expect(deleteRes.status).toBe(204)
+
+        // Document should still be accessible
+        const headRes = await fetch(`${baseUrl}/docs/${docId}`, {
+          method: `HEAD`,
+        })
+        expect(headRes.status).toBe(200)
+      })
+    })
+
+    describe(`delete.awareness-post-requires-document`, () => {
+      it(`should return 404 on awareness POST after document deletion`, async () => {
+        const docId = `del-aw-post-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        // Delete the document
+        await fetch(`${baseUrl}/docs/${docId}`, { method: `DELETE` })
+
+        // POST to awareness — should NOT auto-create on deleted document
+        const postRes = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=default`,
+          {
+            method: `POST`,
+            headers: { "content-type": `application/octet-stream` },
+            body: new Uint8Array([1, 2, 3]),
+          }
+        )
+        expect(postRes.status).toBe(404)
+        const body = await postRes.json()
+        expect(body.error.code).toBe(`DOCUMENT_NOT_FOUND`)
+      })
+    })
+
+    describe(`delete.doc-then-head-returns-404`, () => {
+      it(`should return 404 on HEAD after document deletion`, async () => {
+        const docId = `del-doc-head-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        await fetch(`${baseUrl}/docs/${docId}`, { method: `DELETE` })
+
+        const headRes = await fetch(`${baseUrl}/docs/${docId}`, {
+          method: `HEAD`,
+        })
+        expect(headRes.status).toBe(404)
+      })
+    })
+
+    describe(`delete.doc-double-delete-returns-404`, () => {
+      it(`should return 404 on second DELETE`, async () => {
+        const docId = `del-doc-double-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        const first = await fetch(`${baseUrl}/docs/${docId}`, {
+          method: `DELETE`,
+        })
+        expect(first.status).toBe(204)
+
+        const second = await fetch(`${baseUrl}/docs/${docId}`, {
+          method: `DELETE`,
+        })
+        expect(second.status).toBe(404)
+        const body = await second.json()
+        expect(body.error.code).toBe(`DOCUMENT_NOT_FOUND`)
+      })
+    })
+
+    describe(`delete.doc-then-snapshot-discovery-returns-404`, () => {
+      it(`should return 404 on snapshot discovery after deletion`, async () => {
+        const docId = `del-doc-snap-disc-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        await fetch(`${baseUrl}/docs/${docId}`, { method: `DELETE` })
+
+        const res = await fetch(`${baseUrl}/docs/${docId}?offset=snapshot`, {
+          redirect: `manual`,
+        })
+        expect(res.status).toBe(404)
+      })
+    })
+
+    describe(`delete.awareness-put-after-doc-delete-returns-404`, () => {
+      it(`should return 404 when creating awareness on deleted document`, async () => {
+        const docId = `del-aw-put-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        await fetch(`${baseUrl}/docs/${docId}`, { method: `DELETE` })
+
+        const putRes = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=cursors`,
+          { method: `PUT` }
+        )
+        expect(putRes.status).toBe(404)
+        const body = await putRes.json()
+        expect(body.error.code).toBe(`DOCUMENT_NOT_FOUND`)
+      })
+    })
+
+    describe(`delete.doc-cascades-awareness`, () => {
+      it(`should delete awareness streams when document is deleted`, async () => {
+        const docId = `del-cascade-aw-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        // Verify default awareness stream exists
+        const headBefore = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=default`,
+          { method: `HEAD` }
+        )
+        expect(headBefore.status).toBe(200)
+
+        // Delete document
+        const deleteRes = await fetch(`${baseUrl}/docs/${docId}`, {
+          method: `DELETE`,
+        })
+        expect(deleteRes.status).toBe(204)
+
+        // Awareness operations should return 404
+        const headAfter = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=default`,
+          { method: `HEAD` }
+        )
+        expect(headAfter.status).toBe(404)
+      })
+    })
+
+    describe(`delete.doc-cascades-named-awareness`, () => {
+      it(`should delete named awareness streams when document is deleted`, async () => {
+        const docId = `del-cascade-named-aw-${Date.now()}`
+        await createDocument(baseUrl, docId)
+
+        // Create named awareness streams
+        const put1 = await fetch(`${baseUrl}/docs/${docId}?awareness=cursors`, {
+          method: `PUT`,
+        })
+        expect(put1.status).toBe(201)
+        await put1.arrayBuffer()
+
+        const put2 = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=presence`,
+          { method: `PUT` }
+        )
+        expect(put2.status).toBe(201)
+        await put2.arrayBuffer()
+
+        // Verify they exist
+        const head1 = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=cursors`,
+          { method: `HEAD` }
+        )
+        expect(head1.status).toBe(200)
+
+        // Delete document
+        const deleteRes = await fetch(`${baseUrl}/docs/${docId}`, {
+          method: `DELETE`,
+        })
+        expect(deleteRes.status).toBe(204)
+
+        // Named awareness streams should be gone
+        const headAfter1 = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=cursors`,
+          { method: `HEAD` }
+        )
+        expect(headAfter1.status).toBe(404)
+
+        const headAfter2 = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=presence`,
+          { method: `HEAD` }
+        )
+        expect(headAfter2.status).toBe(404)
+      })
+    })
+
+    describe.skipIf(!!externalServerUrl)(
+      `delete.doc-cascades-legacy-awareness-index`,
+      () => {
+        it(`should clean up awareness streams recorded by an earlier server version`, async () => {
+          const docId = `del-cascade-legacy-aw-${Date.now()}`
+          const awarenessName = `legacy-presence`
+          await createDocument(baseUrl, docId)
+
+          const awarenessPath = YjsStreamPaths.awarenessStream(
+            `test`,
+            docId,
+            awarenessName
+          )
+          const createAwareness = await fetch(
+            `${dsServer!.url}${awarenessPath}`,
+            {
+              method: `PUT`,
+              headers: { "content-type": `application/octet-stream` },
+            }
+          )
+          expect(createAwareness.status).toBe(201)
+
+          const legacyIndexPath = YjsStreamPaths.awarenessIndexStream(
+            `test`,
+            docId
+          )
+          await yjsServer!.appendToIndexStream(legacyIndexPath, {
+            name: awarenessName,
+            createdAt: Date.now(),
+          })
+
+          const deleteDocument = await fetch(`${baseUrl}/docs/${docId}`, {
+            method: `DELETE`,
+          })
+          expect(deleteDocument.status).toBe(204)
+
+          const awarenessAfter = await fetch(
+            `${dsServer!.url}${awarenessPath}`,
+            { method: `HEAD` }
+          )
+          expect(awarenessAfter.status).toBe(404)
+
+          const legacyIndexAfter = await fetch(
+            `${dsServer!.url}${legacyIndexPath}`,
+            { method: `HEAD` }
+          )
+          expect(legacyIndexAfter.status).toBe(404)
+        })
+      }
+    )
+
+    describe(`delete.doc-cascades-snapshots`, () => {
+      let providers: Array<YjsProvider> = []
+
+      afterEach(() => {
+        for (const provider of providers) {
+          provider.destroy()
+        }
+        providers = []
+      })
+
+      async function createProviderWithDoc(
+        docId: string
+      ): Promise<YjsProvider> {
+        const doc = new Y.Doc()
+        const provider = new YjsProvider({
+          doc,
+          baseUrl,
+          docId,
+        })
+        providers.push(provider)
+        return provider
+      }
+
+      it(`should delete snapshot streams when document is deleted`, async () => {
+        const docId = `del-cascade-snap-${Date.now()}`
+        const provider = await createProviderWithDoc(docId)
+        await waitForSync(provider)
+
+        // Write enough data to trigger compaction (threshold is 1500 bytes)
+        const text = provider.doc.getText(`test`)
+        for (let i = 0; i < 10; i++) {
+          text.insert(0, `x`.repeat(200))
+        }
+        await provider.flush()
+
+        // Wait for snapshot to be created
+        await waitForSnapshot(baseUrl, docId)
+
+        // Get snapshot offset from discovery
+        const discoveryRes = await fetch(
+          `${baseUrl}/docs/${docId}?offset=snapshot`,
+          { redirect: `manual` }
+        )
+        expect(discoveryRes.status).toBe(307)
+        const location = discoveryRes.headers.get(`location`)!
+        expect(location).toContain(`_snapshot`)
+
+        // Build full snapshot URL (location may be relative)
+        const snapshotUrl = location.startsWith(`http`)
+          ? location
+          : `${baseUrl}/docs/${docId}?offset=${new URL(location, `http://localhost`).searchParams.get(`offset`)}`
+
+        // Verify snapshot exists
+        const snapshotRes = await fetch(snapshotUrl)
+        expect(snapshotRes.status).toBe(200)
+        await snapshotRes.arrayBuffer()
+
+        provider.destroy()
+        providers = providers.filter((p) => p !== provider)
+
+        // Delete document
+        const deleteRes = await fetch(`${baseUrl}/docs/${docId}`, {
+          method: `DELETE`,
+        })
+        expect(deleteRes.status).toBe(204)
+
+        // Snapshot should be gone — document no longer exists so all offsets return 404
+        const snapshotAfter = await fetch(snapshotUrl)
+        expect(snapshotAfter.status).toBe(404)
+      })
+    })
+  })
+
+  describe(`Compaction`, () => {
+    let providers: Array<YjsProvider> = []
+
+    afterEach(() => {
+      for (const provider of providers) {
+        provider.destroy()
+      }
+      providers = []
+    })
+
+    async function createProviderWithDoc(
+      docId: string,
+      options?: {
+        doc?: Y.Doc
+      }
+    ): Promise<YjsProvider> {
+      const doc = options?.doc ?? new Y.Doc()
+
+      const provider = new YjsProvider({
+        doc,
+        baseUrl,
+        docId,
+      })
+
+      providers.push(provider)
+      return provider
+    }
+
+    describe(`compaction.client-transparent`, () => {
+      it(`should sync correctly through compaction`, async () => {
+        const docId = `compaction-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const provider1 = await createProviderWithDoc(docId, { doc: doc1 })
+        await waitForSync(provider1)
+
+        const text = doc1.getText(`content`)
+
+        // Write enough data to trigger compaction (threshold is ~1.5KB)
+        await appendWithSync(provider1, text, `X`.repeat(200), 10)
+
+        // Wait for snapshot to exist
+        await waitForSnapshot(baseUrl, docId)
+
+        // Second provider should be able to sync even if compaction happened
+        const doc2 = new Y.Doc()
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+        })
+        await waitForSync(provider2)
+
+        const text2 = doc2.getText(`content`)
+        expect(text2.toString()).toBe(text.toString())
+        expect(text2.toString().length).toBe(2000) // 10 * 200 chars
+      })
+    })
+
+    describe(`compaction.post-update`, () => {
+      it(`should include updates written after compaction`, async () => {
+        const docId = `compaction-post-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const provider1 = await createProviderWithDoc(docId, { doc: doc1 })
+        await waitForSync(provider1)
+
+        const text = doc1.getText(`content`)
+        await appendWithSync(provider1, text, `X`.repeat(200), 10)
+
+        await waitForSnapshot(baseUrl, docId)
+
+        text.insert(text.length, `POST`)
+        await waitForCondition(() => provider1.synced, {
+          label: `provider1 synced after post-compaction update`,
+        })
+
+        const expected = text.toString()
+
+        const doc2 = new Y.Doc()
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+        })
+        await waitForSync(provider2)
+
+        await waitForDocText(doc2, `content`, expected)
+      })
+    })
+
+    describe(`compaction.live-streaming`, () => {
+      it(`should continue streaming during compaction`, async () => {
+        const docId = `compaction-live-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const doc2 = new Y.Doc()
+
+        const provider1 = await createProviderWithDoc(docId, { doc: doc1 })
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+        })
+
+        await waitForSync(provider1)
+        await waitForSync(provider2)
+
+        const text = doc1.getText(`content`)
+        await appendWithSync(provider1, text, `X`.repeat(200), 10)
+
+        await waitForSnapshot(baseUrl, docId)
+
+        text.insert(text.length, `AFTER`)
+        await waitForCondition(() => provider1.synced, {
+          label: `provider1 synced after live update`,
+        })
+
+        await waitForDocText(doc2, `content`, text.toString())
+        expect(provider2.connected).toBe(true)
+      })
+    })
+
+    describe(`compaction.snapshot-discovery`, () => {
+      it(`should redirect to snapshot after compaction`, async () => {
+        const docId = `compaction-discovery-${Date.now()}`
+
+        const doc = new Y.Doc()
+        const provider = await createProviderWithDoc(docId, { doc })
+        await waitForSync(provider)
+
+        const text = doc.getText(`content`)
+        await appendWithSync(provider, text, `X`.repeat(200), 10)
+
+        // Wait for snapshot
+        const snapshotKey = await waitForSnapshot(baseUrl, docId)
+        expect(snapshotKey).toMatch(/_snapshot$/)
+
+        // Verify the redirect
+        const response = await fetch(
+          `${baseUrl}/docs/${docId}?offset=snapshot`,
+          {
+            method: `GET`,
+            redirect: `manual`,
+          }
+        )
+
+        expect(response.status).toBe(307)
+        const location = response.headers.get(`location`)
+        expect(location).toContain(`_snapshot`)
+      })
+    })
+
+    describe(`compaction.concurrent-writes`, () => {
+      it(`should avoid concurrent compactions and keep updates`, async () => {
+        const docId = `compaction-concurrent-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const provider1 = await createProviderWithDoc(docId, { doc: doc1 })
+        await waitForSync(provider1)
+
+        const compactor = (yjsServer as unknown as { compactor: unknown })
+          .compactor as {
+          performCompaction: (...args: Array<unknown>) => Promise<unknown>
+        }
+
+        const original = compactor.performCompaction.bind(compactor)
+        let allowCompaction!: () => void
+        let compactionStarted!: () => void
+
+        const started = new Promise<void>((resolve) => {
+          compactionStarted = resolve
+        })
+        const allow = new Promise<void>((resolve) => {
+          allowCompaction = resolve
+        })
+
+        const spy = vi
+          .spyOn(compactor, `performCompaction`)
+          .mockImplementation(async (...args: Array<unknown>) => {
+            compactionStarted()
+            await allow
+            return original(...args)
+          })
+
+        try {
+          const text = doc1.getText(`content`)
+          await appendWithSync(provider1, text, `X`.repeat(300), 6)
+
+          await started
+
+          await appendWithSync(provider1, text, `Y`.repeat(50), 3)
+
+          allowCompaction()
+          await waitForSnapshot(baseUrl, docId)
+
+          expect(spy).toHaveBeenCalledTimes(1)
+
+          const doc2 = new Y.Doc()
+          const provider2 = await createProviderWithDoc(docId, {
+            doc: doc2,
+          })
+          await waitForSync(provider2)
+
+          await waitForDocText(doc2, `content`, text.toString())
+        } finally {
+          allowCompaction()
+          spy.mockRestore()
+        }
+      })
+    })
+
+    describe(`compaction.stream-next-offset`, () => {
+      it(`should return correct stream-next-offset header on snapshot read`, async () => {
+        const docId = `snapshot-offset-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const provider1 = await createProviderWithDoc(docId, { doc: doc1 })
+        await waitForSync(provider1)
+
+        const text = doc1.getText(`content`)
+        await appendWithSync(provider1, text, `X`.repeat(200), 10)
+
+        const snapshotKey = await waitForSnapshot(baseUrl, docId)
+
+        // Read the snapshot directly and check the header
+        const response = await fetch(
+          `${baseUrl}/docs/${docId}?offset=${encodeURIComponent(snapshotKey)}`,
+          { method: `GET` }
+        )
+
+        expect(response.status).toBe(200)
+        const nextOffset = response.headers.get(`stream-next-offset`)
+        expect(nextOffset).toBeTruthy()
+
+        // The next offset should be one past the snapshot offset (without _snapshot suffix)
+        // e.g. snapshot at 0000000000000000_0000000000001555 → next offset 0000000000000000_0000000000001556
+        const snapshotOffset = snapshotKey.replace(/_snapshot$/, ``)
+        const parts = snapshotOffset.split(`_`)
+        const expectedSeq = (parseInt(parts[1]!, 10) + 1)
+          .toString()
+          .padStart(parts[1]!.length, `0`)
+        const expectedOffset = `${parts[0]}_${expectedSeq}`
+        expect(nextOffset).toBe(expectedOffset)
+
+        // Verify we can read updates from that offset without error
+        const updatesResponse = await fetch(
+          `${baseUrl}/docs/${docId}?offset=${encodeURIComponent(nextOffset!)}`,
+          { method: `GET` }
+        )
+        // Should succeed (200 with data or 204 if caught up)
+        expect([200, 204]).toContain(updatesResponse.status)
+      })
+    })
+
+    describe(`compaction.stale-client-resume`, () => {
+      it(`should sync correctly when client resumes from pre-snapshot offset`, async () => {
+        const docId = `stale-resume-${Date.now()}`
+
+        // Provider 1 writes data and triggers compaction
+        const doc1 = new Y.Doc()
+        const provider1 = await createProviderWithDoc(docId, { doc: doc1 })
+        await waitForSync(provider1)
+
+        const text1 = doc1.getText(`content`)
+
+        // Write some initial data
+        text1.insert(0, `BEFORE`)
+        await waitForCondition(() => provider1.synced, {
+          label: `provider1 synced after initial write`,
+        })
+
+        // Provider 2 joins and syncs (gets an offset before compaction)
+        const doc2 = new Y.Doc()
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+        })
+        await waitForSync(provider2)
+        expect(doc2.getText(`content`).toString()).toBe(`BEFORE`)
+
+        // Disconnect provider 2 (simulating going offline)
+        provider2.disconnect()
+
+        // Write enough data to trigger compaction while provider2 is offline
+        await appendWithSync(provider1, text1, `X`.repeat(200), 10)
+        await waitForSnapshot(baseUrl, docId)
+
+        // Write more data after compaction
+        text1.insert(text1.length, `AFTER`)
+        await waitForCondition(() => provider1.synced, {
+          label: `provider1 synced after post-compaction write`,
+        })
+
+        const expected = text1.toString()
+
+        // Reconnect provider 2 - it will resume and should get all data
+        await provider2.connect()
+        await waitForSync(provider2)
+
+        await waitForDocText(doc2, `content`, expected)
+      })
+    })
+
+    describe(`compaction.snapshot-404-retry`, () => {
+      it(`should handle deleted snapshot by retrying discovery`, async () => {
+        const docId = `snapshot-404-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const provider1 = await createProviderWithDoc(docId, { doc: doc1 })
+        await waitForSync(provider1)
+
+        const text = doc1.getText(`content`)
+        await appendWithSync(provider1, text, `X`.repeat(200), 10)
+
+        const firstSnapshotKey = await waitForSnapshot(baseUrl, docId)
+
+        // Verify the snapshot exists
+        const checkResponse = await fetch(
+          `${baseUrl}/docs/${docId}?offset=${encodeURIComponent(firstSnapshotKey)}`,
+          { method: `GET` }
+        )
+        expect(checkResponse.status).toBe(200)
+        // consume the body
+        await checkResponse.arrayBuffer()
+
+        // Trigger another compaction so the first snapshot gets deleted
+        await appendWithSync(provider1, text, `Y`.repeat(200), 10)
+        const secondSnapshotKey = await waitForSnapshot(baseUrl, docId)
+
+        // Wait for old snapshot to be deleted (async cleanup)
+        await waitForCondition(
+          async () => {
+            const r = await fetch(
+              `${baseUrl}/docs/${docId}?offset=${encodeURIComponent(firstSnapshotKey)}`,
+              { method: `GET` }
+            )
+            await r.arrayBuffer()
+            return r.status === 404
+          },
+          { label: `old snapshot deleted`, timeoutMs: 5000 }
+        )
+
+        // A new client using the old (deleted) snapshot offset should handle the 404
+        // and fall back to the current snapshot
+        const doc2 = new Y.Doc()
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+        })
+        await waitForSync(provider2)
+
+        expect(doc2.getText(`content`).toString()).toBe(text.toString())
+        expect(secondSnapshotKey).not.toBe(firstSnapshotKey)
+      })
+    })
+
+    describe(`compaction.multiple-cycles`, () => {
+      it(`should discover latest snapshot after multiple compactions`, async () => {
+        const docId = `multi-compact-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const provider1 = await createProviderWithDoc(docId, { doc: doc1 })
+        await waitForSync(provider1)
+
+        const text = doc1.getText(`content`)
+
+        // First compaction
+        await appendWithSync(provider1, text, `A`.repeat(200), 10)
+        const snapshot1 = await waitForSnapshot(baseUrl, docId)
+
+        // Second compaction
+        await appendWithSync(provider1, text, `B`.repeat(200), 10)
+
+        // Wait for a new snapshot (different from snapshot1)
+        await waitForCondition(
+          async () => {
+            const r = await fetch(`${baseUrl}/docs/${docId}?offset=snapshot`, {
+              method: `GET`,
+              redirect: `manual`,
+            })
+            if (r.status === 307) {
+              const loc = r.headers.get(`location`)
+              if (loc) {
+                const match = loc.match(/offset=([^&]+_snapshot)/)
+                return match != null && match[1] !== snapshot1
+              }
+            }
+            return false
+          },
+          { label: `second snapshot different from first` }
+        )
+
+        // Third compaction
+        await appendWithSync(provider1, text, `C`.repeat(200), 10)
+
+        // Wait for yet another snapshot
+        const snapshot3 = await waitForSnapshot(baseUrl, docId)
+
+        // Snapshot should be different from the first
+        expect(snapshot3).not.toBe(snapshot1)
+
+        // A new client should sync the full document state
+        const doc2 = new Y.Doc()
+        const provider2 = await createProviderWithDoc(docId, {
+          doc: doc2,
+        })
+        await waitForSync(provider2)
+
+        expect(doc2.getText(`content`).toString()).toBe(text.toString())
+        // 10 * 200 * 3 = 6000 chars of A/B/C
+        expect(doc2.getText(`content`).toString().length).toBe(6000)
+      })
+    })
+
+    describe(`compaction.read-from-pre-snapshot-offset`, () => {
+      it(`should return updates when reading from offset before snapshot`, async () => {
+        const docId = `pre-snapshot-read-${Date.now()}`
+
+        const doc1 = new Y.Doc()
+        const provider1 = await createProviderWithDoc(docId, { doc: doc1 })
+        await waitForSync(provider1)
+
+        const text = doc1.getText(`content`)
+
+        // Write initial data and capture the offset
+        text.insert(0, `INITIAL`)
+        await provider1.flush()
+        await waitForCondition(() => provider1.synced, {
+          label: `synced after initial write`,
+        })
+
+        // Read from beginning to get the current offset
+        const initialResponse = await fetch(
+          `${baseUrl}/docs/${docId}?offset=-1`,
+          { method: `GET` }
+        )
+        expect(initialResponse.status).toBe(200)
+        const earlyOffset =
+          initialResponse.headers.get(`stream-next-offset`) ??
+          initialResponse.headers.get(`stream-cursor`)
+        await initialResponse.arrayBuffer()
+
+        // Now write enough to trigger compaction
+        await appendWithSync(provider1, text, `X`.repeat(200), 10)
+        await waitForSnapshot(baseUrl, docId)
+
+        // Read updates from the early offset (before the snapshot)
+        // The underlying DS stream should still have all data
+        const updatesResponse = await fetch(
+          `${baseUrl}/docs/${docId}?offset=${encodeURIComponent(earlyOffset ?? `-1`)}`,
+          { method: `GET` }
+        )
+
+        // Should succeed - updates are never deleted by compaction
+        expect(updatesResponse.status).toBe(200)
+        const body = await updatesResponse.arrayBuffer()
+        expect(body.byteLength).toBeGreaterThan(0)
+      })
+    })
+  })
+
+  // Server restart test requires local servers - skip when using external URL
+  describe.skipIf(!!externalServerUrl)(`Server Restart`, () => {
+    it(
+      `should preserve document state across restarts`,
+      { timeout: 30000 },
+      async () => {
+        const docId = `restart-${Date.now()}`
+        const service = `restart`
+
+        const serverA = new YjsServer({
+          port: 0,
+          dsServerUrl: dsServer!.url,
+          compactionThreshold: 1500,
+        })
+        await serverA.start()
+
+        const baseUrlA = `${serverA.url}/v1/yjs/${service}`
+
+        const doc = new Y.Doc()
+        const provider = new YjsProvider({
+          doc,
+          baseUrl: baseUrlA,
+          docId,
+        })
+
+        try {
+          await waitForSync(provider)
+
+          const text = doc.getText(`content`)
+          await appendWithSync(provider, text, `R`.repeat(200), 10)
+
+          await waitForSnapshot(baseUrlA, docId)
+        } finally {
+          provider.destroy()
+          await serverA.stop()
+        }
+
+        const serverB = new YjsServer({
+          port: 0,
+          dsServerUrl: dsServer!.url,
+          compactionThreshold: 1500,
+        })
+        await serverB.start()
+
+        const baseUrlB = `${serverB.url}/v1/yjs/${service}`
+
+        try {
+          const doc2 = new Y.Doc()
+          const provider2 = new YjsProvider({
+            doc: doc2,
+            baseUrl: baseUrlB,
+            docId,
+          })
+          await waitForSync(provider2)
+
+          // Should have synced the content
+          expect(doc2.getText(`content`).toString().length).toBe(2000)
+
+          provider2.destroy()
+        } finally {
+          await serverB.stop()
+        }
+      }
+    )
+  })
+
+  describe(`Error Handling`, () => {
+    let providers: Array<YjsProvider> = []
+
+    afterEach(() => {
+      for (const provider of providers) {
+        provider.destroy()
+      }
+      providers = []
+    })
+
+    describe(`error.event-emission`, () => {
+      it(`should emit error event on connection failure`, async () => {
+        const doc = new Y.Doc()
+        const errors: Array<Error> = []
+
+        const provider = new YjsProvider({
+          doc,
+          baseUrl: `http://localhost:1`, // Invalid port - connection refused
+          docId: `error-test-${Date.now()}`,
+          connect: false,
+        })
+        providers.push(provider)
+
+        provider.on(`error`, (err) => {
+          errors.push(err)
+        })
+
+        // Connect will fail because the server doesn't exist
+        await provider.connect()
+
+        await waitForCondition(() => errors.length > 0, {
+          label: `error event emitted`,
+        })
+
+        expect(errors.length).toBeGreaterThan(0)
+        expect(errors[0]).toBeInstanceOf(Error)
+      })
+    })
+
+    describe(`error.disconnect-during-sync`, () => {
+      it(`should handle disconnect during initial sync`, async () => {
+        const docId = `disconnect-sync-${Date.now()}`
+        const doc = new Y.Doc()
+
+        const provider = new YjsProvider({
+          doc,
+          baseUrl,
+          docId,
+          connect: false,
+        })
+        providers.push(provider)
+
+        // Start connecting but disconnect immediately
+        const connectPromise = provider.connect()
+        provider.disconnect()
+
+        // Should not throw
+        await connectPromise
+
+        expect(provider.connected).toBe(false)
+      })
+
+      it(`should handle disconnect while polling`, async () => {
+        const docId = `disconnect-poll-${Date.now()}`
+        const doc = new Y.Doc()
+
+        const provider = new YjsProvider({
+          doc,
+          baseUrl,
+          docId,
+        })
+        providers.push(provider)
+
+        await waitForSync(provider)
+        expect(provider.connected).toBe(true)
+
+        // Disconnect while polling is active
+        provider.disconnect()
+
+        expect(provider.connected).toBe(false)
+        expect(provider.synced).toBe(false)
+      })
+    })
+
+    describe(`error.reconnect-after-error`, () => {
+      it(`should be able to reconnect after disconnect`, async () => {
+        const docId = `reconnect-error-${Date.now()}`
+        const doc = new Y.Doc()
+
+        const provider = new YjsProvider({
+          doc,
+          baseUrl,
+          docId,
+        })
+        providers.push(provider)
+
+        await waitForSync(provider)
+
+        // Make some changes
+        doc.getText(`content`).insert(0, `Before disconnect`)
+        await waitForCondition(() => provider.synced, {
+          label: `provider synced before disconnect`,
+        })
+
+        // Disconnect
+        provider.disconnect()
+        expect(provider.connected).toBe(false)
+
+        // Reconnect
+        await provider.connect()
+        await waitForSync(provider)
+
+        expect(provider.connected).toBe(true)
+        expect(doc.getText(`content`).toString()).toBe(`Before disconnect`)
+      })
+    })
+
+    describe(`error.connect-disconnect-cycle`, () => {
+      it(`should handle connect/disconnect cycle`, async () => {
+        const docId = `reconnect-${Date.now()}`
+        const doc = new Y.Doc()
+
+        const provider = new YjsProvider({
+          doc,
+          baseUrl,
+          docId,
+          connect: false,
+        })
+        providers.push(provider)
+
+        expect(provider.connected).toBe(false)
+
+        await provider.connect()
+        await waitForSync(provider)
+
+        expect(provider.connected).toBe(true)
+
+        provider.disconnect()
+        expect(provider.connected).toBe(false)
+
+        await provider.connect()
+        await waitForSync(provider)
+
+        expect(provider.connected).toBe(true)
+      })
+    })
+  })
+
+  describe(`Method Validation`, () => {
+    // Document URLs accept: GET, HEAD, POST, PUT, DELETE
+    const unsupportedDocMethods = [`PATCH`]
+    for (const method of unsupportedDocMethods) {
+      it(`should reject ${method} on document URL with 405`, async () => {
+        const docId = `method-doc-${method.toLowerCase()}-${Date.now()}`
+        const response = await fetch(`${baseUrl}/docs/${docId}`, { method })
+        expect(response.status).toBe(405)
+        const body = await response.json()
+        expect(body.error.code).toBe(`INVALID_REQUEST`)
+      })
+    }
+
+    // Awareness URLs accept: GET, HEAD, POST, PUT, DELETE
+    const unsupportedAwarenessMethods = [`PATCH`]
+    for (const method of unsupportedAwarenessMethods) {
+      it(`should reject ${method} on awareness URL with 405`, async () => {
+        const docId = `method-aw-${method.toLowerCase()}-${Date.now()}`
+        const response = await fetch(
+          `${baseUrl}/docs/${docId}?awareness=default`,
+          { method }
+        )
+        expect(response.status).toBe(405)
+        const body = await response.json()
+        expect(body.error.code).toBe(`INVALID_REQUEST`)
+      })
+    }
+  })
+
+  describe(`Path Validation`, () => {
+    describe(`error.invalid-doc-path`, () => {
+      // Note: Browser/fetch normalizes paths like foo/../bar before sending,
+      // so server-side validation can only catch URL-encoded path traversal.
+      it(`should reject URL-encoded paths with .. segments`, async () => {
+        // Use %2F for / to prevent normalization, and encode the full path
+        const response = await fetch(
+          `${baseUrl}/docs/foo%2F..%2Fbar?offset=snapshot`,
+          {
+            method: `GET`,
+            redirect: `manual`,
+          }
+        )
+
+        expect(response.status).toBe(400)
+      })
+
+      it(`should reject URL-encoded paths with . segments`, async () => {
+        const response = await fetch(
+          `${baseUrl}/docs/foo%2F.%2Fbar?offset=snapshot`,
+          {
+            method: `GET`,
+            redirect: `manual`,
+          }
+        )
+
+        expect(response.status).toBe(400)
+      })
+    })
+  })
+})

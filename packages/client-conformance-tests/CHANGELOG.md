@@ -1,0 +1,233 @@
+# @durable-streams/client-conformance-tests
+
+## 0.2.12
+
+### Patch Changes
+
+- Updated dependencies [[`a4d31bc`](https://github.com/durable-streams/durable-streams/commit/a4d31bcca01794aa81a5e482b7401670077cc78e)]:
+  - @durable-streams/server@0.3.8
+  - @durable-streams/client@0.2.6
+
+## 0.2.11
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @durable-streams/server@0.3.7
+  - @durable-streams/client@0.2.6
+
+## 0.2.10
+
+### Patch Changes
+
+- Escape Unicode line separator characters in the JSONL adapter protocol so Node 24 readline does not split conformance test commands mid-payload. ([#378](https://github.com/durable-streams/durable-streams/pull/378))
+
+- Updated dependencies [[`f380bca`](https://github.com/durable-streams/durable-streams/commit/f380bcafe11d0291d63e6ff96041d13cbf0cf976)]:
+  - @durable-streams/server@0.3.6
+  - @durable-streams/client@0.2.6
+
+## 0.2.9
+
+### Patch Changes
+
+- Updated dependencies [[`f9aff7d`](https://github.com/durable-streams/durable-streams/commit/f9aff7d3e1350deb208cb569e2c489842331167d), [`92c0821`](https://github.com/durable-streams/durable-streams/commit/92c082152f7be8327f0c055d8b224494e5e71f76)]:
+  - @durable-streams/server@0.3.5
+  - @durable-streams/client@0.2.6
+
+## 0.2.8
+
+### Patch Changes
+
+- Updated dependencies [[`6afab5f`](https://github.com/durable-streams/durable-streams/commit/6afab5f8258999ff1794749ad9d0d9bd0c823625)]:
+  - @durable-streams/client@0.2.5
+  - @durable-streams/server@0.3.4
+
+## 0.2.7
+
+### Patch Changes
+
+- Updated dependencies [[`5f02156`](https://github.com/durable-streams/durable-streams/commit/5f02156bf5317037591eb087bf757c8c14a84a27), [`5f02156`](https://github.com/durable-streams/durable-streams/commit/5f02156bf5317037591eb087bf757c8c14a84a27), [`df5d78b`](https://github.com/durable-streams/durable-streams/commit/df5d78badf02be74e7e5e47789da4219bba0252f)]:
+  - @durable-streams/server@0.3.3
+  - @durable-streams/client@0.2.4
+
+## 0.2.6
+
+### Patch Changes
+
+- Implement fetch-then-live pattern: initial requests omit the `live` query parameter so catch-up responses are cacheable by CDNs and browsers. Live mode (long-poll or SSE) activates only after the client reaches up-to-date. ([#354](https://github.com/durable-streams/durable-streams/pull/354))
+
+  For SSE mode, a dedicated `startSSE` path opens a persistent connection only after HTTP catch-up completes, replacing the previous single-connection approach.
+
+- Updated dependencies [[`a3ed371`](https://github.com/durable-streams/durable-streams/commit/a3ed371a56b28ec6abc00ecdd149e2e030710cf6), [`33cb090`](https://github.com/durable-streams/durable-streams/commit/33cb09076b5eeb278e671a7afc9963bffd940872), [`bcc757e`](https://github.com/durable-streams/durable-streams/commit/bcc757eca91a22436f7d32859f471a7abe774310), [`346bc42`](https://github.com/durable-streams/durable-streams/commit/346bc426f5e13705cdd5e0cc5f7a759c7735a888)]:
+  - @durable-streams/client@0.2.4
+  - @durable-streams/server@0.3.2
+
+## 0.2.5
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @durable-streams/server@0.3.1
+  - @durable-streams/client@0.2.3
+
+## 0.2.4
+
+### Patch Changes
+
+- Updated dependencies [[`ebf3f23`](https://github.com/durable-streams/durable-streams/commit/ebf3f23c0e9c9cd56eebd514a1a53a51b94e9628), [`86f9698`](https://github.com/durable-streams/durable-streams/commit/86f96986fd0cbb80eb98befd70e7d104a5ccfdad)]:
+  - @durable-streams/server@0.3.0
+  - @durable-streams/client@0.2.3
+
+## 0.2.3
+
+### Patch Changes
+
+- Updated dependencies [[`5f50195`](https://github.com/durable-streams/durable-streams/commit/5f501950e7f9e3ffcd3c077b4ba90ce405d9f066)]:
+  - @durable-streams/client@0.2.3
+  - @durable-streams/server@0.2.3
+
+## 0.2.2
+
+### Patch Changes
+
+- Updated dependencies [[`6d50b29`](https://github.com/durable-streams/durable-streams/commit/6d50b29b544a48cca161232d881a06b44cdebcb8), [`054de99`](https://github.com/durable-streams/durable-streams/commit/054de99b0a3b97009a55e94d6f829ef38b520d41), [`054de99`](https://github.com/durable-streams/durable-streams/commit/054de99b0a3b97009a55e94d6f829ef38b520d41)]:
+  - @durable-streams/client@0.2.2
+  - @durable-streams/server@0.2.2
+
+## 0.2.1
+
+### Patch Changes
+
+- added support for base64 encoding over sse ([#223](https://github.com/durable-streams/durable-streams/pull/223))
+
+- Updated dependencies [[`5ceafb8`](https://github.com/durable-streams/durable-streams/commit/5ceafb896944e869f943f121dc9701c1aee4cb78), [`334a4fc`](https://github.com/durable-streams/durable-streams/commit/334a4fc80fc1483cebf9c0a02959f14875519a13), [`82a566a`](https://github.com/durable-streams/durable-streams/commit/82a566ace620b1b8d0d43cdf181356e6a6f6f4aa)]:
+  - @durable-streams/client@0.2.1
+  - @durable-streams/server@0.2.1
+
+## 0.2.0
+
+### Minor Changes
+
+- Bump all packages to version 0.2.0 ([#206](https://github.com/durable-streams/durable-streams/pull/206))
+
+### Patch Changes
+
+- Updated dependencies [[`2a0f163`](https://github.com/durable-streams/durable-streams/commit/2a0f1639f7d84f4f1b611f46c8a3bbbc0cca41f3)]:
+  - @durable-streams/server@0.2.0
+  - @durable-streams/client@0.2.0
+
+## 0.1.9
+
+### Patch Changes
+
+- Updated dependencies [[`447e102`](https://github.com/durable-streams/durable-streams/commit/447e10235a1732ec24e1d906487d6b2750a16063), [`095944a`](https://github.com/durable-streams/durable-streams/commit/095944a5fefdef0cbc87eef532c871cdd46ee7d8), [`e47081e`](https://github.com/durable-streams/durable-streams/commit/e47081e553e1e98466bca25faf929ac346816e6b)]:
+  - @durable-streams/client@0.2.0
+  - @durable-streams/server@0.1.7
+
+## 0.1.8
+
+### Patch Changes
+
+- Updated dependencies [[`a5ce923`](https://github.com/durable-streams/durable-streams/commit/a5ce923bf849bdde47a651be8200b560053f4997)]:
+  - @durable-streams/client@0.1.5
+  - @durable-streams/server@0.1.6
+
+## 0.1.7
+
+### Patch Changes
+
+- Add Kafka-style idempotent producers for exactly-once write semantics. ([#140](https://github.com/durable-streams/durable-streams/pull/140))
+
+  **Server:**
+  - Producer state tracking with `Producer-Id`, `Producer-Epoch`, `Producer-Seq` headers
+  - Duplicate detection returns 204 (idempotent success)
+  - Zombie fencing via epoch validation (403 on stale epoch)
+  - Sequence gap detection (409 with expected/received seq)
+  - Per-producer serialization for concurrent request handling
+
+  **Client:**
+  - New `IdempotentProducer` class with batching and pipelining
+  - Fire-and-forget API with automatic deduplication
+  - Configurable `maxBatchBytes`, `lingerMs`, `maxInFlight`
+  - Auto-claim flow for ephemeral producers
+  - `StaleEpochError` and `SequenceGapError` for error handling
+
+  **Protocol:**
+  - New section 5.2.1 documenting idempotent producer semantics
+
+- Updated dependencies [[`67b5a4d`](https://github.com/durable-streams/durable-streams/commit/67b5a4dcaae69dbe651dc6ede3cac72d3390567f)]:
+  - @durable-streams/server@0.1.5
+  - @durable-streams/client@0.1.4
+
+## 0.1.6
+
+### Patch Changes
+
+- Add advanced fault injection and conformance tests ([#119](https://github.com/durable-streams/durable-streams/pull/119))
+
+  Server fault injection improvements:
+  - Extended fault injection with new capabilities: delayMs, dropConnection, truncateBodyBytes, probability, method filtering, corruptBody, and jitterMs
+  - Updated /\_test/inject-error endpoint to accept all new fault parameters
+  - Added body modification support for response truncation and corruption
+
+  New server conformance tests:
+  - Concurrent writer stress tests (seq conflicts, racing writers, mixed readers/writers)
+  - State hash verification tests (replay consistency, deterministic ordering)
+
+  New client conformance tests:
+  - 8 fault injection test cases covering delay recovery, connection drops, method-specific faults, and retry scenarios
+
+- Updated dependencies [[`615ea5f`](https://github.com/durable-streams/durable-streams/commit/615ea5f64002a711598f9ee9f7461484fa8c74c0), [`0252af8`](https://github.com/durable-streams/durable-streams/commit/0252af86362569f875c7866c41b57b1201ecb94c), [`411512c`](https://github.com/durable-streams/durable-streams/commit/411512ce910f31958957bf4fda08b8fb45ce31b9), [`8d06625`](https://github.com/durable-streams/durable-streams/commit/8d06625eba26d79b7c5d317adf89047f6b44c8ce), [`8f500cf`](https://github.com/durable-streams/durable-streams/commit/8f500cf720e59ada83188ed67f244a40c4b04422)]:
+  - @durable-streams/server@0.1.4
+  - @durable-streams/client@0.1.3
+
+## 0.1.5
+
+### Patch Changes
+
+- Add conformance tests for Unicode line separator preservation in SSE parsing. Per the HTML Living Standard, SSE parsers must only split on CRLF, LF, or CR. Other Unicode line separators (U+0085 NEL, U+2028 Line Separator, U+2029 Paragraph Separator) must be preserved as data characters. ([#118](https://github.com/durable-streams/durable-streams/pull/118))
+
+- Updated dependencies []:
+  - @durable-streams/server@0.1.3
+
+## 0.1.4
+
+### Patch Changes
+
+- Fix npx executable discovery for all CLI packages. When running `npx @durable-streams/<package>`, npm now correctly finds the executable. Also fixes vitest binary path resolution in server-conformance-tests for scoped packages installed via npx. ([#103](https://github.com/durable-streams/durable-streams/pull/103))
+
+- Updated dependencies []:
+  - @durable-streams/server@0.1.3
+
+## 0.1.3
+
+### Patch Changes
+
+- Updated dependencies [[`c17d571`](https://github.com/durable-streams/durable-streams/commit/c17d571d8ad5bbc17466cda15bbd3c8979353781)]:
+  - @durable-streams/server@0.1.3
+  - @durable-streams/client@0.1.2
+
+## 0.1.2
+
+### Patch Changes
+
+- Standardize package.json exports across all packages ([`bf9bc19`](https://github.com/durable-streams/durable-streams/commit/bf9bc19ef13eb22b2c0f98a175fad02b221d7860))
+  - Add dual ESM/CJS exports to all packages
+  - Fix export order to have "." first, then "./package.json"
+  - Add proper main/module/types fields
+  - Add sideEffects: false
+  - Remove duplicate fields
+
+- Updated dependencies [[`bf9bc19`](https://github.com/durable-streams/durable-streams/commit/bf9bc19ef13eb22b2c0f98a175fad02b221d7860)]:
+  - @durable-streams/client@0.1.2
+  - @durable-streams/server@0.1.2
+
+## 0.1.1
+
+### Patch Changes
+
+- new version to fix local manual release ([#97](https://github.com/durable-streams/durable-streams/pull/97))
+
+- Updated dependencies [[`1873789`](https://github.com/durable-streams/durable-streams/commit/187378923ed743255ba741252b1617b13cbbab16)]:
+  - @durable-streams/client@0.1.1
+  - @durable-streams/server@0.1.1

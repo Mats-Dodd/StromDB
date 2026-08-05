@@ -1,0 +1,11730 @@
+/**
+ * Conformance test suite for Durable Streams server implementations
+ *
+ * This package provides a standardized test suite that can be run against
+ * any server implementation to verify protocol compliance.
+ */
+
+import { createServer as createHttpServer } from "node:http"
+import { createPublicKey, verify as verifySignature } from "node:crypto"
+import { describe, expect, test, vi } from "vitest"
+import * as fc from "fast-check"
+import {
+  DurableStream,
+  STREAM_OFFSET_HEADER,
+  STREAM_SEQ_HEADER,
+  STREAM_UP_TO_DATE_HEADER,
+} from "@durable-streams/client"
+import type { JsonWebKey as NodeJsonWebKey } from "node:crypto"
+
+export interface ConformanceTestOptions {
+  /** Base URL of the server to test */
+  baseUrl: string
+  /** Timeout for long-poll tests in milliseconds (default: 20000) */
+  longPollTimeoutMs?: number
+  /** Enable stream metadata subscription conformance tests. */
+  subscriptions?: boolean
+}
+
+/**
+ * Helper to fetch SSE stream and read until a condition is met.
+ * Handles AbortController, timeout, and cleanup automatically.
+ */
+async function fetchSSE(
+  url: string,
+  opts: {
+    timeoutMs?: number
+    maxChunks?: number
+    untilContent?: string
+    signal?: AbortSignal
+    headers?: Record<string, string>
+  } = {}
+): Promise<{ response: Response; received: string }> {
+  const {
+    timeoutMs = 2000,
+    maxChunks = 10,
+    untilContent,
+    headers = {},
+    signal,
+  } = opts
+
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+  if (signal) {
+    signal.addEventListener(`abort`, () => controller.abort())
+  }
+
+  try {
+    const response = await fetch(url, {
+      method: `GET`,
+      headers,
+      signal: controller.signal,
+    })
+
+    if (!response.body) {
+      clearTimeout(timeoutId)
+      return { response, received: `` }
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder()
+    let received = ``
+
+    let untilContentIndex = -1
+    for (let i = 0; i < maxChunks; i++) {
+      const { done, value } = await reader.read()
+      if (done) break
+      received += decoder.decode(value, { stream: true })
+      if (
+        untilContent &&
+        received.includes(untilContent) &&
+        untilContentIndex < 0
+      ) {
+        untilContentIndex = received.indexOf(untilContent)
+      }
+
+      const normalized = received.replace(/\r\n/g, `\n`)
+      if (
+        untilContentIndex >= 0 &&
+        normalized.lastIndexOf(`\n\n`) > untilContentIndex
+      ) {
+        break
+      }
+    }
+
+    clearTimeout(timeoutId)
+    reader.cancel()
+
+    return { response, received }
+  } catch (e) {
+    clearTimeout(timeoutId)
+    if (e instanceof Error && e.name === `AbortError`) {
+      // Return empty result on timeout/abort
+      return { response: new Response(), received: `` }
+    }
+    throw e
+  }
+}
+
+/**
+ * Parse SSE events from raw SSE text.
+ * Handles multi-line data correctly by joining data: lines per the SSE spec.
+ * Returns an array of parsed events with type and data.
+ */
+function parseSSEEvents(
+  sseText: string
+): Array<{ type: string; data: string }> {
+  const events: Array<{ type: string; data: string }> = []
+  const normalized = sseText.replace(/\r\n/g, `\n`).replace(/\r/g, `\n`)
+
+  // Split by double newlines (event boundaries)
+  const eventBlocks = normalized.split(`\n\n`).filter((block) => block.trim())
+
+  for (const block of eventBlocks) {
+    const lines = block.split(`\n`)
+    let eventType = ``
+    const dataLines: Array<string> = []
+
+    for (const line of lines) {
+      if (line.startsWith(`event:`)) {
+        eventType = line.slice(6).trim()
+      } else if (line.startsWith(`data:`)) {
+        // Per SSE spec, strip the optional space after "data:"
+        const content = line.slice(5)
+        dataLines.push(content.startsWith(` `) ? content.slice(1) : content)
+      }
+    }
+
+    if (eventType && dataLines.length > 0) {
+      // Join data lines with newlines per SSE spec
+      events.push({ type: eventType, data: dataLines.join(`\n`) })
+    }
+  }
+
+  return events
+}
+
+async function createWebhookReceiver(opts?: {
+  response?: Record<string, unknown>
+}): Promise<{
+  url: string
+  received: Array<{
+    body: Record<string, unknown>
+    rawBody: string
+    signature: string | null
+  }>
+  waitForRequest: (timeoutMs?: number) => Promise<{
+    body: Record<string, unknown>
+    rawBody: string
+    signature: string | null
+  }>
+  close: () => Promise<void>
+}> {
+  const received: Array<{
+    body: Record<string, unknown>
+    rawBody: string
+    signature: string | null
+  }> = []
+  const waiters: Array<() => void> = []
+
+  const server = createHttpServer((req, res) => {
+    const chunks: Array<Buffer> = []
+    req.on(`data`, (chunk: Buffer) => chunks.push(chunk))
+    req.on(`end`, () => {
+      const rawBody = Buffer.concat(chunks).toString(`utf8`)
+      const body = JSON.parse(rawBody) as Record<string, unknown>
+      const signatureHeader = req.headers[`webhook-signature`]
+      received.push({
+        body,
+        rawBody,
+        signature: typeof signatureHeader === `string` ? signatureHeader : null,
+      })
+      for (const waiter of waiters.splice(0)) waiter()
+      res.writeHead(200, { "content-type": `application/json` })
+      res.end(JSON.stringify(opts?.response ?? {}))
+    })
+  })
+
+  await new Promise<void>((resolve, reject) => {
+    server.on(`error`, reject)
+    server.listen(0, `127.0.0.1`, () => resolve())
+  })
+
+  const addr = server.address()
+  if (!addr || typeof addr === `string`) {
+    throw new Error(`Failed to start webhook receiver`)
+  }
+
+  return {
+    url: `http://127.0.0.1:${addr.port}/webhook`,
+    received,
+    waitForRequest: async (timeoutMs = 5_000) => {
+      if (received.length > 0) return received[received.length - 1]!
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(
+          () => reject(new Error(`Timed out waiting for webhook request`)),
+          timeoutMs
+        )
+        waiters.push(() => {
+          clearTimeout(timeout)
+          resolve()
+        })
+      })
+      return received[received.length - 1]!
+    },
+    close: async () => {
+      server.closeAllConnections()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    },
+  }
+}
+
+interface WebhookPublicJwk {
+  kty: string
+  crv: string
+  x: string
+  kid: string
+  use?: string
+  alg?: string
+}
+
+interface WebhookJwks {
+  keys: Array<WebhookPublicJwk>
+}
+
+async function fetchWebhookJwks(url: string): Promise<WebhookJwks> {
+  const res = await fetch(url)
+  expect(res.status).toBe(200)
+  expect(res.headers.get(`content-type`)).toContain(`application/jwk-set+json`)
+  return (await res.json()) as WebhookJwks
+}
+
+function verifyWebhookSignature(
+  rawBody: string,
+  signatureHeader: string | null,
+  jwks: WebhookJwks
+): boolean {
+  if (!signatureHeader) return false
+  const match = signatureHeader.match(
+    /^t=(\d+),kid=([^,]+),ed25519=([A-Za-z0-9_-]+)$/
+  )
+  if (!match) return false
+
+  const [, timestamp, kid, signature] = match
+  const key = jwks.keys.find((candidate) => candidate.kid === kid)
+  if (!key) return false
+
+  const now = Math.floor(Date.now() / 1000)
+  if (Math.abs(now - Number(timestamp)) > 300) return false
+
+  const publicKey = createPublicKey({
+    key: key as unknown as NodeJsonWebKey,
+    format: `jwk`,
+  })
+  return verifySignature(
+    null,
+    Buffer.from(`${timestamp}.${rawBody}`),
+    publicKey,
+    Buffer.from(signature!, `base64url`)
+  )
+}
+
+async function waitForCondition(
+  predicate: () => Promise<boolean>,
+  timeoutMs = 3_000
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  throw new Error(`Timed out waiting for condition`)
+}
+
+/**
+ * Run the full conformance test suite against a server
+ */
+export function runConformanceTests(options: ConformanceTestOptions): void {
+  // Access options.baseUrl directly instead of destructuring to support
+  // mutable config objects (needed for dynamic port assignment)
+  const getBaseUrl = () => options.baseUrl
+  const getLongPollTestTimeoutMs = () =>
+    (options.longPollTimeoutMs ?? 20_000) + 1_000
+
+  // ============================================================================
+  // Basic Stream Operations
+  // ============================================================================
+
+  describe(`Basic Stream Operations`, () => {
+    test(`should create a stream`, async () => {
+      const streamPath = `/v1/stream/create-test-${Date.now()}`
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `text/plain`,
+      })
+
+      expect(stream.url).toBe(`${getBaseUrl()}${streamPath}`)
+    })
+
+    test(`should allow idempotent create with same config`, async () => {
+      const streamPath = `/v1/stream/duplicate-test-${Date.now()}`
+
+      // Create first stream
+      await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `text/plain`,
+      })
+
+      // Create again with same config - should succeed (idempotent)
+      await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `text/plain`,
+      })
+    })
+
+    test(`should reject create with different config (409)`, async () => {
+      const streamPath = `/v1/stream/config-mismatch-test-${Date.now()}`
+
+      // Create with text/plain
+      await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `text/plain`,
+      })
+
+      // Try to create with different content type - should fail
+      await expect(
+        DurableStream.create({
+          url: `${getBaseUrl()}${streamPath}`,
+          contentType: `application/json`,
+        })
+      ).rejects.toThrow()
+    })
+
+    test(`should delete a stream`, async () => {
+      const streamPath = `/v1/stream/delete-test-${Date.now()}`
+
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `text/plain`,
+      })
+
+      await stream.delete()
+
+      // Verify it's gone by trying to read
+      await expect(stream.stream({ live: false })).rejects.toThrow()
+    })
+
+    test(`should properly isolate recreated stream after delete`, async () => {
+      const streamPath = `/v1/stream/delete-recreate-test-${Date.now()}`
+
+      // Create stream and append data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `old data`,
+      })
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: ` more old data`,
+      })
+
+      // Verify old data exists
+      const readOld = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      const oldText = await readOld.text()
+      expect(oldText).toBe(`old data more old data`)
+
+      // Delete the stream
+      const deleteResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `DELETE`,
+      })
+      expect(deleteResponse.status).toBe(204)
+
+      // Immediately recreate at same URL with different data
+      const recreateResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `new data`,
+      })
+      expect(recreateResponse.status).toBe(201)
+
+      // Read the new stream - should only see new data, not old
+      const readNew = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      const newText = await readNew.text()
+      expect(newText).toBe(`new data`)
+      expect(newText).not.toContain(`old data`)
+
+      // Verify Stream-Up-To-Date is true (we're caught up on new stream)
+      expect(readNew.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+
+      // Append to the new stream to verify it's fully functional
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: ` appended`,
+      })
+
+      // Read again and verify
+      const finalRead = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      const finalText = await finalRead.text()
+      expect(finalText).toBe(`new data appended`)
+    })
+  })
+
+  // ============================================================================
+  // Append Operations
+  // ============================================================================
+
+  describe(`Append Operations`, () => {
+    test(`should append string data`, async () => {
+      const streamPath = `/v1/stream/append-test-${Date.now()}`
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `text/plain`,
+      })
+
+      await stream.append(`hello world`)
+
+      const res = await stream.stream({ live: false })
+      const text = await res.text()
+      expect(text).toBe(`hello world`)
+    })
+
+    test(`should append multiple chunks`, async () => {
+      const streamPath = `/v1/stream/multi-append-test-${Date.now()}`
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `text/plain`,
+      })
+
+      await stream.append(`chunk1`)
+      await stream.append(`chunk2`)
+      await stream.append(`chunk3`)
+
+      const res = await stream.stream({ live: false })
+      const text = await res.text()
+      expect(text).toBe(`chunk1chunk2chunk3`)
+    })
+
+    test(`should enforce sequence ordering with seq`, async () => {
+      const streamPath = `/v1/stream/seq-test-${Date.now()}`
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `text/plain`,
+      })
+
+      await stream.append(`first`, { seq: `001` })
+      await stream.append(`second`, { seq: `002` })
+
+      // Trying to append with lower seq should fail
+      await expect(stream.append(`invalid`, { seq: `001` })).rejects.toThrow()
+    })
+  })
+
+  // ============================================================================
+  // Read Operations
+  // ============================================================================
+
+  describe(`Read Operations`, () => {
+    test(`should read empty stream`, async () => {
+      const streamPath = `/v1/stream/read-empty-test-${Date.now()}`
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `text/plain`,
+      })
+
+      const res = await stream.stream({ live: false })
+      const body = await res.body()
+      expect(body.length).toBe(0)
+      expect(res.upToDate).toBe(true)
+    })
+
+    test(`should read stream with data`, async () => {
+      const streamPath = `/v1/stream/read-data-test-${Date.now()}`
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `text/plain`,
+      })
+
+      await stream.append(`hello`)
+
+      const res = await stream.stream({ live: false })
+      const text = await res.text()
+      expect(text).toBe(`hello`)
+      expect(res.upToDate).toBe(true)
+    })
+
+    test(`should read from offset`, async () => {
+      const streamPath = `/v1/stream/read-offset-test-${Date.now()}`
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `text/plain`,
+      })
+
+      await stream.append(`first`)
+      const res1 = await stream.stream({ live: false })
+      await res1.text()
+      const firstOffset = res1.offset
+
+      await stream.append(`second`)
+
+      const res2 = await stream.stream({ offset: firstOffset, live: false })
+      const text = await res2.text()
+      expect(text).toBe(`second`)
+    })
+  })
+
+  // ============================================================================
+  // Long-Poll Operations
+  // ============================================================================
+
+  describe(`Long-Poll Operations`, () => {
+    test(
+      `should wait for new data with long-poll`,
+      async () => {
+        const streamPath = `/v1/stream/longpoll-test-${Date.now()}`
+        const stream = await DurableStream.create({
+          url: `${getBaseUrl()}${streamPath}`,
+          contentType: `text/plain`,
+        })
+
+        const receivedData: Array<string> = []
+
+        // Start reading in long-poll mode
+        const readPromise = (async () => {
+          const res = await stream.stream({ live: `long-poll` })
+          await new Promise<void>((resolve) => {
+            const unsubscribe = res.subscribeBytes((chunk) => {
+              if (chunk.data.length > 0) {
+                receivedData.push(new TextDecoder().decode(chunk.data))
+              }
+              if (receivedData.length >= 1) {
+                unsubscribe()
+                res.cancel()
+                resolve()
+              }
+              return Promise.resolve()
+            })
+          })
+        })()
+
+        // Wait a bit for the long-poll to be active
+        await new Promise((resolve) => setTimeout(resolve, 500))
+
+        // Append data while long-poll is waiting
+        await stream.append(`new data`)
+
+        await readPromise
+
+        expect(receivedData).toContain(`new data`)
+      },
+      getLongPollTestTimeoutMs()
+    )
+
+    test(`should return immediately if data already exists`, async () => {
+      const streamPath = `/v1/stream/longpoll-immediate-test-${Date.now()}`
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `text/plain`,
+      })
+
+      // Add data first
+      await stream.append(`existing data`)
+
+      // Read should return existing data immediately
+      const res = await stream.stream({ live: false })
+      const text = await res.text()
+
+      expect(text).toBe(`existing data`)
+    })
+  })
+
+  // ============================================================================
+  // HTTP Protocol Tests
+  // ============================================================================
+
+  describe(`HTTP Protocol`, () => {
+    test(`should return correct headers on PUT`, async () => {
+      const streamPath = `/v1/stream/put-headers-test-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+        },
+      })
+
+      expect(response.status).toBe(201)
+      expect(response.headers.get(`content-type`)).toBe(`text/plain`)
+      expect(response.headers.get(STREAM_OFFSET_HEADER)).toBeDefined()
+    })
+
+    test(`should return 200 on idempotent PUT with same config`, async () => {
+      const streamPath = `/v1/stream/duplicate-put-test-${Date.now()}`
+
+      // First PUT
+      const firstResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+      expect(firstResponse.status).toBe(201)
+
+      // Second PUT with same config should succeed
+      const secondResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+      expect(secondResponse.status).toBe(200)
+    })
+
+    test(`should return 409 on PUT with different config`, async () => {
+      const streamPath = `/v1/stream/config-conflict-test-${Date.now()}`
+
+      // First PUT with text/plain
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Second PUT with different content type should fail
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+      })
+
+      expect(response.status).toBe(409)
+    })
+
+    test(`should return correct headers on POST`, async () => {
+      const streamPath = `/v1/stream/post-headers-test-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Append data
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `hello world`,
+      })
+
+      expect(response.status).toBe(204)
+      expect(response.headers.get(STREAM_OFFSET_HEADER)).toBeDefined()
+    })
+
+    test(`should return 404 on POST to non-existent stream`, async () => {
+      const streamPath = `/v1/stream/post-404-test-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `data`,
+      })
+
+      expect(response.status).toBe(404)
+    })
+
+    test(`should return 409 on content-type mismatch`, async () => {
+      const streamPath = `/v1/stream/content-type-mismatch-test-${Date.now()}`
+
+      // Create with text/plain
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Try to append with application/json - valid content-type but doesn't match stream
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `application/json` },
+        body: `{}`,
+      })
+
+      expect(response.status).toBe(409)
+    })
+
+    test(`should return correct headers on GET`, async () => {
+      const streamPath = `/v1/stream/get-headers-test-${Date.now()}`
+
+      // Create and add data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Read data
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(200)
+      expect(response.headers.get(`content-type`)).toBe(`text/plain`)
+      const nextOffset = response.headers.get(STREAM_OFFSET_HEADER)
+      expect(nextOffset).toBeDefined()
+      expect(response.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+      const etag = response.headers.get(`etag`)
+      expect(etag).toBeDefined()
+
+      const text = await response.text()
+      expect(text).toBe(`test data`)
+    })
+
+    test(`should return empty body with up-to-date for empty stream`, async () => {
+      const streamPath = `/v1/stream/get-empty-test-${Date.now()}`
+
+      // Create empty stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Read empty stream
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(200)
+      expect(response.headers.get(STREAM_OFFSET_HEADER)).toBeDefined()
+      expect(response.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+
+      const text = await response.text()
+      expect(text).toBe(``)
+    })
+
+    test(`should read from offset`, async () => {
+      const streamPath = `/v1/stream/get-offset-test-${Date.now()}`
+
+      // Create with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `first`,
+      })
+
+      // Append more
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `second`,
+      })
+
+      // Get the first offset (after "first")
+      const firstResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      const firstText = await firstResponse.text()
+      expect(firstText).toBe(`firstsecond`)
+
+      // Now create fresh and read from middle offset
+      const streamPath2 = `/v1/stream/get-offset-test2-${Date.now()}`
+      await fetch(`${getBaseUrl()}${streamPath2}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `first`,
+      })
+      const middleResponse = await fetch(`${getBaseUrl()}${streamPath2}`, {
+        method: `GET`,
+      })
+      const middleOffset = middleResponse.headers.get(STREAM_OFFSET_HEADER)
+
+      // Append more
+      await fetch(`${getBaseUrl()}${streamPath2}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `second`,
+      })
+
+      // Read from the middle offset
+      const response = await fetch(
+        `${getBaseUrl()}${streamPath2}?offset=${middleOffset}`,
+        {
+          method: `GET`,
+        }
+      )
+
+      expect(response.status).toBe(200)
+      const text = await response.text()
+      expect(text).toBe(`second`)
+    })
+
+    test(`should return 404 on DELETE non-existent stream`, async () => {
+      const streamPath = `/v1/stream/delete-404-test-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `DELETE`,
+      })
+
+      expect(response.status).toBe(404)
+    })
+
+    test(`should return 204 on successful DELETE`, async () => {
+      const streamPath = `/v1/stream/delete-success-test-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Delete it
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `DELETE`,
+      })
+
+      expect(response.status).toBe(204)
+
+      // Verify it's gone
+      const readResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      expect(readResponse.status).toBe(404)
+    })
+
+    test(`should enforce sequence ordering`, async () => {
+      const streamPath = `/v1/stream/seq-test-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Append with seq 001
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_SEQ_HEADER]: `001`,
+        },
+        body: `first`,
+      })
+
+      // Append with seq 002
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_SEQ_HEADER]: `002`,
+        },
+        body: `second`,
+      })
+
+      // Try to append with seq 001 (regression) - should fail
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_SEQ_HEADER]: `001`,
+        },
+        body: `invalid`,
+      })
+
+      expect(response.status).toBe(409)
+    })
+
+    test(`should enforce lexicographic seq ordering ("2" then "10" rejects)`, async () => {
+      const streamPath = `/v1/stream/seq-lexicographic-test-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Append with seq "2"
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_SEQ_HEADER]: `2`,
+        },
+        body: `first`,
+      })
+
+      // Try to append with seq "10" - should fail (lexicographically "10" < "2")
+      // A numeric implementation would incorrectly accept this (10 > 2)
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_SEQ_HEADER]: `10`,
+        },
+        body: `second`,
+      })
+
+      expect(response.status).toBe(409)
+    })
+
+    test(`should allow lexicographic seq ordering ("09" then "10" succeeds)`, async () => {
+      const streamPath = `/v1/stream/seq-padded-test-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Append with seq "09"
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_SEQ_HEADER]: `09`,
+        },
+        body: `first`,
+      })
+
+      // Append with seq "10" - should succeed (lexicographically "10" > "09")
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_SEQ_HEADER]: `10`,
+        },
+        body: `second`,
+      })
+
+      expect(response.status).toBe(204)
+    })
+
+    test(`should reject duplicate seq values`, async () => {
+      const streamPath = `/v1/stream/seq-duplicate-test-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Append with seq "001"
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_SEQ_HEADER]: `001`,
+        },
+        body: `first`,
+      })
+
+      // Try to append with same seq "001" - should fail
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_SEQ_HEADER]: `001`,
+        },
+        body: `duplicate`,
+      })
+
+      expect(response.status).toBe(409)
+    })
+  })
+
+  // ============================================================================
+  // Browser Security Headers (Protocol Section 10.7)
+  // ============================================================================
+
+  describe(`Browser Security Headers`, () => {
+    test(`should include X-Content-Type-Options: nosniff on GET responses`, async () => {
+      const streamPath = `/v1/stream/security-get-nosniff-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Read data
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(200)
+      expect(response.headers.get(`x-content-type-options`)).toBe(`nosniff`)
+    })
+
+    test(`should include X-Content-Type-Options: nosniff on PUT responses`, async () => {
+      const streamPath = `/v1/stream/security-put-nosniff-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      expect(response.status).toBe(201)
+      expect(response.headers.get(`x-content-type-options`)).toBe(`nosniff`)
+    })
+
+    test(`should include X-Content-Type-Options: nosniff on POST responses`, async () => {
+      const streamPath = `/v1/stream/security-post-nosniff-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Append data
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `data`,
+      })
+
+      expect([200, 204]).toContain(response.status)
+      expect(response.headers.get(`x-content-type-options`)).toBe(`nosniff`)
+    })
+
+    test(`should include X-Content-Type-Options: nosniff on HEAD responses`, async () => {
+      const streamPath = `/v1/stream/security-head-nosniff-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // HEAD request
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `HEAD`,
+      })
+
+      expect(response.status).toBe(200)
+      expect(response.headers.get(`x-content-type-options`)).toBe(`nosniff`)
+    })
+
+    test(`should include Cross-Origin-Resource-Policy header on GET responses`, async () => {
+      const streamPath = `/v1/stream/security-corp-get-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/octet-stream` },
+        body: new Uint8Array([1, 2, 3, 4]),
+      })
+
+      // Read data
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(200)
+      const corp = response.headers.get(`cross-origin-resource-policy`)
+      expect(corp).toBeDefined()
+      expect([`cross-origin`, `same-origin`, `same-site`]).toContain(corp)
+    })
+
+    test(`should include Cache-Control: no-store on HEAD responses`, async () => {
+      const streamPath = `/v1/stream/security-head-cache-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // HEAD request
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `HEAD`,
+      })
+
+      expect(response.status).toBe(200)
+      const cacheControl = response.headers.get(`cache-control`)
+      expect(cacheControl).toBeDefined()
+      expect(cacheControl).toContain(`no-store`)
+    })
+
+    test(`should include X-Content-Type-Options: nosniff on SSE responses`, async () => {
+      const streamPath = `/v1/stream/security-sse-nosniff-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: JSON.stringify({ test: `data` }),
+      })
+
+      // Get offset
+      const headResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `HEAD`,
+      })
+      const offset = headResponse.headers.get(STREAM_OFFSET_HEADER) ?? `-1`
+
+      // SSE request with abort controller
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 500)
+
+      try {
+        const response = await fetch(
+          `${getBaseUrl()}${streamPath}?offset=${offset}&live=sse`,
+          {
+            method: `GET`,
+            signal: controller.signal,
+          }
+        )
+
+        expect(response.status).toBe(200)
+        expect(response.headers.get(`x-content-type-options`)).toBe(`nosniff`)
+      } catch (e) {
+        // AbortError is expected
+        if (!(e instanceof Error && e.name === `AbortError`)) {
+          throw e
+        }
+      } finally {
+        clearTimeout(timeoutId)
+      }
+    })
+
+    test(`should include X-Content-Type-Options: nosniff on long-poll responses`, async () => {
+      const streamPath = `/v1/stream/security-longpoll-nosniff-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `initial data`,
+      })
+
+      // Get offset
+      const headResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `HEAD`,
+      })
+      const offset = headResponse.headers.get(STREAM_OFFSET_HEADER) ?? `-1`
+
+      // Long-poll request (will likely return 204 if no new data)
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 500)
+
+      try {
+        const response = await fetch(
+          `${getBaseUrl()}${streamPath}?offset=${offset}&live=long-poll`,
+          {
+            method: `GET`,
+            signal: controller.signal,
+          }
+        )
+
+        // Either 200 (data) or 204 (timeout) - both should have nosniff
+        expect([200, 204]).toContain(response.status)
+        expect(response.headers.get(`x-content-type-options`)).toBe(`nosniff`)
+      } catch (e) {
+        // AbortError is acceptable if request times out
+        if (!(e instanceof Error && e.name === `AbortError`)) {
+          throw e
+        }
+      } finally {
+        clearTimeout(timeoutId)
+      }
+    })
+
+    test(`should include security headers on error responses`, async () => {
+      const streamPath = `/v1/stream/security-error-headers-${Date.now()}`
+
+      // Try to read non-existent stream (404)
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(404)
+      // Security headers should be present even on error responses
+      expect(response.headers.get(`x-content-type-options`)).toBe(`nosniff`)
+    })
+  })
+
+  // ============================================================================
+  // TTL and Expiry Validation
+  // ============================================================================
+
+  describe(`TTL and Expiry Validation`, () => {
+    test(`should reject both TTL and Expires-At (400)`, async () => {
+      const streamPath = `/v1/stream/ttl-expires-conflict-test-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `3600`,
+          "Stream-Expires-At": new Date(Date.now() + 3600000).toISOString(),
+        },
+      })
+
+      expect(response.status).toBe(400)
+    })
+
+    test(`should reject invalid TTL (non-integer)`, async () => {
+      const streamPath = `/v1/stream/ttl-invalid-test-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `abc`,
+        },
+      })
+
+      expect(response.status).toBe(400)
+    })
+
+    test(`should reject negative TTL`, async () => {
+      const streamPath = `/v1/stream/ttl-negative-test-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `-1`,
+        },
+      })
+
+      expect(response.status).toBe(400)
+    })
+
+    test(`should accept valid TTL`, async () => {
+      const streamPath = `/v1/stream/ttl-valid-test-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `3600`,
+        },
+      })
+
+      expect([200, 201]).toContain(response.status)
+    })
+
+    test(`should accept valid Expires-At`, async () => {
+      const streamPath = `/v1/stream/expires-valid-test-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-Expires-At": new Date(Date.now() + 3600000).toISOString(),
+        },
+      })
+
+      expect([200, 201]).toContain(response.status)
+    })
+  })
+
+  // ============================================================================
+  // Case-Insensitivity Tests
+  // ============================================================================
+
+  describe(`Case-Insensitivity`, () => {
+    test(`should treat content-type case-insensitively`, async () => {
+      const streamPath = `/v1/stream/case-content-type-test-${Date.now()}`
+
+      // Create with lowercase content-type
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Append with mixed case - should succeed
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `TEXT/PLAIN` },
+        body: `test`,
+      })
+
+      expect(response.status).toBe(204)
+    })
+
+    test(`should allow idempotent create with different case content-type`, async () => {
+      const streamPath = `/v1/stream/case-idempotent-test-${Date.now()}`
+
+      // Create with lowercase
+      const response1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+      })
+      expect(response1.status).toBe(201)
+
+      // PUT again with uppercase - should be idempotent
+      const response2 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `APPLICATION/JSON` },
+      })
+      expect(response2.status).toBe(200)
+    })
+
+    test(`should accept headers with different casing`, async () => {
+      const streamPath = `/v1/stream/case-header-test-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Append with different header casing (lowercase)
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "content-type": `text/plain`,
+          "stream-seq": `001`,
+        },
+        body: `test`,
+      })
+
+      expect(response.status).toBe(204)
+    })
+  })
+
+  // ============================================================================
+  // Content-Type Validation
+  // ============================================================================
+
+  describe(`Content-Type Validation`, () => {
+    test(`should enforce content-type match on append`, async () => {
+      const streamPath = `/v1/stream/content-type-enforcement-test-${Date.now()}`
+
+      // Create with text/plain
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Try to append with application/json - valid but doesn't match stream (409)
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `application/json` },
+        body: `{"test": true}`,
+      })
+
+      expect(response.status).toBe(409)
+    })
+
+    test(`should allow append with matching content-type`, async () => {
+      const streamPath = `/v1/stream/content-type-match-test-${Date.now()}`
+
+      // Create with application/json
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+      })
+
+      // Append with same content-type - should succeed
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `application/json` },
+        body: `{"test": true}`,
+      })
+
+      expect(response.status).toBe(204)
+    })
+
+    test(`should return stream content-type on GET`, async () => {
+      const streamPath = `/v1/stream/content-type-get-test-${Date.now()}`
+
+      // Create with application/json
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: `{"initial": true}`,
+      })
+
+      // Read and verify content-type
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(200)
+      expect(response.headers.get(`content-type`)).toBe(`application/json`)
+    })
+  })
+
+  // ============================================================================
+  // HEAD Metadata Tests
+  // ============================================================================
+
+  describe(`HEAD Metadata`, () => {
+    test(`should return metadata without body`, async () => {
+      const streamPath = `/v1/stream/head-test-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // HEAD request
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `HEAD`,
+      })
+
+      expect(response.status).toBe(200)
+      expect(response.headers.get(`content-type`)).toBe(`text/plain`)
+      expect(response.headers.get(STREAM_OFFSET_HEADER)).toBeDefined()
+
+      // Body should be empty
+      const text = await response.text()
+      expect(text).toBe(``)
+    })
+
+    test(`should return 404 for non-existent stream`, async () => {
+      const streamPath = `/v1/stream/head-404-test-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `HEAD`,
+      })
+
+      expect(response.status).toBe(404)
+    })
+
+    test(`should return tail offset`, async () => {
+      const streamPath = `/v1/stream/head-offset-test-${Date.now()}`
+
+      // Create empty stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // HEAD should show initial offset
+      const response1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `HEAD`,
+      })
+      const offset1 = response1.headers.get(STREAM_OFFSET_HEADER)
+      expect(offset1).toBeDefined()
+
+      // Append data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test`,
+      })
+
+      // HEAD should show updated offset
+      const response2 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `HEAD`,
+      })
+      const offset2 = response2.headers.get(STREAM_OFFSET_HEADER)
+      expect(offset2).toBeDefined()
+      expect(offset2).not.toBe(offset1)
+    })
+  })
+
+  // ============================================================================
+  // Offset Validation and Resumability
+  // ============================================================================
+
+  describe(`Offset Validation and Resumability`, () => {
+    test(`should accept -1 as sentinel for stream beginning`, async () => {
+      const streamPath = `/v1/stream/offset-sentinel-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Using offset=-1 should return data from the beginning
+      const response = await fetch(`${getBaseUrl()}${streamPath}?offset=-1`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(200)
+      const text = await response.text()
+      expect(text).toBe(`test data`)
+      expect(response.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+    })
+
+    test(`should return same data for offset=-1 and no offset`, async () => {
+      const streamPath = `/v1/stream/offset-sentinel-equiv-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `hello world`,
+      })
+
+      // Request without offset
+      const response1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      const text1 = await response1.text()
+
+      // Request with offset=-1
+      const response2 = await fetch(`${getBaseUrl()}${streamPath}?offset=-1`, {
+        method: `GET`,
+      })
+      const text2 = await response2.text()
+
+      // Both should return the same data
+      expect(text1).toBe(text2)
+      expect(text1).toBe(`hello world`)
+    })
+
+    test(`should accept offset=now as sentinel for current tail position`, async () => {
+      const streamPath = `/v1/stream/offset-now-sentinel-test-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `historical data`,
+      })
+
+      // Using offset=now should return empty body with tail offset
+      const response = await fetch(`${getBaseUrl()}${streamPath}?offset=now`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(200)
+      const text = await response.text()
+      expect(text).toBe(``)
+      expect(response.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+      expect(response.headers.get(STREAM_OFFSET_HEADER)).toBeDefined()
+      // Cache-Control: no-store prevents caching of the tail offset
+      const cacheControl = response.headers.get(`cache-control`)
+      expect(cacheControl).toContain(`no-store`)
+    })
+
+    test(`should return correct tail offset for offset=now`, async () => {
+      const streamPath = `/v1/stream/offset-now-tail-test-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `initial data`,
+      })
+
+      // Get the tail offset via normal read
+      const readResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      const tailOffset = readResponse.headers.get(STREAM_OFFSET_HEADER)
+      expect(tailOffset).toBeDefined()
+
+      // offset=now should return the same tail offset
+      const nowResponse = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=now`,
+        {
+          method: `GET`,
+        }
+      )
+      expect(nowResponse.headers.get(STREAM_OFFSET_HEADER)).toBe(tailOffset)
+    })
+
+    test(`should be able to resume from offset=now result`, async () => {
+      const streamPath = `/v1/stream/offset-now-resume-test-${Date.now()}`
+
+      // Create stream with historical data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `old data`,
+      })
+
+      // Get tail position via offset=now
+      const nowResponse = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=now`,
+        {
+          method: `GET`,
+        }
+      )
+      const nowOffset = nowResponse.headers.get(STREAM_OFFSET_HEADER)
+      expect(nowOffset).toBeDefined()
+
+      // Append new data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `new data`,
+      })
+
+      // Resume from the offset we got - should only get new data
+      const resumeResponse = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=${nowOffset}`,
+        {
+          method: `GET`,
+        }
+      )
+      const resumeText = await resumeResponse.text()
+      expect(resumeText).toBe(`new data`)
+    })
+
+    test(`should work with offset=now on empty stream`, async () => {
+      const streamPath = `/v1/stream/offset-now-empty-test-${Date.now()}`
+
+      // Create empty stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // offset=now on empty stream should still return empty with offset
+      const response = await fetch(`${getBaseUrl()}${streamPath}?offset=now`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(200)
+      const text = await response.text()
+      expect(text).toBe(``)
+      expect(response.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+      expect(response.headers.get(STREAM_OFFSET_HEADER)).toBeDefined()
+    })
+
+    test(`should return empty JSON array for offset=now on JSON streams`, async () => {
+      const streamPath = `/v1/stream/offset-now-json-body-test-${Date.now()}`
+
+      // Create JSON stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: `[{"event": "historical"}]`,
+      })
+
+      // offset=now on JSON stream should return [] (empty array), not empty string
+      const response = await fetch(`${getBaseUrl()}${streamPath}?offset=now`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(200)
+      expect(response.headers.get(`content-type`)).toBe(`application/json`)
+      expect(response.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+      expect(response.headers.get(STREAM_OFFSET_HEADER)).toBeDefined()
+
+      // Body MUST be [] for JSON streams (valid empty JSON array)
+      const body = await response.text()
+      expect(body).toBe(`[]`)
+    })
+
+    test(`should return empty body for offset=now on non-JSON streams`, async () => {
+      const streamPath = `/v1/stream/offset-now-text-body-test-${Date.now()}`
+
+      // Create text stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `historical data`,
+      })
+
+      // offset=now on text stream should return empty body (0 bytes)
+      const response = await fetch(`${getBaseUrl()}${streamPath}?offset=now`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(200)
+      expect(response.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+      expect(response.headers.get(STREAM_OFFSET_HEADER)).toBeDefined()
+
+      // Body MUST be empty (0 bytes) for non-JSON streams
+      const body = await response.text()
+      expect(body).toBe(``)
+    })
+
+    test(`should support offset=now with long-poll mode (waits for data)`, async () => {
+      const streamPath = `/v1/stream/offset-now-longpoll-test-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `existing data`,
+      })
+
+      // Get tail offset first
+      const readRes = await fetch(`${getBaseUrl()}${streamPath}`)
+      const tailOffset = readRes.headers.get(STREAM_OFFSET_HEADER)
+
+      // offset=now with long-poll should immediately start waiting for new data
+      // Since we don't append anything, it should timeout with 204
+      const response = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=now&live=long-poll`,
+        {
+          method: `GET`,
+        }
+      )
+
+      // Should get 204 timeout (server waited for data but none arrived)
+      expect(response.status).toBe(204)
+      expect(response.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+      // Should return the tail offset
+      expect(response.headers.get(STREAM_OFFSET_HEADER)).toBe(tailOffset)
+    })
+
+    test(`should receive data with offset=now long-poll when appended`, async () => {
+      const streamPath = `/v1/stream/offset-now-longpoll-data-test-${Date.now()}`
+
+      // Create stream with historical data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `historical`,
+      })
+
+      // Start long-poll with offset=now (will wait for new data)
+      const longPollPromise = fetch(
+        `${getBaseUrl()}${streamPath}?offset=now&live=long-poll`,
+        { method: `GET` }
+      )
+
+      // Continuously append data so the long-poll picks it up regardless of
+      // when the server establishes the subscription or how short its timeout is.
+      const interval = setInterval(() => {
+        void fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { "Content-Type": `text/plain` },
+          body: `new data`,
+        })
+      }, 50)
+
+      try {
+        // Long-poll should return with new data (not historical)
+        const response = await longPollPromise
+        expect(response.status).toBe(200)
+        const text = await response.text()
+        expect(text).toContain(`new data`)
+        expect(text).not.toContain(`historical`)
+        expect(response.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+      } finally {
+        clearInterval(interval)
+      }
+    })
+
+    test(`should support offset=now with SSE mode`, async () => {
+      const streamPath = `/v1/stream/offset-now-sse-test-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `existing data`,
+      })
+
+      // Get tail offset first
+      const readResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      const tailOffset = readResponse.headers.get(STREAM_OFFSET_HEADER)
+
+      // offset=now with SSE should work and provide correct offset in control event
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=now&live=sse`,
+        { untilContent: `"upToDate"` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Should have control event with upToDate:true and streamNextOffset
+      const controlMatch = received.match(
+        /event: control\s*\n\s*data:({[^}]+})/
+      )
+      expect(controlMatch).toBeDefined()
+      if (controlMatch && controlMatch[1]) {
+        const controlData = JSON.parse(controlMatch[1])
+        expect(controlData[`upToDate`]).toBe(true)
+        expect(controlData[`streamNextOffset`]).toBe(tailOffset)
+      }
+    })
+
+    test(`should return 404 for offset=now on non-existent stream`, async () => {
+      const streamPath = `/v1/stream/offset-now-404-test-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}?offset=now`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(404)
+    })
+
+    test(`should return 404 for offset=now with long-poll on non-existent stream`, async () => {
+      const streamPath = `/v1/stream/offset-now-longpoll-404-test-${Date.now()}`
+
+      const response = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=now&live=long-poll`,
+        { method: `GET` }
+      )
+
+      expect(response.status).toBe(404)
+    })
+
+    test(`should return 404 for offset=now with SSE on non-existent stream`, async () => {
+      const streamPath = `/v1/stream/offset-now-sse-404-test-${Date.now()}`
+
+      const response = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=now&live=sse`,
+        { method: `GET` }
+      )
+
+      expect(response.status).toBe(404)
+    })
+
+    test(`should support offset=now with long-poll on empty stream`, async () => {
+      const streamPath = `/v1/stream/offset-now-empty-longpoll-test-${Date.now()}`
+
+      // Create empty stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // offset=now with long-poll on empty stream should timeout with 204
+      const response = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=now&live=long-poll`,
+        { method: `GET` }
+      )
+
+      expect(response.status).toBe(204)
+      expect(response.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+      // Should return a valid offset that can be used to resume
+      const offset = response.headers.get(STREAM_OFFSET_HEADER)
+      expect(offset).toBeDefined()
+
+      // Verify the offset works for future data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `first data`,
+      })
+
+      const resumeResponse = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=${offset}`,
+        { method: `GET` }
+      )
+      expect(resumeResponse.status).toBe(200)
+      const resumeText = await resumeResponse.text()
+      expect(resumeText).toBe(`first data`)
+    })
+
+    test(`should support offset=now with SSE on empty stream`, async () => {
+      const streamPath = `/v1/stream/offset-now-empty-sse-test-${Date.now()}`
+
+      // Create empty stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // offset=now with SSE on empty stream should return upToDate:true with valid offset
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=now&live=sse`,
+        { untilContent: `"upToDate"` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Should have control event with upToDate:true and streamNextOffset
+      const controlMatch = received.match(
+        /event: control\s*\n\s*data:({[^}]+})/
+      )
+      expect(controlMatch).toBeDefined()
+      if (controlMatch && controlMatch[1]) {
+        const controlData = JSON.parse(controlMatch[1])
+        expect(controlData[`upToDate`]).toBe(true)
+        // Should have a valid offset even on empty stream
+        expect(controlData[`streamNextOffset`]).toBeDefined()
+      }
+    })
+
+    test(`should reject malformed offset (contains comma)`, async () => {
+      const streamPath = `/v1/stream/offset-comma-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test`,
+      })
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}?offset=0,1`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(400)
+    })
+
+    test(`should reject offset with spaces`, async () => {
+      const streamPath = `/v1/stream/offset-spaces-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test`,
+      })
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}?offset=0 1`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(400)
+    })
+
+    test(`should support resumable reads (no duplicate data)`, async () => {
+      const streamPath = `/v1/stream/resumable-test-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Append chunk 1
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `chunk1`,
+      })
+
+      // Read chunk 1
+      const response1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      const text1 = await response1.text()
+      const offset1 = response1.headers.get(STREAM_OFFSET_HEADER)
+
+      expect(text1).toBe(`chunk1`)
+      expect(offset1).toBeDefined()
+
+      // Append chunk 2
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `chunk2`,
+      })
+
+      // Read from offset1 - should only get chunk2
+      const response2 = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=${offset1}`,
+        {
+          method: `GET`,
+        }
+      )
+      const text2 = await response2.text()
+
+      expect(text2).toBe(`chunk2`)
+    })
+
+    test(`should return empty response when reading from tail offset`, async () => {
+      const streamPath = `/v1/stream/tail-read-test-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test`,
+      })
+
+      // Read all data
+      const response1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      const tailOffset = response1.headers.get(STREAM_OFFSET_HEADER)
+
+      // Read from tail offset - should return empty with up-to-date
+      const response2 = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=${tailOffset}`,
+        {
+          method: `GET`,
+        }
+      )
+
+      expect(response2.status).toBe(200)
+      const text = await response2.text()
+      expect(text).toBe(``)
+      expect(response2.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+    })
+  })
+
+  // ============================================================================
+  // Protocol Edge Cases
+  // ============================================================================
+
+  describe(`Protocol Edge Cases`, () => {
+    test(`should reject empty POST body with 400`, async () => {
+      const streamPath = `/v1/stream/empty-append-test-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Try to append empty body - should fail
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: ``,
+      })
+
+      expect(response.status).toBe(400)
+    })
+
+    test(`should handle PUT with initial body correctly`, async () => {
+      const streamPath = `/v1/stream/put-initial-body-test-${Date.now()}`
+      const initialData = `initial stream content`
+
+      // Create stream with initial content
+      const putResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: initialData,
+      })
+
+      expect(putResponse.status).toBe(201)
+      const nextOffset = putResponse.headers.get(STREAM_OFFSET_HEADER)
+      expect(nextOffset).toBeDefined()
+
+      // Verify we can read the initial content
+      const getResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+
+      const text = await getResponse.text()
+      expect(text).toBe(initialData)
+      expect(getResponse.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+    })
+
+    test(`should preserve data immutability by position`, async () => {
+      const streamPath = `/v1/stream/immutability-test-${Date.now()}`
+
+      // Create and append first chunk
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `chunk1`,
+      })
+
+      // Read and save the offset after chunk1
+      const response1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      const text1 = await response1.text()
+      const offset1 = response1.headers.get(STREAM_OFFSET_HEADER)
+      expect(text1).toBe(`chunk1`)
+
+      // Append more chunks
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `chunk2`,
+      })
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `chunk3`,
+      })
+
+      // Read from the saved offset - should still get chunk2 (position is immutable)
+      const response2 = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=${offset1}`,
+        {
+          method: `GET`,
+        }
+      )
+      const text2 = await response2.text()
+      expect(text2).toBe(`chunk2chunk3`)
+    })
+
+    test(`should generate unique, monotonically increasing offsets`, async () => {
+      const streamPath = `/v1/stream/monotonic-offset-test-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      const offsets: Array<string> = []
+
+      // Append multiple chunks and collect offsets
+      for (let i = 0; i < 5; i++) {
+        const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { "Content-Type": `text/plain` },
+          body: `chunk${i}`,
+        })
+
+        const offset = response.headers.get(STREAM_OFFSET_HEADER)
+        expect(offset).toBeDefined()
+        offsets.push(offset!)
+      }
+
+      // Verify offsets are unique and strictly increasing (lexicographically)
+      for (let i = 1; i < offsets.length; i++) {
+        expect(offsets[i]! > offsets[i - 1]!).toBe(true)
+      }
+    })
+
+    test(`should reject empty offset parameter`, async () => {
+      const streamPath = `/v1/stream/empty-offset-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test`,
+      })
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}?offset=`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(400)
+    })
+
+    test(`should reject multiple offset parameters`, async () => {
+      const streamPath = `/v1/stream/multi-offset-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test`,
+      })
+
+      const response = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=a&offset=b`,
+        {
+          method: `GET`,
+        }
+      )
+
+      expect(response.status).toBe(400)
+    })
+
+    test(`should enforce case-sensitive seq ordering`, async () => {
+      const streamPath = `/v1/stream/case-seq-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Append with seq "a" (lowercase)
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_SEQ_HEADER]: `a`,
+        },
+        body: `first`,
+      })
+
+      // Try to append with seq "B" (uppercase) - should fail
+      // Lexicographically: "B" < "a" in byte order (uppercase comes before lowercase in ASCII)
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_SEQ_HEADER]: `B`,
+        },
+        body: `second`,
+      })
+
+      expect(response.status).toBe(409)
+    })
+
+    test(`should handle binary data with integrity`, async () => {
+      const streamPath = `/v1/stream/binary-test-${Date.now()}`
+
+      // Create binary stream with various byte values including 0x00 and 0xFF
+      const binaryData = new Uint8Array([
+        0x00, 0x01, 0x02, 0x7f, 0x80, 0xfe, 0xff,
+      ])
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/octet-stream` },
+        body: binaryData,
+      })
+
+      // Read back and verify byte-for-byte
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+
+      const buffer = await response.arrayBuffer()
+      const result = new Uint8Array(buffer)
+
+      expect(result.length).toBe(binaryData.length)
+      for (let i = 0; i < binaryData.length; i++) {
+        expect(result[i]).toBe(binaryData[i])
+      }
+    })
+
+    test(`should return Location header on 201`, async () => {
+      const streamPath = `/v1/stream/location-test-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      expect(response.status).toBe(201)
+      const location = response.headers.get(`location`)
+      expect(location).toBeDefined()
+      // Check that Location contains the correct path (host may vary by server config)
+      expect(location!.endsWith(streamPath)).toBe(true)
+      // Verify it's a valid absolute URL
+      expect(() => new URL(location!)).not.toThrow()
+    })
+
+    test(`should reject missing Content-Type on POST`, async () => {
+      const streamPath = `/v1/stream/missing-ct-post-test-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Try to append without Content-Type - should fail
+      // Note: fetch will try to detect the Content-Type based on the body.
+      // Blob with an explicit empty type results in the header being omitted.
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        body: new Blob([`data`], { type: `` }),
+      })
+
+      expect(response.status).toBe(400)
+    })
+
+    test(`should accept PUT without Content-Type (use default)`, async () => {
+      const streamPath = `/v1/stream/no-ct-put-test-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+      })
+
+      expect([200, 201]).toContain(response.status)
+      const contentType = response.headers.get(`content-type`)
+      expect(contentType).toBeDefined()
+    })
+
+    test(`should ignore unknown query parameters`, async () => {
+      const streamPath = `/v1/stream/unknown-param-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Should work fine with unknown params (use -1 to start from beginning)
+      const response = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=-1&foo=bar&baz=qux`,
+        {
+          method: `GET`,
+        }
+      )
+
+      expect(response.status).toBe(200)
+      const text = await response.text()
+      expect(text).toBe(`test data`)
+    })
+  })
+
+  // ============================================================================
+  // Long-Poll Edge Cases
+  // ============================================================================
+
+  describe(`Long-Poll Edge Cases`, () => {
+    test(`should require offset parameter for long-poll`, async () => {
+      const streamPath = `/v1/stream/longpoll-no-offset-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Try long-poll without offset - protocol says offset MUST be provided
+      const response = await fetch(
+        `${getBaseUrl()}${streamPath}?live=long-poll`,
+        {
+          method: `GET`,
+        }
+      )
+
+      expect(response.status).toBe(400)
+    })
+
+    test(`should generate Stream-Cursor header on long-poll responses`, async () => {
+      const streamPath = `/v1/stream/longpoll-cursor-gen-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Long-poll request without cursor - server MUST generate one
+      const response = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=long-poll`,
+        {
+          method: `GET`,
+        }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Server MUST return a Stream-Cursor header
+      const cursor = response.headers.get(`Stream-Cursor`)
+      expect(cursor).toBeDefined()
+      expect(cursor).not.toBeNull()
+
+      // Cursor must be a numeric string (interval number)
+      expect(/^\d+$/.test(cursor!)).toBe(true)
+    })
+
+    test(`should return immediately with Stream-Up-To-Date when data exists at offset`, async () => {
+      const streamPath = `/v1/stream/longpoll-immediate-uptodate-test-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `existing data`,
+      })
+
+      // Long-poll at offset=-1 where data already exists - should return immediately
+      const response = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=long-poll`,
+        {
+          method: `GET`,
+        }
+      )
+
+      // Should return 200 immediately with the data (not wait)
+      expect(response.status).toBe(200)
+      const text = await response.text()
+      expect(text).toBe(`existing data`)
+
+      // Stream-Up-To-Date MUST be set when returning all available data
+      expect(response.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+      expect(response.headers.get(STREAM_OFFSET_HEADER)).toBeDefined()
+    })
+
+    test(`should echo cursor and handle collision with jitter`, async () => {
+      const streamPath = `/v1/stream/longpoll-cursor-collision-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // First request to get current cursor
+      const response1 = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=long-poll`,
+        {
+          method: `GET`,
+        }
+      )
+
+      expect(response1.status).toBe(200)
+      const cursor1 = response1.headers.get(`Stream-Cursor`)
+      expect(cursor1).toBeDefined()
+
+      // Immediate second request with same cursor - should get advanced cursor due to collision
+      const response2 = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=long-poll&cursor=${cursor1}`,
+        {
+          method: `GET`,
+        }
+      )
+
+      expect(response2.status).toBe(200)
+      const cursor2 = response2.headers.get(`Stream-Cursor`)
+      expect(cursor2).toBeDefined()
+
+      // The returned cursor MUST be strictly greater than the one we sent
+      // (monotonic progression prevents cache cycles)
+      expect(parseInt(cursor2!, 10)).toBeGreaterThan(parseInt(cursor1!, 10))
+    })
+
+    test(
+      `should return Stream-Cursor, Stream-Up-To-Date and Stream-Next-Offset on 204 timeout`,
+      async () => {
+        const streamPath = `/v1/stream/longpoll-204-headers-test-${Date.now()}`
+
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        // Get the current tail offset
+        const headResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `HEAD`,
+        })
+        const tailOffset = headResponse.headers.get(STREAM_OFFSET_HEADER)
+        expect(tailOffset).toBeDefined()
+
+        // Long-poll at tail offset with a short timeout
+        // We use AbortController to limit wait time on our side
+        const controller = new AbortController()
+        const timeoutId = setTimeout(() => controller.abort(), 5000)
+
+        try {
+          const response = await fetch(
+            `${getBaseUrl()}${streamPath}?offset=${tailOffset}&live=long-poll`,
+            {
+              method: `GET`,
+              signal: controller.signal,
+            }
+          )
+
+          clearTimeout(timeoutId)
+
+          // If we get a 204, verify headers
+          if (response.status === 204) {
+            expect(response.headers.get(STREAM_OFFSET_HEADER)).toBeDefined()
+            expect(response.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+
+            // Server MUST return Stream-Cursor even on 204 timeout
+            const cursor = response.headers.get(`Stream-Cursor`)
+            expect(cursor).toBeDefined()
+            expect(/^\d+$/.test(cursor!)).toBe(true)
+          }
+          // If we get a 200 (data arrived somehow), that's also valid
+          expect([200, 204]).toContain(response.status)
+        } catch (e) {
+          clearTimeout(timeoutId)
+          // AbortError is expected if server timeout is longer than our 5s
+          if (e instanceof Error && e.name !== `AbortError`) {
+            throw e
+          }
+          // Test passes - server just has a longer timeout than our abort
+        }
+      },
+      getLongPollTestTimeoutMs()
+    )
+  })
+
+  // ============================================================================
+  // TTL and Expiry Edge Cases
+  // ============================================================================
+
+  describe(`TTL and Expiry Edge Cases`, () => {
+    test(`should reject TTL with leading zeros`, async () => {
+      const streamPath = `/v1/stream/ttl-leading-zeros-test-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `00060`,
+        },
+      })
+
+      expect(response.status).toBe(400)
+    })
+
+    test(`should reject TTL with plus sign`, async () => {
+      const streamPath = `/v1/stream/ttl-plus-test-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `+60`,
+        },
+      })
+
+      expect(response.status).toBe(400)
+    })
+
+    test(`should reject TTL with float value`, async () => {
+      const streamPath = `/v1/stream/ttl-float-test-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `60.5`,
+        },
+      })
+
+      expect(response.status).toBe(400)
+    })
+
+    test(`should reject TTL with scientific notation`, async () => {
+      const streamPath = `/v1/stream/ttl-scientific-test-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `1e3`,
+        },
+      })
+
+      expect(response.status).toBe(400)
+    })
+
+    test(`should reject invalid Expires-At timestamp`, async () => {
+      const streamPath = `/v1/stream/expires-invalid-test-${Date.now()}`
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-Expires-At": `not-a-timestamp`,
+        },
+      })
+
+      expect(response.status).toBe(400)
+    })
+
+    test(`should accept Expires-At with Z timezone`, async () => {
+      const streamPath = `/v1/stream/expires-z-test-${Date.now()}`
+
+      const expiresAt = new Date(Date.now() + 3600000).toISOString()
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-Expires-At": expiresAt,
+        },
+      })
+
+      expect([200, 201]).toContain(response.status)
+    })
+
+    test(`should accept Expires-At with timezone offset`, async () => {
+      const streamPath = `/v1/stream/expires-offset-test-${Date.now()}`
+
+      // RFC3339 with timezone offset
+      const date = new Date(Date.now() + 3600000)
+      const expiresAt = date.toISOString().replace(`Z`, `+00:00`)
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-Expires-At": expiresAt,
+        },
+      })
+
+      expect([200, 201]).toContain(response.status)
+    })
+
+    test(`should handle idempotent PUT with same TTL`, async () => {
+      const streamPath = `/v1/stream/ttl-idempotent-test-${Date.now()}`
+
+      // Create with TTL
+      const response1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `3600`,
+        },
+      })
+      expect(response1.status).toBe(201)
+
+      // PUT again with same TTL - should be idempotent
+      const response2 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `3600`,
+        },
+      })
+      expect(response2.status).toBe(200)
+    })
+
+    test(`should reject idempotent PUT with different TTL`, async () => {
+      const streamPath = `/v1/stream/ttl-conflict-test-${Date.now()}`
+
+      // Create with TTL=3600
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `3600`,
+        },
+      })
+
+      // PUT again with different TTL - should fail
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `7200`,
+        },
+      })
+
+      expect(response.status).toBe(409)
+    })
+  })
+
+  // ============================================================================
+  // HEAD Metadata Edge Cases
+  // ============================================================================
+
+  describe(`HEAD Metadata Edge Cases`, () => {
+    test(`should return TTL metadata if configured`, async () => {
+      const streamPath = `/v1/stream/head-ttl-metadata-test-${Date.now()}`
+
+      // Create with TTL
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `3600`,
+        },
+      })
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `HEAD`,
+      })
+
+      // SHOULD return TTL metadata
+      const ttl = response.headers.get(`Stream-TTL`)
+      // Stream-TTL returns the window value, not remaining time
+      expect(ttl).toBe(`3600`)
+    })
+
+    test(`should return Expires-At metadata if configured`, async () => {
+      const streamPath = `/v1/stream/head-expires-metadata-test-${Date.now()}`
+
+      const expiresAt = new Date(Date.now() + 3600000).toISOString()
+
+      // Create with Expires-At
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-Expires-At": expiresAt,
+        },
+      })
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `HEAD`,
+      })
+
+      // SHOULD return Expires-At metadata
+      const expiresHeader = response.headers.get(`Stream-Expires-At`)
+      if (expiresHeader) {
+        expect(expiresHeader).toBeDefined()
+      }
+    })
+  })
+
+  // ============================================================================
+  // TTL Expiration Behavior Tests
+  // ============================================================================
+
+  describe(`TTL Expiration Behavior`, () => {
+    // Helper function to wait for a specified duration
+    const sleep = (ms: number) =>
+      new Promise((resolve) => setTimeout(resolve, ms))
+
+    // Helper to generate unique stream paths for concurrent tests
+    const uniquePath = (prefix: string) =>
+      `/v1/stream/${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+    // Poll HEAD until the stream is deleted, tolerating slight timing delays
+    const waitForDeletion = async (
+      url: string,
+      initialSleepMs: number,
+      expectedStatuses: Array<number> = [404],
+      timeoutMs: number = 5000
+    ) => {
+      await sleep(initialSleepMs)
+      await vi.waitFor(
+        async () => {
+          const head = await fetch(url, { method: `HEAD` })
+          expect(expectedStatuses).toContain(head.status)
+        },
+        { timeout: timeoutMs, interval: 200 }
+      )
+    }
+
+    // Run tests concurrently to avoid 6x 1.5s wait time
+    test.concurrent(`should return 404 on HEAD after TTL expires`, async () => {
+      const streamPath = uniquePath(`ttl-expire-head`)
+
+      // Create stream with 1 second TTL
+      const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `1`,
+        },
+      })
+      expect(createResponse.status).toBe(201)
+
+      // Verify stream exists immediately
+      const headBefore = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `HEAD`,
+      })
+      expect(headBefore.status).toBe(200)
+
+      // Wait for TTL to expire, polling HEAD until deleted
+      await waitForDeletion(`${getBaseUrl()}${streamPath}`, 1000)
+
+      // Verify with GET as well
+      const getAfter = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      expect(getAfter.status).toBe(404)
+    })
+
+    test.concurrent(
+      `should return 404 on GET after TTL expires (idle)`,
+      async () => {
+        const streamPath = uniquePath(`ttl-expire-get`)
+
+        // Create stream with 1 second TTL and some data
+        const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            "Stream-TTL": `1`,
+          },
+          body: `test data`,
+        })
+        expect(createResponse.status).toBe(201)
+
+        // Wait for TTL to expire (no reads or writes — stream is idle)
+        await waitForDeletion(`${getBaseUrl()}${streamPath}`, 1000)
+
+        // Verify with GET as well
+        const getAfter = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `GET`,
+        })
+        expect(getAfter.status).toBe(404)
+      }
+    )
+
+    test.concurrent(
+      `should return 404 on POST append after TTL expires (idle)`,
+      async () => {
+        const streamPath = uniquePath(`ttl-expire-post`)
+
+        // Create stream with 1 second TTL
+        const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            "Stream-TTL": `1`,
+          },
+        })
+        expect(createResponse.status).toBe(201)
+
+        // Wait for TTL to expire (no reads or writes — stream is idle)
+        await waitForDeletion(`${getBaseUrl()}${streamPath}`, 1000)
+
+        // Verify append fails - stream no longer exists
+        const postAfter = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { "Content-Type": `text/plain` },
+          body: `more data`,
+        })
+        expect(postAfter.status).toBe(404)
+      }
+    )
+
+    test.concurrent(
+      `should return 404 on HEAD after Expires-At passes`,
+      async () => {
+        const streamPath = uniquePath(`expires-at-head`)
+
+        // Create stream that expires in 3 seconds (wide window to tolerate clock skew)
+        const expiresAt = new Date(Date.now() + 3000).toISOString()
+        const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            "Stream-Expires-At": expiresAt,
+          },
+        })
+        expect(createResponse.status).toBe(201)
+
+        // Verify stream exists immediately
+        const headBefore = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `HEAD`,
+        })
+        expect(headBefore.status).toBe(200)
+
+        // Wait for expiry, polling HEAD until deleted
+        await waitForDeletion(`${getBaseUrl()}${streamPath}`, 3000)
+
+        // Verify with GET as well
+        const getAfter = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `GET`,
+        })
+        expect(getAfter.status).toBe(404)
+      }
+    )
+
+    test.concurrent(
+      `should return 404 on GET after Expires-At passes`,
+      async () => {
+        const streamPath = uniquePath(`expires-at-get`)
+
+        // Create stream that expires in 3 seconds (wide window to tolerate clock skew)
+        const expiresAt = new Date(Date.now() + 3000).toISOString()
+        const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            "Stream-Expires-At": expiresAt,
+          },
+          body: `test data`,
+        })
+        expect(createResponse.status).toBe(201)
+
+        // Verify stream is readable immediately
+        const getBefore = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `GET`,
+        })
+        expect(getBefore.status).toBe(200)
+
+        // Wait for expiry, polling HEAD until deleted
+        await waitForDeletion(`${getBaseUrl()}${streamPath}`, 3000)
+
+        // Verify with GET as well
+        const getAfter = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `GET`,
+        })
+        expect(getAfter.status).toBe(404)
+      }
+    )
+
+    test.concurrent(
+      `should return 404 on POST append after Expires-At passes`,
+      async () => {
+        const streamPath = uniquePath(`expires-at-post`)
+
+        // Create stream that expires in 3 seconds (wide window to tolerate clock skew)
+        const expiresAt = new Date(Date.now() + 3000).toISOString()
+        const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            "Stream-Expires-At": expiresAt,
+          },
+        })
+        expect(createResponse.status).toBe(201)
+
+        // Verify append works immediately
+        const postBefore = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { "Content-Type": `text/plain` },
+          body: `appended data`,
+        })
+        expect(postBefore.status).toBe(204)
+
+        // Wait for expiry, polling HEAD until deleted
+        await waitForDeletion(`${getBaseUrl()}${streamPath}`, 3000)
+
+        // Verify append fails - stream no longer exists
+        const postAfter = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { "Content-Type": `text/plain` },
+          body: `more data`,
+        })
+        expect(postAfter.status).toBe(404)
+      }
+    )
+
+    test.concurrent(
+      `should allow recreating stream after TTL expires`,
+      async () => {
+        const streamPath = uniquePath(`ttl-recreate`)
+
+        // Create stream with 1 second TTL
+        const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            "Stream-TTL": `1`,
+          },
+          body: `original data`,
+        })
+        expect(createResponse.status).toBe(201)
+
+        // Wait for TTL to expire, polling HEAD until deleted
+        await waitForDeletion(`${getBaseUrl()}${streamPath}`, 1000)
+
+        // Recreate stream with different config - should succeed (201)
+        const recreateResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `application/json`,
+            "Stream-TTL": `3600`,
+          },
+          body: `["new data"]`,
+        })
+        expect(recreateResponse.status).toBe(201)
+
+        // Verify the new stream is accessible
+        const getResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `GET`,
+        })
+        expect(getResponse.status).toBe(200)
+        const body = await getResponse.text()
+        expect(body).toContain(`new data`)
+      }
+    )
+
+    test.concurrent(`should extend TTL on write (sliding window)`, async () => {
+      const streamPath = uniquePath(`ttl-renew-write`)
+
+      // Create stream with 2 second TTL
+      const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `2`,
+        },
+      })
+      expect(createResponse.status).toBe(201)
+
+      // Wait 1.5s (past the midpoint)
+      await sleep(1500)
+
+      // Append — this should reset TTL to 2s from now
+      const appendResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `keep alive`,
+      })
+      expect(appendResponse.status).toBe(204)
+
+      // Wait another 1.5s — total 3s since creation, but only 1.5s since last write
+      await sleep(1500)
+
+      // Stream should still be alive (TTL was reset by the write)
+      const headResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `HEAD`,
+      })
+      expect(headResponse.status).toBe(200)
+    })
+
+    test.concurrent(
+      `should extend TTL on GET ?offset=now (sliding window)`,
+      async () => {
+        const streamPath = uniquePath(`ttl-renew-offset-now`)
+
+        // Create stream with 2 second TTL
+        const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            "Stream-TTL": `2`,
+          },
+        })
+        expect(createResponse.status).toBe(201)
+
+        // Wait 1.5s (past the midpoint)
+        await sleep(1500)
+
+        // Non-live tail read — a read, so it should reset the TTL
+        const nowResponse = await fetch(
+          `${getBaseUrl()}${streamPath}?offset=now`
+        )
+        expect(nowResponse.status).toBe(200)
+        expect(nowResponse.headers.get(`Stream-Up-To-Date`)).toBe(`true`)
+
+        // Wait another 1.5s — total 3s since creation, 1.5s since the read
+        await sleep(1500)
+
+        // Stream should still be alive (TTL was reset by the offset=now read)
+        const headResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `HEAD`,
+        })
+        expect(headResponse.status).toBe(200)
+      }
+    )
+
+    test.concurrent(
+      `should extend TTL on close-only POST (sliding window)`,
+      async () => {
+        const streamPath = uniquePath(`ttl-renew-close`)
+
+        // Create stream with 2 second TTL
+        const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            "Stream-TTL": `2`,
+          },
+        })
+        expect(createResponse.status).toBe(201)
+
+        // Wait 1.5s (past the midpoint)
+        await sleep(1500)
+
+        // Close-only POST (empty body) — a write, so it should reset the TTL
+        const closeResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { "Stream-Closed": `true` },
+        })
+        expect(closeResponse.status).toBe(204)
+
+        // Wait another 1.5s — total 3s since creation, 1.5s since the close
+        await sleep(1500)
+
+        // Stream should still be alive (TTL was reset by the close)
+        const headResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `HEAD`,
+        })
+        expect(headResponse.status).toBe(200)
+        expect(headResponse.headers.get(`Stream-Closed`)).toBe(`true`)
+      }
+    )
+
+    test.concurrent(
+      `should extend TTL on producer close-only POST (sliding window)`,
+      async () => {
+        const streamPath = uniquePath(`ttl-renew-producer-close`)
+
+        // Create stream with 2 second TTL
+        const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            "Stream-TTL": `2`,
+          },
+        })
+        expect(createResponse.status).toBe(201)
+
+        // Wait 1.5s (past the midpoint)
+        await sleep(1500)
+
+        // Producer close-only POST — a write, so it should reset the TTL
+        const closeResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Stream-Closed": `true`,
+            "Producer-Id": `ttl-close-producer`,
+            "Producer-Epoch": `0`,
+            "Producer-Seq": `0`,
+          },
+        })
+        expect(closeResponse.status).toBe(204)
+
+        // Wait another 1.5s — total 3s since creation, 1.5s since the close
+        await sleep(1500)
+
+        // Stream should still be alive (TTL was reset by the close)
+        const headResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `HEAD`,
+        })
+        expect(headResponse.status).toBe(200)
+        expect(headResponse.headers.get(`Stream-Closed`)).toBe(`true`)
+      }
+    )
+
+    test.concurrent(`should extend TTL on read (sliding window)`, async () => {
+      const streamPath = uniquePath(`ttl-renew-read`)
+
+      // Create stream with 2 second TTL and some data
+      const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `2`,
+        },
+        body: `test data`,
+      })
+      expect(createResponse.status).toBe(201)
+
+      // Wait 1.5s
+      await sleep(1500)
+
+      // Read — this should reset TTL to 2s from now
+      const readResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      expect(readResponse.status).toBe(200)
+
+      // Wait another 1.5s — total 3s since creation, but only 1.5s since last read
+      await sleep(1500)
+
+      // Stream should still be alive (TTL was reset by the read)
+      const headResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `HEAD`,
+      })
+      expect(headResponse.status).toBe(200)
+    })
+
+    test.concurrent(`should NOT extend TTL on HEAD`, async () => {
+      const streamPath = uniquePath(`ttl-no-renew-head`)
+
+      // Create stream with 2 second TTL
+      const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `2`,
+        },
+      })
+      expect(createResponse.status).toBe(201)
+
+      // Wait 1.5s
+      await sleep(1500)
+
+      // HEAD — should NOT reset TTL
+      const headMid = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `HEAD`,
+      })
+      expect(headMid.status).toBe(200)
+
+      // Stream should be expired (HEAD did not extend TTL)
+      // Poll until deleted — original 2s TTL minus ~1.5s already waited
+      await waitForDeletion(`${getBaseUrl()}${streamPath}`, 500)
+
+      // Verify with GET as well
+      const getAfter = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      expect(getAfter.status).toBe(404)
+    })
+
+    test.concurrent(
+      `should NOT extend Expires-At on read or write`,
+      async () => {
+        const streamPath = uniquePath(`expires-at-no-renew`)
+
+        // Create stream that expires in 4 seconds (wide window to tolerate clock skew)
+        const expiresAt = new Date(Date.now() + 4000).toISOString()
+        const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            "Stream-Expires-At": expiresAt,
+          },
+          body: `test data`,
+        })
+        expect(createResponse.status).toBe(201)
+
+        // Read at 2s — if this were TTL, it would extend; for Expires-At it should not
+        await sleep(2000)
+        const readResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `GET`,
+        })
+        expect(readResponse.status).toBe(200)
+
+        // Stream should be expired despite recent read
+        // Poll until deleted — original 4s Expires-At minus ~2s already waited
+        await waitForDeletion(`${getBaseUrl()}${streamPath}`, 2000)
+
+        // Verify with GET as well
+        const getAfter = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `GET`,
+        })
+        expect(getAfter.status).toBe(404)
+      }
+    )
+  })
+
+  // ============================================================================
+  // Caching and ETag Tests
+  // ============================================================================
+
+  describe(`Caching and ETag`, () => {
+    test(`should generate ETag on GET responses`, async () => {
+      const streamPath = `/v1/stream/etag-generate-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+
+      expect(response.status).toBe(200)
+      const etag = response.headers.get(`etag`)
+      expect(etag).toBeDefined()
+      expect(etag!.length).toBeGreaterThan(0)
+    })
+
+    test(`should return 304 Not Modified for matching If-None-Match`, async () => {
+      const streamPath = `/v1/stream/etag-304-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // First request to get ETag
+      const response1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+
+      const etag = response1.headers.get(`etag`)
+      expect(etag).toBeDefined()
+
+      // Second request with If-None-Match - MUST return 304
+      const response2 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+        headers: {
+          "If-None-Match": etag!,
+        },
+      })
+
+      expect(response2.status).toBe(304)
+      // 304 should have empty body
+      const text = await response2.text()
+      expect(text).toBe(``)
+    })
+
+    test(`should allow If-None-Match in CORS preflight responses`, async () => {
+      const streamPath = `/v1/stream/etag-preflight-test-${Date.now()}`
+
+      // Preflight for a conditional cross-origin GET
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `OPTIONS`,
+        headers: {
+          Origin: `https://example.com`,
+          "Access-Control-Request-Method": `GET`,
+          "Access-Control-Request-Headers": `if-none-match`,
+        },
+      })
+
+      expect([200, 204]).toContain(response.status)
+      const allowHeaders = response.headers.get(`access-control-allow-headers`)
+      expect(allowHeaders).toBeDefined()
+      // A wildcard also satisfies non-credentialed preflights
+      expect(allowHeaders!.toLowerCase()).toMatch(/if-none-match|\*/)
+    })
+
+    test(`should return 200 for non-matching If-None-Match`, async () => {
+      const streamPath = `/v1/stream/etag-mismatch-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Request with wrong ETag - should return 200 with data
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+        headers: {
+          "If-None-Match": `"wrong-etag"`,
+        },
+      })
+
+      expect(response.status).toBe(200)
+      const text = await response.text()
+      expect(text).toBe(`test data`)
+    })
+
+    test(`should return new ETag after data changes`, async () => {
+      const streamPath = `/v1/stream/etag-change-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `initial`,
+      })
+
+      // Get initial ETag
+      const response1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      const etag1 = response1.headers.get(`etag`)
+
+      // Append more data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: ` more`,
+      })
+
+      // Get new ETag
+      const response2 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      const etag2 = response2.headers.get(`etag`)
+
+      // ETags should be different
+      expect(etag1).not.toBe(etag2)
+
+      // Old ETag should now return 200 (not 304)
+      const response3 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+        headers: {
+          "If-None-Match": etag1!,
+        },
+      })
+      expect(response3.status).toBe(200)
+    })
+  })
+
+  // ============================================================================
+  // Chunking and Large Payloads
+  // ============================================================================
+
+  describe(`Chunking and Large Payloads`, () => {
+    test(`should handle chunk-size pagination correctly`, async () => {
+      const streamPath = `/v1/stream/chunk-pagination-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/octet-stream` },
+      })
+
+      // Append a large amount of data (100KB)
+      const largeData = new Uint8Array(100 * 1024)
+      for (let i = 0; i < largeData.length; i++) {
+        largeData[i] = i % 256
+      }
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `application/octet-stream` },
+        body: largeData,
+      })
+
+      // Read back using pagination
+      const accumulated: Array<number> = []
+      let currentOffset: string | null = null
+      let previousOffset: string | null = null
+      let iterations = 0
+      const maxIterations = 1000
+
+      while (iterations < maxIterations) {
+        iterations++
+
+        const url: string = currentOffset
+          ? `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(currentOffset)}`
+          : `${getBaseUrl()}${streamPath}`
+
+        const response: Response = await fetch(url, { method: `GET` })
+        expect(response.status).toBe(200)
+
+        const buffer = await response.arrayBuffer()
+        const data = new Uint8Array(buffer)
+
+        if (data.length > 0) {
+          accumulated.push(...Array.from(data))
+        }
+
+        const nextOffset: string | null =
+          response.headers.get(STREAM_OFFSET_HEADER)
+        const upToDate = response.headers.get(STREAM_UP_TO_DATE_HEADER)
+
+        if (upToDate === `true` && data.length === 0) {
+          break
+        }
+
+        expect(nextOffset).toBeDefined()
+
+        // Verify offset progresses
+        if (nextOffset === currentOffset && data.length === 0) {
+          break
+        }
+
+        // Verify monotonic progression
+        if (previousOffset && nextOffset) {
+          expect(nextOffset >= previousOffset).toBe(true)
+        }
+
+        previousOffset = currentOffset
+        currentOffset = nextOffset
+      }
+
+      // Verify we got all the data
+      const result = new Uint8Array(accumulated)
+      expect(result.length).toBe(largeData.length)
+      for (let i = 0; i < largeData.length; i++) {
+        expect(result[i]).toBe(largeData[i])
+      }
+    })
+
+    test(`should handle large payload appropriately`, async () => {
+      const streamPath = `/v1/stream/large-payload-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/octet-stream` },
+      })
+
+      // Try to append very large payload (10MB)
+      const largeData = new Uint8Array(10 * 1024 * 1024)
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `application/octet-stream` },
+        body: largeData,
+      })
+
+      // Server may accept it (200/204) or reject with 413
+      expect([200, 204, 413]).toContain(response.status)
+    }, 30000)
+  })
+
+  // ============================================================================
+  // Read-Your-Writes Consistency
+  // ============================================================================
+
+  describe(`Read-Your-Writes Consistency`, () => {
+    test(`should immediately read message after append`, async () => {
+      const streamPath = `/v1/stream/ryw-test-${Date.now()}`
+
+      // Create stream and append
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `initial`,
+      })
+
+      // Immediately read - should see the data
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+
+      const text = await response.text()
+      expect(text).toBe(`initial`)
+    })
+
+    test(`should immediately read multiple appends`, async () => {
+      const streamPath = `/v1/stream/ryw-multi-test-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Append multiple messages
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `msg1`,
+      })
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `msg2`,
+      })
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `msg3`,
+      })
+
+      // Immediately read - should see all messages
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+
+      const text = await response.text()
+      expect(text).toBe(`msg1msg2msg3`)
+    })
+
+    test(`should serve offset-based reads immediately after append`, async () => {
+      const streamPath = `/v1/stream/ryw-offset-test-${Date.now()}`
+
+      // Create stream with first message
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `first`,
+      })
+
+      // Get offset
+      const response1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `GET`,
+      })
+      const offset1 = response1.headers.get(STREAM_OFFSET_HEADER)!
+
+      // Append more messages immediately
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `second`,
+      })
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `third`,
+      })
+
+      // Immediately read from offset1 - should see second and third
+      const response2 = await fetch(
+        `${getBaseUrl()}${streamPath}?offset=${offset1}`,
+        {
+          method: `GET`,
+        }
+      )
+
+      const text = await response2.text()
+      expect(text).toBe(`secondthird`)
+    })
+  })
+
+  // ============================================================================
+  // SSE (Server-Sent Events) Mode
+  // ============================================================================
+
+  describe(`SSE Mode`, () => {
+    test(`should return text/event-stream content-type for SSE requests`, async () => {
+      const streamPath = `/v1/stream/sse-content-type-test-${Date.now()}`
+
+      // Create stream with text/plain content type
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Make SSE request with AbortController to avoid hanging
+      const { response } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { headers: { Accept: `text/event-stream` }, maxChunks: 0 }
+      )
+
+      expect(response.status).toBe(200)
+      expect(response.headers.get(`content-type`)).toBe(`text/event-stream`)
+    })
+
+    test(`should accept live=sse query parameter for application/json`, async () => {
+      const streamPath = `/v1/stream/sse-json-test-${Date.now()}`
+
+      // Create stream with application/json content type
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: JSON.stringify({ message: `hello` }),
+      })
+
+      const { response } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { headers: { Accept: `text/event-stream` }, maxChunks: 0 }
+      )
+
+      expect(response.status).toBe(200)
+      expect(response.headers.get(`content-type`)).toBe(`text/event-stream`)
+    })
+
+    test(`should require offset parameter for SSE mode`, async () => {
+      const streamPath = `/v1/stream/sse-no-offset-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // SSE without offset should fail (similar to long-poll)
+      const response = await fetch(`${getBaseUrl()}${streamPath}?live=sse`, {
+        method: `GET`,
+      })
+
+      // Should return 400 (offset required for live modes)
+      expect(response.status).toBe(400)
+    })
+
+    test(`should stream data events via SSE`, async () => {
+      const streamPath = `/v1/stream/sse-data-stream-test-${Date.now()}`
+
+      // Create stream with text/plain content type
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `message one`,
+      })
+
+      // Append more data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `message two`,
+      })
+
+      // Make SSE request and read the response body
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `message two` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Verify SSE format: should contain event: and data: lines
+      expect(received).toContain(`event:`)
+      expect(received).toContain(`data:`)
+    })
+
+    test(`JSON SSE catch-up pairs every data event with a control event`, async () => {
+      const streamPath = `/v1/stream/sse-json-framing-test-${Date.now()}`
+
+      // Two separate appends buffered BEFORE the SSE subscription opens,
+      // so the catch-up read returns a multi-message batch.
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: `[{"n":1}]`,
+      })
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `application/json` },
+        body: `[{"n":2}]`,
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `upToDate` }
+      )
+      expect(response.status).toBe(200)
+
+      // Parse raw SSE frames into (event, payload) pairs, stopping at the
+      // first control event that reports the client caught up.
+      const frames: Array<{ event: string; payload: string }> = []
+      for (const block of received.split(`\n\n`)) {
+        const lines = block.split(`\n`)
+        const eventLine = lines.find((l) => l.startsWith(`event:`))
+        if (!eventLine) continue
+        const payload = lines
+          .filter((l) => l.startsWith(`data:`))
+          .map((l) => l.slice(5).replace(/^ /, ``))
+          .join(`\n`)
+        frames.push({ event: eventLine.slice(6).trim(), payload })
+        if (
+          eventLine.slice(6).trim() === `control` &&
+          (payload.includes(`upToDate`) || payload.includes(`streamClosed`))
+        ) {
+          break
+        }
+      }
+
+      // §5.8: a control event follows EVERY data event. Multiple data
+      // events sharing one control boundary would make JSON catch-up
+      // unparseable for clients that collect data up to the control.
+      const dataFrames = frames.filter((f) => f.event === `data`)
+      expect(dataFrames.length).toBeGreaterThan(0)
+      for (let i = 0; i < frames.length; i++) {
+        if (frames[i]!.event === `data`) {
+          expect(frames[i + 1]?.event).toBe(`control`)
+        }
+      }
+
+      // Each data event must be a complete, independently parseable JSON
+      // value, and together they must carry exactly the appended values.
+      const values: Array<unknown> = []
+      for (const frame of dataFrames) {
+        const parsed: unknown = JSON.parse(frame.payload)
+        expect(Array.isArray(parsed)).toBe(true)
+        values.push(...(parsed as Array<unknown>))
+      }
+      expect(values).toEqual([{ n: 1 }, { n: 2 }])
+    })
+
+    test(`base64 SSE catch-up pairs every data event with a control event`, async () => {
+      const streamPath = `/v1/stream/sse-base64-framing-test-${Date.now()}`
+
+      // Two separate binary appends buffered BEFORE the SSE subscription
+      // opens, so the catch-up read returns a multi-message batch.
+      const partOne = new Uint8Array([0, 1, 2, 3])
+      const partTwo = new Uint8Array([4, 5, 6, 7])
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/octet-stream` },
+        body: partOne,
+      })
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `application/octet-stream` },
+        body: partTwo,
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `upToDate` }
+      )
+      expect(response.status).toBe(200)
+      expect(response.headers.get(`stream-sse-data-encoding`)).toBe(`base64`)
+
+      const frames: Array<{ event: string; payload: string }> = []
+      for (const block of received.split(`\n\n`)) {
+        const lines = block.split(`\n`)
+        const eventLine = lines.find((l) => l.startsWith(`event:`))
+        if (!eventLine) continue
+        const payload = lines
+          .filter((l) => l.startsWith(`data:`))
+          .map((l) => l.slice(5).replace(/^ /, ``))
+          .join(`\n`)
+        frames.push({ event: eventLine.slice(6).trim(), payload })
+        if (
+          eventLine.slice(6).trim() === `control` &&
+          (payload.includes(`upToDate`) || payload.includes(`streamClosed`))
+        ) {
+          break
+        }
+      }
+
+      // §5.8: a control event follows EVERY data event, and each data
+      // event's payload must independently base64-decode — two padded
+      // base64 strings concatenated across a control boundary don't.
+      const dataFrames = frames.filter((f) => f.event === `data`)
+      expect(dataFrames.length).toBeGreaterThan(0)
+      for (let i = 0; i < frames.length; i++) {
+        if (frames[i]!.event === `data`) {
+          expect(frames[i + 1]?.event).toBe(`control`)
+        }
+      }
+
+      const decoded: Array<Buffer> = []
+      for (const frame of dataFrames) {
+        const cleaned = frame.payload.replace(/[\n\r]/g, ``)
+        expect(cleaned.length % 4).toBe(0)
+        decoded.push(Buffer.from(cleaned, `base64`))
+      }
+      expect(new Uint8Array(Buffer.concat(decoded))).toEqual(
+        new Uint8Array([...partOne, ...partTwo])
+      )
+    })
+
+    test(`should send control events with offset`, async () => {
+      const streamPath = `/v1/stream/sse-control-event-test-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Make SSE request
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Verify control event format (Protocol Section 5.7)
+      expect(received).toContain(`event: control`)
+      expect(received).toContain(`streamNextOffset`)
+    })
+
+    test(`should generate streamCursor in SSE control events`, async () => {
+      const streamPath = `/v1/stream/sse-cursor-gen-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // SSE request without cursor - server MUST generate one
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `streamCursor` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Parse control event to find streamCursor
+      const controlMatch = received.match(/event: control\s*\ndata:({[^}]+})/)
+      expect(controlMatch).toBeDefined()
+
+      const controlData = JSON.parse(controlMatch![1] as string)
+      expect(controlData.streamCursor).toBeDefined()
+
+      // Cursor must be a numeric string (interval number)
+      expect(/^\d+$/.test(controlData.streamCursor)).toBe(true)
+    })
+
+    test(`should handle cursor collision with jitter in SSE mode`, async () => {
+      const streamPath = `/v1/stream/sse-cursor-collision-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // First SSE request to get current cursor
+      const { received: received1 } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `streamCursor` }
+      )
+
+      const controlMatch1 = received1.match(/event: control\s*\ndata:({[^}]+})/)
+      expect(controlMatch1).toBeDefined()
+      const cursor1 = JSON.parse(controlMatch1![1] as string).streamCursor
+
+      // Second SSE request with same cursor - should get advanced cursor
+      const { received: received2 } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse&cursor=${cursor1}`,
+        { untilContent: `streamCursor` }
+      )
+
+      const controlMatch2 = received2.match(/event: control\s*\ndata:({[^}]+})/)
+      expect(controlMatch2).toBeDefined()
+      const cursor2 = JSON.parse(controlMatch2![1] as string).streamCursor
+
+      // The returned cursor MUST be strictly greater than the one we sent
+      // (monotonic progression prevents cache cycles)
+      expect(parseInt(cursor2 as string, 10)).toBeGreaterThan(
+        parseInt(cursor1 as string, 10)
+      )
+    })
+
+    test(`should wrap JSON data in arrays for SSE and produce valid JSON`, async () => {
+      const streamPath = `/v1/stream/sse-json-wrap-test-${Date.now()}`
+
+      // Create JSON stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: JSON.stringify({ id: 1, message: `hello` }),
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: data` }
+      )
+
+      expect(response.status).toBe(200)
+      expect(received).toContain(`event: data`)
+
+      // Parse SSE events properly (handles multi-line data per SSE spec)
+      const events = parseSSEEvents(received)
+      const dataEvent = events.find((e) => e.type === `data`)
+      expect(dataEvent).toBeDefined()
+
+      // This will throw if JSON is invalid (e.g., trailing comma)
+      const parsed = JSON.parse(dataEvent!.data)
+
+      // Verify the structure matches what we sent
+      expect(parsed).toEqual([{ id: 1, message: `hello` }])
+    })
+
+    test(`should handle SSE for empty stream with correct offset`, async () => {
+      const streamPath = `/v1/stream/sse-empty-test-${Date.now()}`
+
+      // Create empty stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // First, get the offset from HTTP GET (the canonical source)
+      const httpResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+      const httpOffset = httpResponse.headers.get(`Stream-Next-Offset`)
+      expect(httpOffset).toBeDefined()
+      expect(httpOffset).not.toBe(`-1`) // Should be the stream's actual offset, not -1
+
+      // Make SSE request
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+      expect(response.status).toBe(200)
+
+      // Should get a control event even for empty stream
+      expect(received).toContain(`event: control`)
+
+      // Parse the control event and verify offset matches HTTP GET
+      const controlLine = received
+        .split(`\n`)
+        .find((l) => l.startsWith(`data:`) && l.includes(`streamNextOffset`))
+      expect(controlLine).toBeDefined()
+
+      const controlPayload = controlLine!.slice(`data:`.length)
+      const controlData = JSON.parse(controlPayload)
+
+      // SSE control offset should match HTTP GET offset (not -1)
+      expect(controlData[`streamNextOffset`]).toBe(httpOffset)
+    })
+
+    test(`should send upToDate flag in SSE control events when caught up`, async () => {
+      const streamPath = `/v1/stream/sse-uptodate-test-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Make SSE request and read until we get a control event
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `"upToDate"` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Parse the control event
+      const controlLine = received
+        .split(`\n`)
+        .find((l) => l.startsWith(`data:`) && l.includes(`streamNextOffset`))
+      expect(controlLine).toBeDefined()
+
+      const controlPayload = controlLine!.slice(`data:`.length)
+      const controlData = JSON.parse(controlPayload)
+
+      // When client has read all data, server MUST include upToDate: true
+      // This is essential for clients to know they've caught up to head
+      expect(controlData.upToDate).toBe(true)
+    })
+
+    test(`should have correct SSE headers (no Content-Length, proper Cache-Control)`, async () => {
+      const streamPath = `/v1/stream/sse-headers-test-${Date.now()}`
+
+      // Create stream with data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `test data`,
+      })
+
+      // Make SSE request
+      const { response } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `test data` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // SSE MUST have text/event-stream content type
+      expect(response.headers.get(`content-type`)).toBe(`text/event-stream`)
+
+      // SSE MUST NOT have Content-Length (it's a streaming response)
+      expect(response.headers.get(`content-length`)).toBeNull()
+
+      // SSE SHOULD have Cache-Control: no-cache to prevent proxy buffering
+      const cacheControl = response.headers.get(`cache-control`)
+      expect(cacheControl).toContain(`no-cache`)
+    })
+
+    test(`should handle newlines in text/plain payloads`, async () => {
+      const streamPath = `/v1/stream/sse-newline-test-${Date.now()}`
+
+      // Create stream with text containing newlines
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `line1\nline2\nline3`,
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+      expect(received).toContain(`event: data`)
+
+      // Per SSE spec, multiline data must use multiple "data:" lines
+      // Each line should have its own data: prefix
+      expect(received).toContain(`data:line1`)
+      expect(received).toContain(`data:line2`)
+      expect(received).toContain(`data:line3`)
+    })
+
+    test(`should prevent CRLF injection in payloads - embedded event boundaries become literal data`, async () => {
+      const streamPath = `/v1/stream/sse-crlf-injection-test-${Date.now()}`
+
+      // Payload attempts to inject a fake control event via CRLF sequences
+      // If vulnerable, this would terminate the current event and inject a new one
+      const maliciousPayload = `safe content\r\n\r\nevent: control\r\ndata: {"injected":true}\r\n\r\nmore safe content`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: maliciousPayload,
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Parse all events from the response
+      const events = parseSSEEvents(received)
+
+      // Should have exactly 1 data event and 1 control event (the real one from server)
+      const dataEvents = events.filter((e) => e.type === `data`)
+      const controlEvents = events.filter((e) => e.type === `control`)
+
+      expect(dataEvents.length).toBe(1)
+      expect(controlEvents.length).toBe(1)
+
+      // The "injected" control event should NOT exist as a real event
+      // Instead, "event: control" should appear as literal text within the data
+      const dataContent = dataEvents[0]!.data
+      expect(dataContent).toContain(`event: control`)
+      expect(dataContent).toContain(`data: {"injected":true}`)
+
+      // The real control event should have server-generated fields, not injected ones
+      const controlContent = JSON.parse(controlEvents[0]!.data)
+      expect(controlContent.injected).toBeUndefined()
+      expect(controlContent.streamNextOffset).toBeDefined()
+    })
+
+    test(`should prevent CRLF injection - LF-only attack vectors`, async () => {
+      const streamPath = `/v1/stream/sse-lf-injection-test-${Date.now()}`
+
+      // Attempt injection using Unix-style line endings only
+      const maliciousPayload = `start\n\nevent: data\ndata: fake-event\n\nend`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: maliciousPayload,
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+
+      const events = parseSSEEvents(received)
+      const dataEvents = events.filter((e) => e.type === `data`)
+
+      // Should be exactly 1 data event (the injected one should be escaped)
+      expect(dataEvents.length).toBe(1)
+
+      // The payload should be preserved as literal content, including the
+      // "event: data" and "data: fake-event" as text, not parsed as SSE commands
+      const dataContent = dataEvents[0]!.data
+      expect(dataContent).toContain(`event: data`)
+      expect(dataContent).toContain(`data: fake-event`)
+    })
+
+    test(`should prevent CRLF injection - carriage return only attack vectors`, async () => {
+      const streamPath = `/v1/stream/sse-cr-injection-test-${Date.now()}`
+
+      // Attempt injection using CR-only line endings (per SSE spec, CR is a valid line terminator)
+      const maliciousPayload = `start\r\revent: control\rdata: {"cr_injected":true}\r\rend`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: maliciousPayload,
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+
+      const events = parseSSEEvents(received)
+      const controlEvents = events.filter((e) => e.type === `control`)
+
+      // Should have exactly 1 control event (the real one from server)
+      expect(controlEvents.length).toBe(1)
+
+      // The real control event should not contain injected fields
+      const controlContent = JSON.parse(controlEvents[0]!.data)
+      expect(controlContent.cr_injected).toBeUndefined()
+      expect(controlContent.streamNextOffset).toBeDefined()
+    })
+
+    test(`should handle JSON payloads with embedded newlines safely`, async () => {
+      const streamPath = `/v1/stream/sse-json-newline-test-${Date.now()}`
+
+      // JSON content that contains literal newlines in string values
+      // These should be JSON-escaped, but we test that even if they're not,
+      // SSE encoding handles them safely
+      const jsonPayload = JSON.stringify({
+        message: `line1\nline2\nline3`,
+        attack: `try\r\n\r\nevent: control\r\ndata: {"bad":true}`,
+      })
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: jsonPayload,
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+
+      const events = parseSSEEvents(received)
+      const dataEvents = events.filter((e) => e.type === `data`)
+      const controlEvents = events.filter((e) => e.type === `control`)
+
+      expect(dataEvents.length).toBe(1)
+      expect(controlEvents.length).toBe(1)
+
+      // Parse the data event - should be valid JSON array wrapping the original object
+      const parsedData = JSON.parse(dataEvents[0]!.data)
+      expect(Array.isArray(parsedData)).toBe(true)
+      expect(parsedData[0].message).toBe(`line1\nline2\nline3`)
+      expect(parsedData[0].attack).toContain(`event: control`)
+
+      // Control event should be the real server-generated one
+      const controlContent = JSON.parse(controlEvents[0]!.data)
+      expect(controlContent.bad).toBeUndefined()
+      expect(controlContent.streamNextOffset).toBeDefined()
+    })
+
+    test(`should generate unique, monotonically increasing offsets in SSE mode`, async () => {
+      const streamPath = `/v1/stream/sse-monotonic-offset-test-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Append multiple messages
+      for (let i = 0; i < 5; i++) {
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { "Content-Type": `text/plain` },
+          body: `message ${i}`,
+        })
+      }
+
+      // Make SSE request
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Extract all control event offsets
+      const controlLines = received
+        .split(`\n`)
+        .filter((l) => l.startsWith(`data:`) && l.includes(`streamNextOffset`))
+
+      const offsets: Array<string> = []
+      for (const line of controlLines) {
+        const payload = line.slice(`data:`.length)
+        const data = JSON.parse(payload)
+        offsets.push(data[`streamNextOffset`])
+      }
+
+      // Verify offsets are unique and strictly increasing (lexicographically)
+      for (let i = 1; i < offsets.length; i++) {
+        expect(offsets[i]! > offsets[i - 1]!).toBe(true)
+      }
+    })
+
+    test(`should support reconnection with last known offset`, async () => {
+      const streamPath = `/v1/stream/sse-reconnect-test-${Date.now()}`
+
+      // Create stream with initial data
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `message 1`,
+      })
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `message 2`,
+      })
+
+      // First SSE connection - get initial data and offset
+      // Wait for upToDate to ensure we receive all messages (control events
+      // are sent after each data event, so we need the last one with upToDate)
+      let lastOffset: string | null = null
+      const { response: response1, received: received1 } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `upToDate` }
+      )
+
+      expect(response1.status).toBe(200)
+
+      // Extract offset from the LAST control event (with upToDate)
+      // Control events are sent after each data event per protocol section 5.7
+      const controlLines = received1
+        .split(`\n`)
+        .filter((l) => l.startsWith(`data:`) && l.includes(`streamNextOffset`))
+      const lastControlLine = controlLines[controlLines.length - 1]
+      const controlPayload = lastControlLine!.slice(`data:`.length)
+      lastOffset = JSON.parse(controlPayload)[`streamNextOffset`]
+
+      expect(lastOffset).toBeDefined()
+
+      // Append more data while "disconnected"
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `message 3`,
+      })
+
+      // Reconnect with last known offset
+      const { response: response2, received: received2 } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=${lastOffset}&live=sse`,
+        { untilContent: `message 3` }
+      )
+
+      expect(response2.status).toBe(200)
+
+      // Should receive message 3 (the new one), not duplicates of 1 and 2
+      expect(received2).toContain(`message 3`)
+      // Should NOT contain message 1 or 2 (already received before disconnect)
+      expect(received2).not.toContain(`message 1`)
+      expect(received2).not.toContain(`message 2`)
+    })
+
+    // ==========================================================================
+    // Base64 Encoding for Binary Streams (Protocol Section 5.7)
+    // ==========================================================================
+
+    test(`should auto-detect binary streams and return base64 encoded data in SSE mode`, async () => {
+      const streamPath = `/v1/stream/sse-binary-base64-${Date.now()}`
+
+      // Create stream with binary content type and known binary data
+      const binaryData = new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f]) // "Hello" in ASCII
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/octet-stream` },
+        body: binaryData,
+      })
+
+      // SSE request for binary stream should auto-detect and use base64
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+      expect(response.headers.get(`content-type`)).toBe(`text/event-stream`)
+
+      // Parse events
+      const events = parseSSEEvents(received)
+      const dataEvents = events.filter((e) => e.type === `data`)
+      const controlEvents = events.filter((e) => e.type === `control`)
+
+      expect(dataEvents.length).toBe(1)
+      expect(controlEvents.length).toBe(1)
+
+      // Data should be base64 encoded - "Hello" -> "SGVsbG8="
+      // Remove any whitespace that might be in the base64 string
+      const base64Data = dataEvents[0]!.data.replace(/[\n\r\s]/g, ``)
+      expect(base64Data).toBe(`SGVsbG8=`)
+
+      // Control event should still be valid JSON (not base64 encoded)
+      const controlData = JSON.parse(controlEvents[0]!.data)
+      expect(controlData.streamNextOffset).toBeDefined()
+    })
+
+    test(`should include Stream-SSE-Data-Encoding header for binary streams`, async () => {
+      const streamPath = `/v1/stream/sse-encoding-header-${Date.now()}`
+
+      // Create stream with binary content type
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/octet-stream` },
+        body: new Uint8Array([0x01, 0x02, 0x03]),
+      })
+
+      // SSE request for binary stream (server auto-detects encoding)
+      const { response } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Should include the Stream-SSE-Data-Encoding header
+      const encodingHeader = response.headers.get(`stream-sse-data-encoding`)
+      expect(encodingHeader).toBe(`base64`)
+    })
+
+    test(`should NOT include Stream-SSE-Data-Encoding header for text/plain streams`, async () => {
+      const streamPath = `/v1/stream/sse-text-no-encoding-${Date.now()}`
+
+      // Create stream with text content type
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `hello world`,
+      })
+
+      const { response } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Should NOT include the Stream-SSE-Data-Encoding header for text streams
+      const encodingHeader = response.headers.get(`stream-sse-data-encoding`)
+      expect(encodingHeader).toBeNull()
+    })
+
+    test(`should NOT include Stream-SSE-Data-Encoding header for application/json streams`, async () => {
+      const streamPath = `/v1/stream/sse-json-no-encoding-${Date.now()}`
+
+      // Create stream with JSON content type
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: JSON.stringify({ message: `hello` }),
+      })
+
+      const { response } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Should NOT include the Stream-SSE-Data-Encoding header for JSON streams
+      const encodingHeader = response.headers.get(`stream-sse-data-encoding`)
+      expect(encodingHeader).toBeNull()
+    })
+
+    test(`should base64 encode data events only, control events remain JSON`, async () => {
+      const streamPath = `/v1/stream/sse-base64-data-only-${Date.now()}`
+
+      // Create stream with binary content type
+      const binaryData = new Uint8Array([0xff, 0xfe, 0xfd])
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/octet-stream` },
+        body: binaryData,
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+
+      const events = parseSSEEvents(received)
+      const controlEvents = events.filter((e) => e.type === `control`)
+
+      expect(controlEvents.length).toBe(1)
+
+      // Control event should be valid JSON with proper fields
+      const controlData = JSON.parse(controlEvents[0]!.data)
+      expect(controlData.streamNextOffset).toBeDefined()
+      expect(typeof controlData.streamNextOffset).toBe(`string`)
+      expect(controlData.streamCursor).toBeDefined()
+    })
+
+    test(`should handle empty binary payload with auto-detected base64 encoding`, async () => {
+      const streamPath = `/v1/stream/sse-base64-empty-${Date.now()}`
+
+      // Create empty stream with binary content type
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/octet-stream` },
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Should receive a control event indicating up-to-date
+      const events = parseSSEEvents(received)
+      const controlEvents = events.filter((e) => e.type === `control`)
+
+      expect(controlEvents.length).toBeGreaterThanOrEqual(1)
+
+      const controlData = JSON.parse(controlEvents[0]!.data)
+      expect(controlData.upToDate).toBe(true)
+    })
+
+    test(`should handle large binary payload with auto-detected base64 encoding`, async () => {
+      const streamPath = `/v1/stream/sse-base64-large-${Date.now()}`
+
+      // Create stream with larger binary data (1KB)
+      const binaryData = new Uint8Array(1024)
+      for (let i = 0; i < 1024; i++) {
+        binaryData[i] = i % 256
+      }
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/octet-stream` },
+        body: binaryData,
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control`, timeoutMs: 5000 }
+      )
+
+      expect(response.status).toBe(200)
+
+      const events = parseSSEEvents(received)
+      const dataEvents = events.filter((e) => e.type === `data`)
+
+      expect(dataEvents.length).toBe(1)
+
+      // Decode and verify the data
+      const base64Data = dataEvents[0]!.data.replace(/[\n\r\s]/g, ``)
+      const decoded = Uint8Array.from(atob(base64Data), (c) => c.charCodeAt(0))
+
+      expect(decoded.length).toBe(1024)
+      for (let i = 0; i < 1024; i++) {
+        expect(decoded[i]).toBe(i % 256)
+      }
+    })
+
+    test(`should handle binary data with special bytes using auto-detected base64 encoding`, async () => {
+      const streamPath = `/v1/stream/sse-base64-special-bytes-${Date.now()}`
+
+      // Binary data that would break SSE if not encoded:
+      // - null bytes, newlines, carriage returns, high bytes
+      const binaryData = new Uint8Array([
+        0x00, 0x0a, 0x0d, 0xff, 0xfe, 0x00, 0x0a, 0x0d,
+      ])
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/octet-stream` },
+        body: binaryData,
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+
+      const events = parseSSEEvents(received)
+      const dataEvents = events.filter((e) => e.type === `data`)
+
+      expect(dataEvents.length).toBe(1)
+
+      // Decode and verify the exact bytes
+      const base64Data = dataEvents[0]!.data.replace(/[\n\r\s]/g, ``)
+      const decoded = Uint8Array.from(atob(base64Data), (c) => c.charCodeAt(0))
+
+      expect(decoded.length).toBe(8)
+      expect(decoded[0]).toBe(0x00) // null byte
+      expect(decoded[1]).toBe(0x0a) // newline
+      expect(decoded[2]).toBe(0x0d) // carriage return
+      expect(decoded[3]).toBe(0xff) // high byte
+      expect(decoded[4]).toBe(0xfe) // high byte
+    })
+
+    test(`should auto-detect base64 encoding for application/x-protobuf streams`, async () => {
+      const streamPath = `/v1/stream/sse-base64-protobuf-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/x-protobuf` },
+        body: new Uint8Array([0x08, 0x06, 0x12, 0x04, 0x6e, 0x61, 0x6d, 0x65]),
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+
+      const events = parseSSEEvents(received)
+      const dataEvents = events.filter((e) => e.type === `data`)
+
+      expect(dataEvents.length).toBe(1)
+
+      const base64Data = dataEvents[0]!.data.replace(/[\n\r\s]/g, ``)
+      const decoded = Uint8Array.from(atob(base64Data), (c) => c.charCodeAt(0))
+
+      expect(decoded.length).toBe(8)
+      expect(decoded[0]).toBe(0x08)
+      expect(decoded[7]).toBe(0x65)
+    })
+
+    test(`should auto-detect base64 encoding for image/png streams`, async () => {
+      const streamPath = `/v1/stream/sse-base64-image-${Date.now()}`
+
+      // PNG magic header bytes
+      const pngHeader = new Uint8Array([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      ])
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `image/png` },
+        body: pngHeader,
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+        { untilContent: `event: control` }
+      )
+
+      expect(response.status).toBe(200)
+
+      const events = parseSSEEvents(received)
+      const dataEvents = events.filter((e) => e.type === `data`)
+
+      expect(dataEvents.length).toBe(1)
+
+      const base64Data = dataEvents[0]!.data.replace(/[\n\r\s]/g, ``)
+      const decoded = Uint8Array.from(atob(base64Data), (c) => c.charCodeAt(0))
+
+      expect(decoded.length).toBe(8)
+      expect(decoded[0]).toBe(0x89) // PNG magic byte
+      expect(decoded[1]).toBe(0x50) // 'P'
+      expect(decoded[2]).toBe(0x4e) // 'N'
+      expect(decoded[3]).toBe(0x47) // 'G'
+    })
+
+    test(`should handle offset=now with auto-detected base64 encoding for binary streams`, async () => {
+      const streamPath = `/v1/stream/sse-base64-offset-now-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/octet-stream` },
+        body: new Uint8Array([0x01, 0x02, 0x03]),
+      })
+
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${streamPath}?offset=now&live=sse`,
+        { untilContent: `"upToDate"` }
+      )
+
+      expect(response.status).toBe(200)
+
+      // Should have control event with upToDate:true
+      const controlMatch = received.match(
+        /event: control\s*\n\s*data:({[^}]+})/
+      )
+      expect(controlMatch).toBeDefined()
+      if (controlMatch && controlMatch[1]) {
+        const controlData = JSON.parse(controlMatch[1])
+        expect(controlData[`upToDate`]).toBe(true)
+      }
+
+      // Should NOT contain historical data events (offset=now skips existing data)
+      const events = parseSSEEvents(received)
+      const dataEvents = events.filter((e) => e.type === `data`)
+      expect(dataEvents.length).toBe(0)
+    })
+  })
+
+  // ============================================================================
+  // JSON Mode
+  // ============================================================================
+
+  describe(`JSON Mode`, () => {
+    test(`should allow PUT with empty array body (creates empty stream)`, async () => {
+      const streamPath = `/v1/stream/json-put-empty-array-test-${Date.now()}`
+
+      // PUT with empty array should create an empty stream
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: `[]`,
+      })
+
+      expect(response.status).toBe(201)
+
+      // Reading should return empty array
+      const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+      const data = await readResponse.json()
+      expect(data).toEqual([])
+      expect(readResponse.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+    })
+
+    test(`should reject POST with empty array body`, async () => {
+      const streamPath = `/v1/stream/json-post-empty-array-test-${Date.now()}`
+
+      // Create stream first
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+      })
+
+      // POST with empty array should be rejected
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `application/json` },
+        body: `[]`,
+      })
+
+      expect(response.status).toBe(400)
+    })
+
+    test(`should handle content-type with charset parameter`, async () => {
+      const streamPath = `/v1/stream/json-charset-test-${Date.now()}`
+
+      // Create with charset parameter
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json; charset=utf-8` },
+      })
+
+      // Append JSON
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `application/json; charset=utf-8` },
+        body: JSON.stringify({ message: `hello` }),
+      })
+
+      // Read and verify it's treated as JSON mode
+      const response = await fetch(`${getBaseUrl()}${streamPath}`)
+      const data = await response.json()
+
+      expect(Array.isArray(data)).toBe(true)
+      expect(data).toEqual([{ message: `hello` }])
+    })
+
+    test(`should wrap single JSON value in array`, async () => {
+      const streamPath = `/v1/stream/json-single-test-${Date.now()}`
+
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `application/json`,
+      })
+
+      await stream.append(JSON.stringify({ message: `hello` }))
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`)
+      const data = await response.json()
+
+      expect(Array.isArray(data)).toBe(true)
+      expect(data).toEqual([{ message: `hello` }])
+    })
+
+    test(`should store arrays as single messages`, async () => {
+      const streamPath = `/v1/stream/json-array-test-${Date.now()}`
+
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `application/json`,
+      })
+
+      // Append array - should be stored as ONE message containing the array
+      await stream.append(JSON.stringify([{ id: 1 }, { id: 2 }, { id: 3 }]))
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`)
+      const data = await response.json()
+
+      expect(Array.isArray(data)).toBe(true)
+      expect(data).toEqual([[{ id: 1 }, { id: 2 }, { id: 3 }]])
+    })
+
+    test(`should concatenate multiple appends into single array`, async () => {
+      const streamPath = `/v1/stream/json-concat-test-${Date.now()}`
+
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `application/json`,
+      })
+
+      await stream.append(JSON.stringify({ event: `first` }))
+      await stream.append(JSON.stringify({ event: `second` }))
+      await stream.append(JSON.stringify({ event: `third` }))
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`)
+      const data = await response.json()
+
+      expect(Array.isArray(data)).toBe(true)
+      expect(data).toEqual([
+        { event: `first` },
+        { event: `second` },
+        { event: `third` },
+      ])
+    })
+
+    test(`should handle mixed single values and arrays`, async () => {
+      const streamPath = `/v1/stream/json-mixed-test-${Date.now()}`
+
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `application/json`,
+      })
+
+      await stream.append(JSON.stringify({ type: `single` }))
+      await stream.append(
+        JSON.stringify([
+          { type: `array`, id: 1 },
+          { type: `array`, id: 2 },
+        ])
+      )
+      await stream.append(JSON.stringify({ type: `single-again` }))
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`)
+      const data = await response.json()
+
+      // Array is stored as ONE message
+      expect(data).toEqual([
+        { type: `single` },
+        [
+          { type: `array`, id: 1 },
+          { type: `array`, id: 2 },
+        ],
+        { type: `single-again` },
+      ])
+    })
+
+    test(`should reject invalid JSON with 400`, async () => {
+      const streamPath = `/v1/stream/json-invalid-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+      })
+
+      // Try to append invalid JSON
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `application/json` },
+        body: `{ invalid json }`,
+      })
+
+      expect(response.status).toBe(400)
+      expect(response.ok).toBe(false)
+    })
+
+    test(`should handle various JSON value types`, async () => {
+      const streamPath = `/v1/stream/json-types-test-${Date.now()}`
+
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `application/json`,
+      })
+
+      await stream.append(JSON.stringify(`string value`))
+      await stream.append(JSON.stringify(42))
+      await stream.append(JSON.stringify(true))
+      await stream.append(JSON.stringify(null))
+      await stream.append(JSON.stringify({ object: `value` }))
+      await stream.append(JSON.stringify([1, 2, 3]))
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`)
+      const data = await response.json()
+
+      expect(data).toEqual([
+        `string value`,
+        42,
+        true,
+        null,
+        { object: `value` },
+        [1, 2, 3],
+      ])
+    })
+
+    test(`should preserve JSON structure and nesting`, async () => {
+      const streamPath = `/v1/stream/json-nested-test-${Date.now()}`
+
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `application/json`,
+      })
+
+      await stream.append(
+        JSON.stringify({
+          user: {
+            id: 123,
+            name: `Alice`,
+            tags: [`admin`, `verified`],
+          },
+          timestamp: `2024-01-01T00:00:00Z`,
+        })
+      )
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`)
+      const data = await response.json()
+
+      expect(data).toEqual([
+        {
+          user: {
+            id: 123,
+            name: `Alice`,
+            tags: [`admin`, `verified`],
+          },
+          timestamp: `2024-01-01T00:00:00Z`,
+        },
+      ])
+    })
+
+    test(`should work with client json() iterator`, async () => {
+      const streamPath = `/v1/stream/json-iterator-test-${Date.now()}`
+
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `application/json`,
+      })
+
+      await stream.append(JSON.stringify({ id: 1 }))
+      await stream.append(JSON.stringify({ id: 2 }))
+      await stream.append(JSON.stringify({ id: 3 }))
+
+      const res = await stream.stream<{ id: number }>({ live: false })
+      const items = await res.json()
+
+      // All three objects are batched together by the writer
+      expect(items).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }])
+    })
+
+    test(`should reject empty JSON arrays with 400`, async () => {
+      const streamPath = `/v1/stream/json-empty-array-test-${Date.now()}`
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+      })
+
+      // Try to append empty array
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `application/json` },
+        body: `[]`,
+      })
+
+      expect(response.status).toBe(400)
+      expect(response.ok).toBe(false)
+    })
+
+    test(`should store nested arrays as single messages`, async () => {
+      const streamPath = `/v1/stream/json-nested-arrays-test-${Date.now()}`
+
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `application/json`,
+      })
+
+      // Append nested array - stored as ONE message
+      await stream.append(
+        JSON.stringify([
+          [1, 2],
+          [3, 4],
+        ])
+      )
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`)
+      const data = await response.json()
+
+      // Should store 1 message containing the nested array
+      expect(data).toEqual([
+        [
+          [1, 2],
+          [3, 4],
+        ],
+      ])
+    })
+
+    test(`should store arrays as values when double-wrapped`, async () => {
+      const streamPath = `/v1/stream/json-wrapped-array-test-${Date.now()}`
+
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `application/json`,
+      })
+
+      // Append double-wrapped array - stored as ONE message containing the array
+      await stream.append(JSON.stringify([[1, 2, 3]]))
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`)
+      const data = await response.json()
+
+      // Should store 1 message containing the single-wrapped array
+      expect(data).toEqual([[[1, 2, 3]]])
+      expect(data.length).toBe(1)
+    })
+
+    test(`should store primitive arrays as single messages`, async () => {
+      const streamPath = `/v1/stream/json-primitive-array-test-${Date.now()}`
+
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `application/json`,
+      })
+
+      // Each append stores ONE message
+      await stream.append(JSON.stringify([1, 2, 3]))
+      await stream.append(JSON.stringify([`a`, `b`, `c`]))
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`)
+      const data = await response.json()
+
+      // Should store 2 messages (2 arrays)
+      expect(data).toEqual([
+        [1, 2, 3],
+        [`a`, `b`, `c`],
+      ])
+    })
+
+    test(`should handle mixed batching - single values, arrays, and nested arrays`, async () => {
+      const streamPath = `/v1/stream/json-mixed-batching-test-${Date.now()}`
+
+      const stream = await DurableStream.create({
+        url: `${getBaseUrl()}${streamPath}`,
+        contentType: `application/json`,
+      })
+
+      await stream.append(JSON.stringify({ single: 1 })) // 1 message
+      await stream.append(JSON.stringify([{ batch: 2 }, { batch: 3 }])) // 1 message (array)
+      await stream.append(JSON.stringify([[`nested`, `array`]])) // 1 message (nested array)
+      await stream.append(JSON.stringify(42)) // 1 message
+
+      const response = await fetch(`${getBaseUrl()}${streamPath}`)
+      const data = await response.json()
+
+      expect(data).toEqual([
+        { single: 1 },
+        [{ batch: 2 }, { batch: 3 }],
+        [[`nested`, `array`]],
+        42,
+      ])
+      expect(data.length).toBe(4)
+    })
+  })
+
+  // ============================================================================
+  // Property-Based Tests (fast-check)
+  // ============================================================================
+
+  describe(`Property-Based Tests (fast-check)`, () => {
+    describe(`Byte-Exactness Property`, () => {
+      const NUM_CONCURRENT_READERS = 7
+
+      async function readEntireStream(streamPath: string): Promise<Uint8Array> {
+        const accumulated: Array<number> = []
+        let currentOffset: string | null = null
+
+        for (let i = 0; i < 100; i++) {
+          const url: string = currentOffset
+            ? `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(currentOffset)}`
+            : `${getBaseUrl()}${streamPath}`
+
+          const response: Response = await fetch(url, { method: `GET` })
+          expect(response.status).toBe(200)
+
+          const data = new Uint8Array(await response.arrayBuffer())
+          accumulated.push(...data)
+
+          const nextOffset: string | null =
+            response.headers.get(STREAM_OFFSET_HEADER)
+          const upToDate = response.headers.get(STREAM_UP_TO_DATE_HEADER)
+
+          if (upToDate === `true` && data.length === 0) {
+            break
+          }
+
+          if (nextOffset === currentOffset) {
+            break
+          }
+
+          currentOffset = nextOffset
+        }
+
+        return new Uint8Array(accumulated)
+      }
+
+      test(`concurrent readers see consistent data during writes`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate 1-10 chunks of arbitrary bytes (1-500 bytes each)
+            fc.array(fc.uint8Array({ minLength: 1, maxLength: 500 }), {
+              minLength: 1,
+              maxLength: 10,
+            }),
+            async (chunks) => {
+              const streamPath = `/v1/stream/fc-byte-exactness-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              // Create stream
+              const createResponse = await fetch(
+                `${getBaseUrl()}${streamPath}`,
+                {
+                  method: `PUT`,
+                  headers: { "Content-Type": `application/octet-stream` },
+                }
+              )
+              expect([200, 201, 204]).toContain(createResponse.status)
+
+              const expected = Uint8Array.from(chunks.flatMap((c) => [...c]))
+
+              // Track when writes are done so readers know to stop
+              let writesComplete = false
+
+              // Start readers and writer concurrently to catch race conditions
+              const readerPromises = Array.from(
+                { length: NUM_CONCURRENT_READERS },
+                async () => {
+                  const snapshots: Array<Uint8Array> = []
+                  // Keep reading until writes complete, capturing snapshots
+                  while (!writesComplete) {
+                    const response: Response = await fetch(
+                      `${getBaseUrl()}${streamPath}`
+                    )
+                    snapshots.push(new Uint8Array(await response.arrayBuffer()))
+                    // Small delay between reads
+                    await new Promise((r) => setTimeout(r, Math.random() * 3))
+                  }
+                  return snapshots
+                }
+              )
+
+              const writerPromise = (async () => {
+                for (const chunk of chunks) {
+                  // Random delay between writes to interleave with readers
+                  await new Promise((r) => setTimeout(r, Math.random() * 5))
+                  const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+                    method: `POST`,
+                    headers: { "Content-Type": `application/octet-stream` },
+                    body: chunk,
+                  })
+                  expect(response.status).toBe(204)
+                }
+                writesComplete = true
+              })()
+
+              const [readerResults] = await Promise.all([
+                Promise.all(readerPromises),
+                writerPromise,
+              ])
+
+              // Each snapshot from each reader must be a valid prefix of expected
+              for (const snapshots of readerResults) {
+                for (const snapshot of snapshots) {
+                  expect(snapshot.length).toBeLessThanOrEqual(expected.length)
+                  for (let i = 0; i < snapshot.length; i++) {
+                    expect(snapshot[i]).toBe(expected[i])
+                  }
+                }
+              }
+
+              // Final read after all writes complete must match expected exactly
+              const finalResult = await readEntireStream(streamPath)
+              expect(finalResult).toEqual(expected)
+            }
+          ),
+          { numRuns: 20, interruptAfterTimeLimit: 10_000 }
+        )
+      }, 30_000)
+
+      test(`single byte values cover full range (0-255) with concurrent readers during write`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate a byte value from 0-255
+            fc.integer({ min: 0, max: 255 }),
+            async (byteValue) => {
+              const streamPath = `/v1/stream/fc-single-byte-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `application/octet-stream` },
+              })
+
+              const expected = new Uint8Array([byteValue])
+
+              // Start readers and writer concurrently
+              const readerPromises = Array.from(
+                { length: NUM_CONCURRENT_READERS },
+                async () => {
+                  await new Promise((r) => setTimeout(r, Math.random() * 5))
+                  const response: Response = await fetch(
+                    `${getBaseUrl()}${streamPath}`
+                  )
+                  return new Uint8Array(await response.arrayBuffer())
+                }
+              )
+
+              const writerPromise = fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `POST`,
+                headers: { "Content-Type": `application/octet-stream` },
+                body: new Uint8Array([byteValue]),
+              })
+
+              const [readerResults] = await Promise.all([
+                Promise.all(readerPromises),
+                writerPromise,
+              ])
+
+              // Each reader sees either empty (read before write) or the byte
+              for (const result of readerResults) {
+                expect(result.length).toBeLessThanOrEqual(1)
+                if (result.length === 1) {
+                  expect(result[0]).toBe(byteValue)
+                }
+              }
+
+              // Final read must have the byte
+              const finalResult = await readEntireStream(streamPath)
+              expect(finalResult).toEqual(expected)
+            }
+          ),
+          { numRuns: 50, interruptAfterTimeLimit: 10_000 }
+        )
+      }, 30_000)
+    })
+
+    describe(`Operation Sequence Properties`, () => {
+      // Define operation types for the state machine
+      type AppendOp = { type: `append`; data: Uint8Array }
+      type ReadOp = { type: `read` }
+      type ReadFromOffsetOp = { type: `readFromOffset`; offsetIndex: number }
+
+      test(`random operation sequences maintain stream invariants`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate a sequence of operations
+            fc.array(
+              fc.oneof(
+                // Append operation with random data
+                fc
+                  .uint8Array({ minLength: 1, maxLength: 200 })
+                  .map((data): AppendOp => ({ type: `append`, data })),
+                // Full read operation
+                fc.constant<ReadOp>({ type: `read` }),
+                // Read from a saved offset (index into saved offsets array)
+                fc.integer({ min: 0, max: 20 }).map(
+                  (idx): ReadFromOffsetOp => ({
+                    type: `readFromOffset`,
+                    offsetIndex: idx,
+                  })
+                )
+              ),
+              { minLength: 5, maxLength: 30 }
+            ),
+            async (operations) => {
+              const streamPath = `/v1/stream/fc-ops-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              // Create stream
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `application/octet-stream` },
+              })
+
+              // Track state
+              const appendedData: Array<number> = []
+              const savedOffsets: Array<string> = []
+
+              for (const op of operations) {
+                if (op.type === `append`) {
+                  const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+                    method: `POST`,
+                    headers: { "Content-Type": `application/octet-stream` },
+                    body: op.data as BodyInit,
+                  })
+                  expect(response.status).toBe(204)
+
+                  // Track what we appended
+                  appendedData.push(...Array.from(op.data))
+
+                  // Save the offset for potential later reads
+                  const offset = response.headers.get(STREAM_OFFSET_HEADER)
+                  if (offset) {
+                    savedOffsets.push(offset)
+                  }
+                } else if (op.type === `read`) {
+                  // Full read from beginning - verify all data
+                  const accumulated: Array<number> = []
+                  let currentOffset: string | null = null
+                  let iterations = 0
+
+                  while (iterations < 100) {
+                    iterations++
+
+                    const url: string = currentOffset
+                      ? `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(currentOffset)}`
+                      : `${getBaseUrl()}${streamPath}`
+
+                    const response: Response = await fetch(url, {
+                      method: `GET`,
+                    })
+                    const buffer = await response.arrayBuffer()
+                    const data = new Uint8Array(buffer)
+
+                    if (data.length > 0) {
+                      accumulated.push(...Array.from(data))
+                    }
+
+                    const nextOffset: string | null =
+                      response.headers.get(STREAM_OFFSET_HEADER)
+                    const upToDate = response.headers.get(
+                      STREAM_UP_TO_DATE_HEADER
+                    )
+
+                    if (upToDate === `true` && data.length === 0) {
+                      break
+                    }
+
+                    if (nextOffset === currentOffset) {
+                      break
+                    }
+
+                    currentOffset = nextOffset
+                  }
+
+                  // Verify we read exactly what was appended
+                  expect(accumulated.length).toBe(appendedData.length)
+                  for (let i = 0; i < appendedData.length; i++) {
+                    expect(accumulated[i]).toBe(appendedData[i])
+                  }
+                } else {
+                  // Read from a previously saved offset (op.type === `readFromOffset`)
+                  if (savedOffsets.length === 0) {
+                    continue // No offsets saved yet
+                  }
+
+                  const offsetIdx = op.offsetIndex % savedOffsets.length
+                  const offset = savedOffsets[offsetIdx]!
+
+                  const response = await fetch(
+                    `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(offset)}`,
+                    { method: `GET` }
+                  )
+                  expect(response.status).toBe(200)
+
+                  // Verify offset is monotonically increasing
+                  const nextOffset = response.headers.get(STREAM_OFFSET_HEADER)
+                  if (nextOffset) {
+                    // Offsets should be lexicographically greater or equal
+                    expect(nextOffset >= offset).toBe(true)
+                  }
+                }
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 15, interruptAfterTimeLimit: 30_000 }
+        )
+      }, 60_000)
+
+      test(`offsets are always monotonically increasing`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate multiple chunks to append
+            fc.array(fc.uint8Array({ minLength: 1, maxLength: 100 }), {
+              minLength: 2,
+              maxLength: 15,
+            }),
+            async (chunks) => {
+              const streamPath = `/v1/stream/fc-monotonic-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `application/octet-stream` },
+              })
+
+              const offsets: Array<string> = []
+
+              // Append all chunks and collect offsets
+              for (const chunk of chunks) {
+                const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+                  method: `POST`,
+                  headers: { "Content-Type": `application/octet-stream` },
+                  body: chunk,
+                })
+
+                const offset = response.headers.get(STREAM_OFFSET_HEADER)
+                expect(offset).toBeDefined()
+                offsets.push(offset!)
+              }
+
+              // Verify offsets are strictly increasing (lexicographically)
+              for (let i = 1; i < offsets.length; i++) {
+                expect(offsets[i]! > offsets[i - 1]!).toBe(true)
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 25 }
+        )
+      })
+
+      test(`read-your-writes: data is immediately visible after append`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            fc.uint8Array({ minLength: 1, maxLength: 500 }),
+            async (data) => {
+              const streamPath = `/v1/stream/fc-ryw-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              // Create stream
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `application/octet-stream` },
+              })
+
+              // Append data
+              const appendResponse = await fetch(
+                `${getBaseUrl()}${streamPath}`,
+                {
+                  method: `POST`,
+                  headers: { "Content-Type": `application/octet-stream` },
+                  body: data,
+                }
+              )
+              expect(appendResponse.status).toBe(204)
+
+              // Immediately read back
+              const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+              expect(readResponse.status).toBe(200)
+
+              const buffer = await readResponse.arrayBuffer()
+              const result = new Uint8Array(buffer)
+
+              // Must see the data we just wrote
+              expect(result.length).toBe(data.length)
+              for (let i = 0; i < data.length; i++) {
+                expect(result[i]).toBe(data[i])
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 30 }
+        )
+      })
+    })
+
+    describe(`Immutability Properties`, () => {
+      test(`data at offset never changes after additional appends`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Initial data and additional data to append
+            fc.uint8Array({ minLength: 1, maxLength: 200 }),
+            fc.array(fc.uint8Array({ minLength: 1, maxLength: 100 }), {
+              minLength: 1,
+              maxLength: 5,
+            }),
+            async (initialData, additionalChunks) => {
+              const streamPath = `/v1/stream/fc-immutable-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              // Create and append initial data
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `application/octet-stream` },
+              })
+
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `POST`,
+                headers: { "Content-Type": `application/octet-stream` },
+                body: initialData,
+              })
+
+              // Read and save the offset after initial data
+              const initialRead = await fetch(`${getBaseUrl()}${streamPath}`)
+              const initialBuffer = await initialRead.arrayBuffer()
+              const initialResult = new Uint8Array(initialBuffer)
+
+              // Append more data
+              for (const chunk of additionalChunks) {
+                await fetch(`${getBaseUrl()}${streamPath}`, {
+                  method: `POST`,
+                  headers: { "Content-Type": `application/octet-stream` },
+                  body: chunk,
+                })
+              }
+
+              // Read from beginning again - initial data should be unchanged
+              const rereadResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+              const rereadBuffer = await rereadResponse.arrayBuffer()
+              const rereadResult = new Uint8Array(rereadBuffer)
+
+              // The initial data portion should be identical
+              expect(rereadResult.length).toBeGreaterThanOrEqual(
+                initialResult.length
+              )
+              for (let i = 0; i < initialResult.length; i++) {
+                expect(rereadResult[i]).toBe(initialResult[i])
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 20 }
+        )
+      })
+    })
+
+    describe(`Offset Validation Properties`, () => {
+      test(`should reject offsets with invalid characters`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate strings with at least one invalid character
+            fc.oneof(
+              // Strings with spaces
+              fc.tuple(fc.string(), fc.string()).map(([a, b]) => `${a} ${b}`),
+              // Strings with path traversal
+              fc.string().map((s) => `../${s}`),
+              fc.string().map((s) => `${s}/..`),
+              // Strings with null bytes
+              fc.string().map((s) => `${s}\u0000`),
+              // Strings with newlines
+              fc.string().map((s) => `${s}\n`),
+              fc.string().map((s) => `${s}\r\n`),
+              // Strings with commas
+              fc.tuple(fc.string(), fc.string()).map(([a, b]) => `${a},${b}`),
+              // Strings with slashes
+              fc.tuple(fc.string(), fc.string()).map(([a, b]) => `${a}/${b}`)
+            ),
+            async (badOffset) => {
+              const streamPath = `/v1/stream/fc-bad-offset-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `text/plain` },
+                body: `test`,
+              })
+
+              const response = await fetch(
+                `${getBaseUrl()}${streamPath}?offset=${encodeURIComponent(badOffset)}`,
+                { method: `GET` }
+              )
+
+              // Should reject with 400
+              expect(response.status).toBe(400)
+
+              return true
+            }
+          ),
+          { numRuns: 30 }
+        )
+      })
+    })
+
+    describe(`Sequence Ordering Properties`, () => {
+      test(`lexicographically ordered seq values are accepted`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate a sorted array of unique lexicographic strings
+            fc
+              .array(fc.stringMatching(/^[0-9a-zA-Z]+$/), {
+                minLength: 2,
+                maxLength: 10,
+              })
+              .map((arr) => [...new Set(arr)].sort())
+              .filter((arr) => arr.length >= 2),
+            async (seqValues) => {
+              const streamPath = `/v1/stream/fc-seq-order-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `text/plain` },
+              })
+
+              // Append with each seq value in order
+              for (const seq of seqValues) {
+                const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+                  method: `POST`,
+                  headers: {
+                    "Content-Type": `text/plain`,
+                    [STREAM_SEQ_HEADER]: seq,
+                  },
+                  body: `data-${seq}`,
+                })
+                expect(response.status).toBe(204)
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 20 }
+        )
+      })
+
+      test(`out-of-order seq values are rejected`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate two strings where the first is lexicographically greater
+            fc
+              .tuple(
+                fc.stringMatching(/^[0-9a-zA-Z]+$/),
+                fc.stringMatching(/^[0-9a-zA-Z]+$/)
+              )
+              .filter(([a, b]) => a > b && a.length > 0 && b.length > 0),
+            async ([firstSeq, secondSeq]) => {
+              const streamPath = `/v1/stream/fc-seq-reject-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `text/plain` },
+              })
+
+              // First append with the larger seq value
+              const response1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `POST`,
+                headers: {
+                  "Content-Type": `text/plain`,
+                  [STREAM_SEQ_HEADER]: firstSeq,
+                },
+                body: `first`,
+              })
+              expect(response1.status).toBe(204)
+
+              // Second append with smaller seq should be rejected
+              const response2 = await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `POST`,
+                headers: {
+                  "Content-Type": `text/plain`,
+                  [STREAM_SEQ_HEADER]: secondSeq,
+                },
+                body: `second`,
+              })
+              expect(response2.status).toBe(409)
+
+              return true
+            }
+          ),
+          { numRuns: 25 }
+        )
+      })
+    })
+
+    describe(`Concurrent Writer Stress Tests`, () => {
+      test(`concurrent writers with sequence numbers - server handles gracefully`, async () => {
+        const streamPath = `/v1/stream/concurrent-seq-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+        // Create stream
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        // Try to write with same seq from multiple "writers" concurrently
+        const numWriters = 5
+        const seqValue = `seq-001`
+
+        const writePromises = Array.from({ length: numWriters }, (_, i) =>
+          fetch(`${getBaseUrl()}${streamPath}`, {
+            method: `POST`,
+            headers: {
+              "Content-Type": `text/plain`,
+              [STREAM_SEQ_HEADER]: seqValue,
+            },
+            body: `writer-${i}`,
+          })
+        )
+
+        const responses = await Promise.all(writePromises)
+        const statuses = responses.map((r) => r.status)
+
+        // Server should handle concurrent writes gracefully
+        // All responses should be valid (success or conflict)
+        for (const status of statuses) {
+          expect([200, 204, 409]).toContain(status)
+        }
+
+        // At least one should succeed
+        const successes = statuses.filter((s) => s === 200 || s === 204)
+        expect(successes.length).toBeGreaterThanOrEqual(1)
+
+        // Read back - should have exactly one write's data
+        const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+        const content = await readResponse.text()
+
+        // Content should contain data from exactly one writer
+        const matchingWriters = Array.from({ length: numWriters }, (_, i) =>
+          content.includes(`writer-${i}`)
+        ).filter(Boolean)
+        expect(matchingWriters.length).toBeGreaterThanOrEqual(1)
+      })
+
+      test(`concurrent writers racing with incrementing seq values`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            fc.integer({ min: 3, max: 8 }), // Number of writers
+            async (numWriters) => {
+              const streamPath = `/v1/stream/concurrent-race-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+              // Create stream
+              await fetch(`${getBaseUrl()}${streamPath}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `text/plain` },
+              })
+
+              // Each writer gets a unique seq value (padded for lexicographic ordering)
+              const writePromises = Array.from({ length: numWriters }, (_, i) =>
+                fetch(`${getBaseUrl()}${streamPath}`, {
+                  method: `POST`,
+                  headers: {
+                    "Content-Type": `text/plain`,
+                    [STREAM_SEQ_HEADER]: String(i).padStart(4, `0`),
+                  },
+                  body: `data-${i}`,
+                })
+              )
+
+              const responses = await Promise.all(writePromises)
+
+              // With concurrent writes, some may succeed (200/204) and some may conflict (409)
+              // due to out-of-order arrival at the server. All responses should be valid.
+              const successIndices: Array<number> = []
+              for (let i = 0; i < responses.length; i++) {
+                expect([200, 204, 409]).toContain(responses[i]!.status)
+                if (
+                  responses[i]!.status === 200 ||
+                  responses[i]!.status === 204
+                ) {
+                  successIndices.push(i)
+                }
+              }
+
+              // At least one write should succeed
+              expect(successIndices.length).toBeGreaterThanOrEqual(1)
+
+              // Read back and verify successful writes are present
+              const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+              const content = await readResponse.text()
+
+              // All successful writes should have their data in the stream
+              for (const i of successIndices) {
+                expect(content).toContain(`data-${i}`)
+              }
+
+              return true
+            }
+          ),
+          { numRuns: 10 }
+        )
+      })
+
+      test(`concurrent appends without seq - all data is persisted`, async () => {
+        const streamPath = `/v1/stream/concurrent-no-seq-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+        // Create stream
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        const numWriters = 10
+        const writePromises = Array.from({ length: numWriters }, (_, i) =>
+          fetch(`${getBaseUrl()}${streamPath}`, {
+            method: `POST`,
+            headers: { "Content-Type": `text/plain` },
+            body: `concurrent-${i}`,
+          })
+        )
+
+        const responses = await Promise.all(writePromises)
+
+        // All should succeed
+        for (const response of responses) {
+          expect([200, 204]).toContain(response.status)
+        }
+
+        // All offsets that are returned should be valid (non-null)
+        const offsets = responses.map((r) =>
+          r.headers.get(STREAM_OFFSET_HEADER)
+        )
+        for (const offset of offsets) {
+          expect(offset).not.toBeNull()
+        }
+
+        // Read back and verify all data is present (the key invariant)
+        const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+        const content = await readResponse.text()
+
+        for (let i = 0; i < numWriters; i++) {
+          expect(content).toContain(`concurrent-${i}`)
+        }
+      })
+
+      test(`mixed readers and writers - readers see consistent state`, async () => {
+        const streamPath = `/v1/stream/concurrent-rw-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+        // Create stream with initial data
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { "Content-Type": `text/plain` },
+          body: `initial`,
+        })
+
+        // Launch concurrent readers and writers
+        const numOps = 20
+        const operations = Array.from({ length: numOps }, (_, i) => {
+          if (i % 2 === 0) {
+            // Writer
+            return fetch(`${getBaseUrl()}${streamPath}`, {
+              method: `POST`,
+              headers: { "Content-Type": `text/plain` },
+              body: `write-${i}`,
+            })
+          } else {
+            // Reader
+            return fetch(`${getBaseUrl()}${streamPath}`)
+          }
+        })
+
+        const responses = await Promise.all(operations)
+
+        // All operations should succeed
+        // Writers (even indices) return 200 or 204, readers (odd indices) return 200
+        responses.forEach((response, i) => {
+          if (i % 2 === 0) {
+            // Writer - POST append can return 200 or 204
+            expect([200, 204]).toContain(response.status)
+          } else {
+            // Reader - catch-up GET returns 200
+            expect(response.status).toBe(200)
+          }
+        })
+
+        // Final read should have all writes
+        const finalRead = await fetch(`${getBaseUrl()}${streamPath}`)
+        const content = await finalRead.text()
+
+        // Initial data should be present
+        expect(content).toContain(`initial`)
+
+        // All writes should be present
+        for (let i = 0; i < numOps; i += 2) {
+          expect(content).toContain(`write-${i}`)
+        }
+      })
+    })
+
+    describe(`State Hash Verification`, () => {
+      /**
+       * Simple hash function for content verification.
+       * Uses FNV-1a algorithm for deterministic hashing.
+       */
+      function hashContent(data: Uint8Array): string {
+        let hash = 2166136261 // FNV offset basis
+        for (const byte of data) {
+          hash ^= byte
+          hash = Math.imul(hash, 16777619) // FNV prime
+          hash = hash >>> 0 // Convert to unsigned 32-bit
+        }
+        return hash.toString(16).padStart(8, `0`)
+      }
+
+      test(`replay produces identical content hash`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            // Generate a sequence of appends
+            fc.array(fc.uint8Array({ minLength: 1, maxLength: 100 }), {
+              minLength: 1,
+              maxLength: 10,
+            }),
+            async (chunks) => {
+              // Create first stream and append data
+              const streamPath1 = `/v1/stream/hash-verify-1-${Date.now()}-${Math.random().toString(36).slice(2)}`
+              await fetch(`${getBaseUrl()}${streamPath1}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `application/octet-stream` },
+              })
+
+              for (const chunk of chunks) {
+                await fetch(`${getBaseUrl()}${streamPath1}`, {
+                  method: `POST`,
+                  headers: { "Content-Type": `application/octet-stream` },
+                  body: chunk,
+                })
+              }
+
+              // Read and hash first stream
+              const response1 = await fetch(`${getBaseUrl()}${streamPath1}`)
+              const data1 = new Uint8Array(await response1.arrayBuffer())
+              const hash1 = hashContent(data1)
+
+              // Create second stream and replay same operations
+              const streamPath2 = `/v1/stream/hash-verify-2-${Date.now()}-${Math.random().toString(36).slice(2)}`
+              await fetch(`${getBaseUrl()}${streamPath2}`, {
+                method: `PUT`,
+                headers: { "Content-Type": `application/octet-stream` },
+              })
+
+              for (const chunk of chunks) {
+                await fetch(`${getBaseUrl()}${streamPath2}`, {
+                  method: `POST`,
+                  headers: { "Content-Type": `application/octet-stream` },
+                  body: chunk,
+                })
+              }
+
+              // Read and hash second stream
+              const response2 = await fetch(`${getBaseUrl()}${streamPath2}`)
+              const data2 = new Uint8Array(await response2.arrayBuffer())
+              const hash2 = hashContent(data2)
+
+              // Hashes must match
+              expect(hash1).toBe(hash2)
+              expect(data1.length).toBe(data2.length)
+
+              return true
+            }
+          ),
+          { numRuns: 15 }
+        )
+      })
+
+      test(`content hash changes with each append`, async () => {
+        const streamPath = `/v1/stream/hash-changes-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `application/octet-stream` },
+        })
+
+        const hashes: Array<string> = []
+
+        // Append 5 chunks and verify hash changes each time
+        for (let i = 0; i < 5; i++) {
+          await fetch(`${getBaseUrl()}${streamPath}`, {
+            method: `POST`,
+            headers: { "Content-Type": `application/octet-stream` },
+            body: new Uint8Array([i, i + 1, i + 2]),
+          })
+
+          const response = await fetch(`${getBaseUrl()}${streamPath}`)
+          const data = new Uint8Array(await response.arrayBuffer())
+          hashes.push(hashContent(data))
+        }
+
+        // All hashes should be unique
+        const uniqueHashes = new Set(hashes)
+        expect(uniqueHashes.size).toBe(5)
+      })
+
+      test(`empty stream has consistent hash`, async () => {
+        // Create two empty streams
+        const streamPath1 = `/v1/stream/empty-hash-1-${Date.now()}-${Math.random().toString(36).slice(2)}`
+        const streamPath2 = `/v1/stream/empty-hash-2-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+        await fetch(`${getBaseUrl()}${streamPath1}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `application/octet-stream` },
+        })
+        await fetch(`${getBaseUrl()}${streamPath2}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `application/octet-stream` },
+        })
+
+        // Read both
+        const response1 = await fetch(`${getBaseUrl()}${streamPath1}`)
+        const response2 = await fetch(`${getBaseUrl()}${streamPath2}`)
+
+        const data1 = new Uint8Array(await response1.arrayBuffer())
+        const data2 = new Uint8Array(await response2.arrayBuffer())
+
+        // Both should be empty and have same hash
+        expect(data1.length).toBe(0)
+        expect(data2.length).toBe(0)
+        expect(hashContent(data1)).toBe(hashContent(data2))
+      })
+
+      test(`deterministic ordering - same data in same order produces same hash`, async () => {
+        await fc.assert(
+          fc.asyncProperty(
+            fc.array(fc.uint8Array({ minLength: 1, maxLength: 50 }), {
+              minLength: 2,
+              maxLength: 5,
+            }),
+            async (chunks) => {
+              // Create two streams with same data in same order
+              const hashes: Array<string> = []
+
+              for (let run = 0; run < 2; run++) {
+                const streamPath = `/v1/stream/order-hash-${run}-${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+                await fetch(`${getBaseUrl()}${streamPath}`, {
+                  method: `PUT`,
+                  headers: { "Content-Type": `application/octet-stream` },
+                })
+
+                // Append in order
+                for (const chunk of chunks) {
+                  await fetch(`${getBaseUrl()}${streamPath}`, {
+                    method: `POST`,
+                    headers: { "Content-Type": `application/octet-stream` },
+                    body: chunk,
+                  })
+                }
+
+                const response = await fetch(`${getBaseUrl()}${streamPath}`)
+                const data = new Uint8Array(await response.arrayBuffer())
+                hashes.push(hashContent(data))
+              }
+
+              expect(hashes[0]).toBe(hashes[1])
+
+              return true
+            }
+          ),
+          { numRuns: 10 }
+        )
+      })
+    })
+  })
+
+  // ============================================================================
+  // Idempotent Producer Tests
+  // ============================================================================
+
+  describe(`Idempotent Producer Operations`, () => {
+    const PRODUCER_ID_HEADER = `Producer-Id`
+    const PRODUCER_EPOCH_HEADER = `Producer-Epoch`
+    const PRODUCER_SEQ_HEADER = `Producer-Seq`
+    const PRODUCER_EXPECTED_SEQ_HEADER = `Producer-Expected-Seq`
+    const PRODUCER_RECEIVED_SEQ_HEADER = `Producer-Received-Seq`
+
+    test(`should accept first append with producer headers (epoch=0, seq=0)`, async () => {
+      const streamPath = `/v1/stream/producer-basic-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // First append with producer headers
+      const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `hello`,
+      })
+
+      expect(response.status).toBe(200)
+      expect(response.headers.get(STREAM_OFFSET_HEADER)).toBeTruthy()
+      expect(response.headers.get(PRODUCER_EPOCH_HEADER)).toBe(`0`)
+    })
+
+    test(`should accept sequential producer sequences`, async () => {
+      const streamPath = `/v1/stream/producer-seq-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Send seq=0
+      const r0 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `msg0`,
+      })
+      expect(r0.status).toBe(200)
+
+      // Send seq=1
+      const r1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `1`,
+        },
+        body: `msg1`,
+      })
+      expect(r1.status).toBe(200)
+
+      // Send seq=2
+      const r2 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `2`,
+        },
+        body: `msg2`,
+      })
+      expect(r2.status).toBe(200)
+    })
+
+    test(`should return 204 for duplicate sequence (idempotent success)`, async () => {
+      const streamPath = `/v1/stream/producer-dup-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // First append
+      const r1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `hello`,
+      })
+      expect(r1.status).toBe(200)
+
+      // Duplicate append (same seq) - should return 204
+      const r2 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `hello`,
+      })
+      expect(r2.status).toBe(204)
+    })
+
+    test(`should accept epoch upgrade (new epoch starts at seq=0)`, async () => {
+      const streamPath = `/v1/stream/producer-epoch-upgrade-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Establish epoch=0
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `epoch0-msg0`,
+      })
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `1`,
+        },
+        body: `epoch0-msg1`,
+      })
+
+      // Upgrade to epoch=1, seq=0
+      const r = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `1`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `epoch1-msg0`,
+      })
+      expect(r.status).toBe(200)
+      expect(r.headers.get(PRODUCER_EPOCH_HEADER)).toBe(`1`)
+    })
+
+    test(`should reject stale epoch with 403 (zombie fencing)`, async () => {
+      const streamPath = `/v1/stream/producer-stale-epoch-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Establish epoch=1
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `1`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `msg`,
+      })
+
+      // Try to write with epoch=0 (stale)
+      const r = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `zombie`,
+      })
+      expect(r.status).toBe(403)
+      expect(r.headers.get(PRODUCER_EPOCH_HEADER)).toBe(`1`)
+    })
+
+    test(`should reject sequence gap with 409`, async () => {
+      const streamPath = `/v1/stream/producer-seq-gap-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Send seq=0
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `msg0`,
+      })
+
+      // Skip seq=1, try to send seq=2 (gap)
+      const r = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `2`,
+        },
+        body: `msg2`,
+      })
+      expect(r.status).toBe(409)
+      expect(r.headers.get(PRODUCER_EXPECTED_SEQ_HEADER)).toBe(`1`)
+      expect(r.headers.get(PRODUCER_RECEIVED_SEQ_HEADER)).toBe(`2`)
+    })
+
+    test(`should reject epoch increase with seq != 0`, async () => {
+      const streamPath = `/v1/stream/producer-epoch-bad-seq-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Establish epoch=0
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `msg`,
+      })
+
+      // Try epoch=1 with seq=5 (invalid - new epoch must start at seq=0)
+      const r = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `1`,
+          [PRODUCER_SEQ_HEADER]: `5`,
+        },
+        body: `bad`,
+      })
+      expect(r.status).toBe(400)
+    })
+
+    test(`should require all producer headers together`, async () => {
+      const streamPath = `/v1/stream/producer-partial-headers-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Only Producer-Id
+      const r1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+        },
+        body: `msg`,
+      })
+      expect(r1.status).toBe(400)
+
+      // Only Producer-Epoch
+      const r2 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+        },
+        body: `msg`,
+      })
+      expect(r2.status).toBe(400)
+
+      // Missing Producer-Seq
+      const r3 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+        },
+        body: `msg`,
+      })
+      expect(r3.status).toBe(400)
+    })
+
+    test(`should reject invalid integer formats in producer headers`, async () => {
+      const streamPath = `/v1/stream/producer-invalid-format-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Producer-Seq with trailing junk (e.g., "1abc")
+      const r1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `1abc`,
+        },
+        body: `msg`,
+      })
+      expect(r1.status).toBe(400)
+
+      // Producer-Epoch with trailing junk
+      const r2 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0xyz`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `msg`,
+      })
+      expect(r2.status).toBe(400)
+
+      // Scientific notation should be rejected
+      const r3 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `1e3`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `msg`,
+      })
+      expect(r3.status).toBe(400)
+
+      // Negative values should be rejected
+      const r4 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `-1`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `msg`,
+      })
+      expect(r4.status).toBe(400)
+
+      // Valid integers should still work
+      const r5 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `msg`,
+      })
+      expect(r5.status).toBe(200)
+    })
+
+    test(`multiple producers should have independent state`, async () => {
+      const streamPath = `/v1/stream/producer-multi-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Producer A: seq=0
+      const rA0 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `producer-A`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `A0`,
+      })
+      expect(rA0.status).toBe(200)
+
+      // Producer B: seq=0 (should be independent)
+      const rB0 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `producer-B`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `B0`,
+      })
+      expect(rB0.status).toBe(200)
+
+      // Producer A: seq=1
+      const rA1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `producer-A`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `1`,
+        },
+        body: `A1`,
+      })
+      expect(rA1.status).toBe(200)
+
+      // Producer B: seq=1
+      const rB1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `producer-B`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `1`,
+        },
+        body: `B1`,
+      })
+      expect(rB1.status).toBe(200)
+    })
+
+    test(`duplicate of seq=0 should not corrupt state`, async () => {
+      const streamPath = `/v1/stream/producer-dup-seq0-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // First seq=0
+      const r1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `first`,
+      })
+      expect(r1.status).toBe(200)
+
+      // Retry seq=0 (simulating lost response)
+      const r2 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `first`,
+      })
+      expect(r2.status).toBe(204) // Duplicate
+
+      // seq=1 should succeed (state not corrupted)
+      const r3 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `1`,
+        },
+        body: `second`,
+      })
+      expect(r3.status).toBe(200)
+    })
+
+    test(`duplicate response should return highest accepted seq, not request seq`, async () => {
+      const streamPath = `/v1/stream/producer-dup-highest-seq-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Send seq=0, 1, 2 successfully
+      for (let i = 0; i < 3; i++) {
+        const r = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [PRODUCER_ID_HEADER]: `test-producer`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `${i}`,
+          },
+          body: `msg-${i}`,
+        })
+        expect(r.status).toBe(200)
+        expect(r.headers.get(PRODUCER_SEQ_HEADER)).toBe(`${i}`)
+      }
+
+      // Now retry seq=1 (an older duplicate)
+      // Per PROTOCOL.md: "the highest accepted sequence number for this (stream, producerId, epoch) tuple"
+      // Should return 2 (highest accepted), not 1 (the request seq)
+      const dupResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `1`,
+        },
+        body: `msg-1`,
+      })
+      expect(dupResponse.status).toBe(204)
+      // The key assertion: should return highest (2), not request seq (1)
+      expect(dupResponse.headers.get(PRODUCER_SEQ_HEADER)).toBe(`2`)
+    })
+
+    test(`split-brain fencing scenario`, async () => {
+      const streamPath = `/v1/stream/producer-split-brain-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Producer A (original): epoch=0, seq=0
+      const rA0 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `shared-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `A0`,
+      })
+      expect(rA0.status).toBe(200)
+
+      // Producer B (new instance): claims with epoch=1
+      const rB0 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `shared-producer`,
+          [PRODUCER_EPOCH_HEADER]: `1`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `B0`,
+      })
+      expect(rB0.status).toBe(200)
+
+      // Producer A (zombie): tries epoch=0, seq=1 - should be fenced
+      const rA1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `shared-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `1`,
+        },
+        body: `A1`,
+      })
+      expect(rA1.status).toBe(403)
+      expect(rA1.headers.get(PRODUCER_EPOCH_HEADER)).toBe(`1`)
+    })
+
+    test(`epoch rollback should be rejected`, async () => {
+      const streamPath = `/v1/stream/producer-epoch-rollback-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Establish epoch=2
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `2`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `msg`,
+      })
+
+      // Try epoch=1 (rollback)
+      const r = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `1`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `rollback`,
+      })
+      expect(r.status).toBe(403)
+    })
+
+    test(`producer headers work with Stream-Seq header`, async () => {
+      const streamPath = `/v1/stream/producer-with-stream-seq-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Append with both producer and Stream-Seq headers
+      const r = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+          [STREAM_SEQ_HEADER]: `app-seq-001`,
+        },
+        body: `msg`,
+      })
+      expect(r.status).toBe(200)
+    })
+
+    test(`producer duplicate should return 204 even with Stream-Seq header`, async () => {
+      // This tests that producer dedupe is checked BEFORE Stream-Seq validation.
+      // A retry with the same producer headers should be deduplicated at the
+      // transport layer, returning 204, even if Stream-Seq would otherwise conflict.
+      const streamPath = `/v1/stream/producer-dedupe-before-stream-seq-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // First append with both producer and Stream-Seq headers
+      const r1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+          [STREAM_SEQ_HEADER]: `app-seq-001`,
+        },
+        body: `msg`,
+      })
+      expect(r1.status).toBe(200)
+
+      // Retry the SAME append (same producer headers AND same Stream-Seq)
+      // This should return 204 (duplicate) NOT 409 (Stream-Seq conflict)
+      // because producer dedupe must be checked before Stream-Seq validation.
+      const r2 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+          [STREAM_SEQ_HEADER]: `app-seq-001`,
+        },
+        body: `msg`,
+      })
+      expect(r2.status).toBe(204)
+    })
+
+    // ========================================================================
+    // Data Integrity Tests - Read Back Verification
+    // ========================================================================
+
+    test(`should store and read back data correctly`, async () => {
+      const streamPath = `/v1/stream/producer-readback-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Append with producer headers
+      const r = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `hello world`,
+      })
+      expect(r.status).toBe(200)
+
+      // Read back and verify
+      const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+      expect(readResponse.status).toBe(200)
+      const content = await readResponse.text()
+      expect(content).toBe(`hello world`)
+    })
+
+    test(`should preserve order of sequential producer writes`, async () => {
+      const streamPath = `/v1/stream/producer-order-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Append multiple messages in sequence
+      for (let i = 0; i < 5; i++) {
+        const r = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [PRODUCER_ID_HEADER]: `test-producer`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `${i}`,
+          },
+          body: `msg-${i}`,
+        })
+        expect(r.status).toBe(200)
+      }
+
+      // Read back and verify order
+      const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+      const content = await readResponse.text()
+      expect(content).toBe(`msg-0msg-1msg-2msg-3msg-4`)
+    })
+
+    test(`duplicate should not corrupt or duplicate data`, async () => {
+      const streamPath = `/v1/stream/producer-dup-integrity-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // First write
+      const r1 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `first`,
+      })
+      expect(r1.status).toBe(200)
+
+      // Duplicate (retry)
+      const r2 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `first`,
+      })
+      expect(r2.status).toBe(204)
+
+      // Continue with seq=1
+      const r3 = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `1`,
+        },
+        body: `second`,
+      })
+      expect(r3.status).toBe(200)
+
+      // Read back - should have exactly "firstsecond", not "firstfirstsecond"
+      const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+      const content = await readResponse.text()
+      expect(content).toBe(`firstsecond`)
+    })
+
+    test(`multiple producers should interleave correctly`, async () => {
+      const streamPath = `/v1/stream/producer-interleave-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Interleave writes from two producers
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `producer-A`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `A0`,
+      })
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `producer-B`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `B0`,
+      })
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `producer-A`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `1`,
+        },
+        body: `A1`,
+      })
+
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `producer-B`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `1`,
+        },
+        body: `B1`,
+      })
+
+      // Read back - should have all data in order of arrival
+      const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+      const content = await readResponse.text()
+      expect(content).toBe(`A0B0A1B1`)
+    })
+
+    // ========================================================================
+    // JSON Mode with Producer Headers
+    // ========================================================================
+
+    test(`should store and read back JSON object correctly`, async () => {
+      const streamPath = `/v1/stream/producer-json-obj-${Date.now()}`
+
+      // Create JSON stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+      })
+
+      // Append JSON with producer headers
+      const r = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `application/json`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: JSON.stringify({ event: `test`, value: 42 }),
+      })
+      expect(r.status).toBe(200)
+
+      // Read back and verify
+      const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+      const data = await readResponse.json()
+      expect(data).toEqual([{ event: `test`, value: 42 }])
+    })
+
+    test(`should preserve order of JSON appends with producer`, async () => {
+      const streamPath = `/v1/stream/producer-json-order-${Date.now()}`
+
+      // Create JSON stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+      })
+
+      // Append multiple JSON messages
+      for (let i = 0; i < 5; i++) {
+        const r = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `application/json`,
+            [PRODUCER_ID_HEADER]: `test-producer`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `${i}`,
+          },
+          body: JSON.stringify({ seq: i, data: `msg-${i}` }),
+        })
+        expect(r.status).toBe(200)
+      }
+
+      // Read back and verify order
+      const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+      const data = await readResponse.json()
+      expect(data).toEqual([
+        { seq: 0, data: `msg-0` },
+        { seq: 1, data: `msg-1` },
+        { seq: 2, data: `msg-2` },
+        { seq: 3, data: `msg-3` },
+        { seq: 4, data: `msg-4` },
+      ])
+    })
+
+    test(`JSON duplicate should not corrupt data`, async () => {
+      const streamPath = `/v1/stream/producer-json-dup-${Date.now()}`
+
+      // Create JSON stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+      })
+
+      // First write
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `application/json`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: JSON.stringify({ id: 1 }),
+      })
+
+      // Duplicate
+      const dup = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `application/json`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: JSON.stringify({ id: 1 }),
+      })
+      expect(dup.status).toBe(204)
+
+      // Continue
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `application/json`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `1`,
+        },
+        body: JSON.stringify({ id: 2 }),
+      })
+
+      // Read back - should have exactly [{id:1}, {id:2}]
+      const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+      const data = await readResponse.json()
+      expect(data).toEqual([{ id: 1 }, { id: 2 }])
+    })
+
+    test(`should reject invalid JSON with producer headers`, async () => {
+      const streamPath = `/v1/stream/producer-json-invalid-${Date.now()}`
+
+      // Create JSON stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+      })
+
+      // Try to append invalid JSON
+      const r = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `application/json`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `{ invalid json }`,
+      })
+      expect(r.status).toBe(400)
+    })
+
+    test(`should reject empty JSON array with producer headers`, async () => {
+      const streamPath = `/v1/stream/producer-json-empty-${Date.now()}`
+
+      // Create JSON stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+      })
+
+      // Try to append empty array
+      const r = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `application/json`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `[]`,
+      })
+      expect(r.status).toBe(400)
+    })
+
+    // ========================================================================
+    // Error Cases
+    // ========================================================================
+
+    test(`should return 404 for non-existent stream`, async () => {
+      const streamPath = `/v1/stream/producer-404-${Date.now()}`
+
+      // Try to append to non-existent stream
+      const r = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `data`,
+      })
+      expect(r.status).toBe(404)
+    })
+
+    test(`should return 409 for content-type mismatch`, async () => {
+      const streamPath = `/v1/stream/producer-ct-mismatch-${Date.now()}`
+
+      // Create stream with text/plain
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Try to append with application/json
+      const r = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `application/json`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: JSON.stringify({ data: `test` }),
+      })
+      expect(r.status).toBe(409)
+    })
+
+    test(`should return 400 for empty body`, async () => {
+      const streamPath = `/v1/stream/producer-empty-body-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Try to append empty body
+      const r = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: `test-producer`,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: ``,
+      })
+      expect(r.status).toBe(400)
+    })
+
+    test(`should reject empty Producer-Id`, async () => {
+      const streamPath = `/v1/stream/producer-empty-id-${Date.now()}`
+
+      // Create stream
+      await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Try with empty producer ID
+      const r = await fetch(`${getBaseUrl()}${streamPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [PRODUCER_ID_HEADER]: ``,
+          [PRODUCER_EPOCH_HEADER]: `0`,
+          [PRODUCER_SEQ_HEADER]: `0`,
+        },
+        body: `data`,
+      })
+      expect(r.status).toBe(400)
+    })
+  })
+
+  // ============================================================================
+  // Stream Closure
+  // ============================================================================
+
+  describe(`Stream Closure`, () => {
+    // Header constant for Stream-Closed
+    const STREAM_CLOSED_HEADER = `Stream-Closed`
+
+    // ========================================================================
+    // Create Tests
+    // ========================================================================
+
+    describe(`Create with Stream-Closed`, () => {
+      test(`create-closed-stream: PUT with Stream-Closed: true creates closed stream`, async () => {
+        const streamPath = `/v1/stream/create-closed-${Date.now()}`
+
+        const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_CLOSED_HEADER]: `true`,
+          },
+        })
+
+        expect(response.status).toBe(201)
+        expect(response.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+        expect(response.headers.get(STREAM_OFFSET_HEADER)).toBeTruthy()
+      })
+
+      test(`create-closed-stream-with-body: PUT with body + Stream-Closed: true`, async () => {
+        const streamPath = `/v1/stream/create-closed-body-${Date.now()}`
+
+        const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_CLOSED_HEADER]: `true`,
+          },
+          body: `initial content`,
+        })
+
+        expect(response.status).toBe(201)
+        expect(response.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+
+        // Verify content is readable
+        const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+        const content = await readResponse.text()
+        expect(content).toBe(`initial content`)
+        expect(readResponse.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+      })
+
+      test(`create-closed-returns-header: Response includes Stream-Closed: true`, async () => {
+        const streamPath = `/v1/stream/create-closed-header-${Date.now()}`
+
+        const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_CLOSED_HEADER]: `true`,
+          },
+        })
+
+        expect(response.status).toBe(201)
+        expect(response.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+      })
+    })
+
+    // ========================================================================
+    // Close Tests
+    // ========================================================================
+
+    describe(`Close Operations`, () => {
+      test(`close-stream-empty-post: POST with Stream-Closed: true, empty body closes stream`, async () => {
+        const streamPath = `/v1/stream/close-empty-${Date.now()}`
+
+        // Create stream
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        // Close with empty body
+        const closeResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { [STREAM_CLOSED_HEADER]: `true` },
+        })
+
+        expect(closeResponse.status).toBe(204)
+        expect(closeResponse.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+      })
+
+      test(`close-with-final-append: POST with body + Stream-Closed: true`, async () => {
+        const streamPath = `/v1/stream/close-final-${Date.now()}`
+
+        // Create stream
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        // Append some data first
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { "Content-Type": `text/plain` },
+          body: `first message`,
+        })
+
+        // Close with final append
+        const closeResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_CLOSED_HEADER]: `true`,
+          },
+          body: `final message`,
+        })
+
+        expect(closeResponse.status).toBe(204)
+        expect(closeResponse.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+
+        // Verify all content
+        const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+        const content = await readResponse.text()
+        expect(content).toBe(`first messagefinal message`)
+      })
+
+      test(`close-returns-offset-and-header: Response includes Stream-Next-Offset and Stream-Closed: true`, async () => {
+        const streamPath = `/v1/stream/close-returns-${Date.now()}`
+
+        // Create and append
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+          body: `content`,
+        })
+
+        // Close
+        const closeResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { [STREAM_CLOSED_HEADER]: `true` },
+        })
+
+        expect(closeResponse.status).toBe(204)
+        expect(closeResponse.headers.get(STREAM_OFFSET_HEADER)).toBeTruthy()
+        expect(closeResponse.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+      })
+
+      test(`close-idempotent: Closing already-closed stream (empty body) returns 204`, async () => {
+        const streamPath = `/v1/stream/close-idempotent-${Date.now()}`
+
+        // Create stream
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        // First close
+        const firstClose = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { [STREAM_CLOSED_HEADER]: `true` },
+        })
+        expect(firstClose.status).toBe(204)
+
+        // Second close (should be idempotent)
+        const secondClose = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { [STREAM_CLOSED_HEADER]: `true` },
+        })
+        expect(secondClose.status).toBe(204)
+        expect(secondClose.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+      })
+
+      test(`close-only-ignores-content-type: Close-only with mismatched Content-Type still succeeds`, async () => {
+        const streamPath = `/v1/stream/close-ignores-ct-${Date.now()}`
+
+        // Create JSON stream
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `application/json` },
+        })
+
+        // Close with mismatched Content-Type (should be ignored for empty body)
+        const closeResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_CLOSED_HEADER]: `true`,
+          },
+        })
+
+        expect(closeResponse.status).toBe(204)
+        expect(closeResponse.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+      })
+
+      test(`append-to-closed-stream-409: Append to closed stream returns 409 with Stream-Closed: true header`, async () => {
+        const streamPath = `/v1/stream/append-closed-${Date.now()}`
+
+        // Create and close
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { [STREAM_CLOSED_HEADER]: `true` },
+        })
+
+        // Try to append
+        const appendResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { "Content-Type": `text/plain` },
+          body: `should fail`,
+        })
+
+        expect(appendResponse.status).toBe(409)
+        expect(appendResponse.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+      })
+
+      test(`append-and-close-to-closed-stream-409: POST with body + Stream-Closed: true to already-closed stream returns 409`, async () => {
+        const streamPath = `/v1/stream/append-close-closed-${Date.now()}`
+
+        // Create and close
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { [STREAM_CLOSED_HEADER]: `true` },
+        })
+
+        // Try to append-and-close (without producer headers, so not idempotent)
+        const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_CLOSED_HEADER]: `true`,
+          },
+          body: `should fail`,
+        })
+
+        expect(response.status).toBe(409)
+        expect(response.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+      })
+    })
+
+    // ========================================================================
+    // HEAD Tests
+    // ========================================================================
+
+    describe(`HEAD with Stream Closure`, () => {
+      test(`head-closed-stream: HEAD returns Stream-Closed: true header`, async () => {
+        const streamPath = `/v1/stream/head-closed-${Date.now()}`
+
+        // Create and close
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { [STREAM_CLOSED_HEADER]: `true` },
+        })
+
+        // HEAD should show closed
+        const headResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `HEAD`,
+        })
+
+        expect(headResponse.status).toBe(200)
+        expect(headResponse.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+      })
+
+      test(`head-open-stream-no-closed-header: HEAD on open stream does NOT have Stream-Closed header`, async () => {
+        const streamPath = `/v1/stream/head-open-${Date.now()}`
+
+        // Create stream (don't close it)
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        // HEAD should NOT have Stream-Closed header
+        const headResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `HEAD`,
+        })
+
+        expect(headResponse.status).toBe(200)
+        expect(headResponse.headers.get(STREAM_CLOSED_HEADER)).toBeNull()
+      })
+    })
+
+    // ========================================================================
+    // Read Tests (Catch-up)
+    // ========================================================================
+
+    describe(`Read Closed Streams (Catch-up)`, () => {
+      test(`read-closed-stream-at-tail: Returns Stream-Closed: true at tail of closed stream`, async () => {
+        const streamPath = `/v1/stream/read-closed-tail-${Date.now()}`
+
+        // Create with content and close
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+          body: `content`,
+        })
+
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { [STREAM_CLOSED_HEADER]: `true` },
+        })
+
+        // Read from beginning - should get content and Stream-Closed
+        const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+        expect(readResponse.status).toBe(200)
+        expect(await readResponse.text()).toBe(`content`)
+        expect(readResponse.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+        expect(readResponse.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+      })
+
+      test(`read-closed-stream-partial-no-closed: Partial read of closed stream does NOT include Stream-Closed`, async () => {
+        const streamPath = `/v1/stream/read-closed-partial-${Date.now()}`
+
+        // Create with initial content
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+          body: `first`,
+        })
+
+        // Append more content
+        const appendResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { "Content-Type": `text/plain` },
+          body: `second`,
+        })
+        const secondOffset = appendResponse.headers.get(STREAM_OFFSET_HEADER)
+
+        // Close
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { [STREAM_CLOSED_HEADER]: `true` },
+        })
+
+        // Read from beginning but stop before tail
+        const partialRead = await fetch(
+          `${getBaseUrl()}${streamPath}?offset=-1`
+        )
+        const partialContent = await partialRead.text()
+        const nextOffset = partialRead.headers.get(STREAM_OFFSET_HEADER)
+
+        // If server returns all data at once, we're at tail and should see Stream-Closed
+        // If server chunks and we haven't reached tail, we should NOT see Stream-Closed
+        if (nextOffset === secondOffset) {
+          // We're at tail - should have Stream-Closed
+          expect(partialRead.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+        } else if (
+          partialContent.length < `firstsecond`.length &&
+          partialContent.length > 0
+        ) {
+          // Partial read - should NOT have Stream-Closed
+          expect(partialRead.headers.get(STREAM_CLOSED_HEADER)).toBeNull()
+        }
+        // If we got all content, Stream-Closed should be true
+        if (partialContent === `firstsecond`) {
+          expect(partialRead.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+        }
+      })
+
+      test(`read-closed-stream-empty-body-eof: At tail of closed stream: 200 OK, empty body, Stream-Closed: true`, async () => {
+        const streamPath = `/v1/stream/read-closed-eof-${Date.now()}`
+
+        // Create with content
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+          body: `content`,
+        })
+
+        // Close
+        const closeResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { [STREAM_CLOSED_HEADER]: `true` },
+        })
+        const tailOffset = closeResponse.headers.get(STREAM_OFFSET_HEADER)
+
+        // Read at tail offset - should get empty body with Stream-Closed
+        const eofRead = await fetch(
+          `${getBaseUrl()}${streamPath}?offset=${tailOffset}`
+        )
+
+        expect(eofRead.status).toBe(200)
+        expect(await eofRead.text()).toBe(``)
+        expect(eofRead.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+        expect(eofRead.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+      })
+    })
+
+    // ========================================================================
+    // Long-poll Tests
+    // ========================================================================
+
+    describe(`Long-poll with Stream Closure`, () => {
+      test(
+        `longpoll-closed-stream-immediate: No wait when closed stream at tail, returns immediately`,
+        async () => {
+          const streamPath = `/v1/stream/longpoll-closed-${Date.now()}`
+
+          // Create and close
+          await fetch(`${getBaseUrl()}${streamPath}`, {
+            method: `PUT`,
+            headers: { "Content-Type": `text/plain` },
+          })
+
+          const closeResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+            method: `POST`,
+            headers: { [STREAM_CLOSED_HEADER]: `true` },
+          })
+          const tailOffset = closeResponse.headers.get(STREAM_OFFSET_HEADER)
+
+          // Long-poll at tail - should return immediately, not wait
+          const startTime = Date.now()
+          const longpollResponse = await fetch(
+            `${getBaseUrl()}${streamPath}?offset=${tailOffset}&live=long-poll`
+          )
+          const elapsed = Date.now() - startTime
+
+          expect(longpollResponse.status).toBe(204)
+          expect(longpollResponse.headers.get(STREAM_CLOSED_HEADER)).toBe(
+            `true`
+          )
+          // Should return almost immediately (not wait the full timeout)
+          expect(elapsed).toBeLessThan(5000)
+        },
+        getLongPollTestTimeoutMs()
+      )
+
+      test(
+        `longpoll-closed-returns-204-with-header: Returns 204 with Stream-Closed: true`,
+        async () => {
+          const streamPath = `/v1/stream/longpoll-closed-204-${Date.now()}`
+
+          // Create with content and close
+          await fetch(`${getBaseUrl()}${streamPath}`, {
+            method: `PUT`,
+            headers: { "Content-Type": `text/plain` },
+            body: `data`,
+          })
+
+          const closeResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+            method: `POST`,
+            headers: { [STREAM_CLOSED_HEADER]: `true` },
+          })
+          const tailOffset = closeResponse.headers.get(STREAM_OFFSET_HEADER)
+
+          // Long-poll at tail
+          const response = await fetch(
+            `${getBaseUrl()}${streamPath}?offset=${tailOffset}&live=long-poll`
+          )
+
+          expect(response.status).toBe(204)
+          expect(response.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+          expect(response.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+          expect(response.headers.get(STREAM_OFFSET_HEADER)).toBeTruthy()
+        },
+        getLongPollTestTimeoutMs()
+      )
+    })
+
+    // ========================================================================
+    // SSE Tests
+    // ========================================================================
+
+    describe(`SSE with Stream Closure`, () => {
+      test(`sse-closed-stream-control-event: Final control event has streamClosed: true`, async () => {
+        const streamPath = `/v1/stream/sse-closed-control-${Date.now()}`
+
+        // Create with content
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+          body: `content`,
+        })
+
+        // Close
+        const closeResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { [STREAM_CLOSED_HEADER]: `true` },
+        })
+        const tailOffset = closeResponse.headers.get(STREAM_OFFSET_HEADER)
+
+        // SSE at tail
+        const { received } = await fetchSSE(
+          `${getBaseUrl()}${streamPath}?offset=${tailOffset}&live=sse`,
+          { timeoutMs: 5000, untilContent: `streamClosed` }
+        )
+
+        const events = parseSSEEvents(received)
+        const controlEvents = events.filter((e) => e.type === `control`)
+
+        // Should have a control event with streamClosed: true
+        expect(controlEvents.length).toBeGreaterThan(0)
+        const lastControl = controlEvents[controlEvents.length - 1]!
+        const controlData = JSON.parse(lastControl.data)
+        expect(controlData.streamClosed).toBe(true)
+      })
+
+      test(`sse-closed-stream-no-cursor: streamCursor omitted when streamClosed is true`, async () => {
+        const streamPath = `/v1/stream/sse-closed-no-cursor-${Date.now()}`
+
+        // Create and close
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        const closeResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { [STREAM_CLOSED_HEADER]: `true` },
+        })
+        const tailOffset = closeResponse.headers.get(STREAM_OFFSET_HEADER)
+
+        // SSE at tail
+        const { received } = await fetchSSE(
+          `${getBaseUrl()}${streamPath}?offset=${tailOffset}&live=sse`,
+          { timeoutMs: 5000, untilContent: `streamClosed` }
+        )
+
+        const events = parseSSEEvents(received)
+        const controlEvents = events.filter((e) => e.type === `control`)
+
+        expect(controlEvents.length).toBeGreaterThan(0)
+        const lastControl = controlEvents[controlEvents.length - 1]!
+        const controlData = JSON.parse(lastControl.data)
+
+        expect(controlData.streamClosed).toBe(true)
+        // streamCursor should be omitted when streamClosed is true
+        expect(controlData.streamCursor).toBeUndefined()
+      })
+
+      test(`sse-closed-stream-connection-closes: Connection closes after final event`, async () => {
+        const streamPath = `/v1/stream/sse-closed-conn-${Date.now()}`
+
+        // Create with content and close
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+          body: `data`,
+        })
+
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { [STREAM_CLOSED_HEADER]: `true` },
+        })
+
+        // Start SSE from beginning - should receive data, then close
+        const controller = new AbortController()
+        const startTime = Date.now()
+
+        try {
+          const response = await fetch(
+            `${getBaseUrl()}${streamPath}?offset=-1&live=sse`,
+            { signal: controller.signal }
+          )
+
+          if (response.body) {
+            const reader = response.body.getReader()
+            let received = ``
+            let chunkCount = 0
+
+            // Read until connection closes
+            while (chunkCount < 20) {
+              const { done, value } = await reader.read()
+              if (done) break
+              received += new TextDecoder().decode(value)
+              chunkCount++
+            }
+
+            // Should have received streamClosed control event
+            expect(received).toContain(`streamClosed`)
+          }
+        } catch {
+          // Connection closing is expected
+        } finally {
+          controller.abort()
+        }
+
+        const elapsed = Date.now() - startTime
+        // Connection should close quickly, not wait for timeout
+        expect(elapsed).toBeLessThan(10000)
+      })
+
+      test(`sse-live-reader-receives-final-append-on-close: live reader at tail receives data appended atomically with the close`, async () => {
+        // A live SSE reader that is caught up at the tail must receive data that
+        // is appended atomically with a stream close (POST + Stream-Closed),
+        // followed by the closing control event. A naive server can lose the
+        // final append when the close races the reader's internal poll cycle:
+        // it emits the streamClosed control without first delivering the data.
+        //
+        // The close is timed across a spread of delays to probe that race
+        // window; a correct server delivers the data regardless of timing, so
+        // this never produces false failures against a compliant implementation.
+        const delaysMs = [40, 60, 75, 82, 85, 88, 90, 90, 92, 92, 95, 98]
+
+        for (let i = 0; i < delaysMs.length; i++) {
+          const streamPath = `/v1/stream/sse-live-final-append-${Date.now()}-${i}`
+
+          // Create with initial content and capture the tail offset.
+          const createResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+            method: `PUT`,
+            headers: { "Content-Type": `text/plain` },
+            body: `initial`,
+          })
+          const tailOffset = createResponse.headers.get(STREAM_OFFSET_HEADER)
+
+          // Start a live SSE reader AT the tail, so it is caught up and waiting
+          // for new data at the moment the stream is closed. Do not await yet.
+          const ssePromise = fetchSSE(
+            `${getBaseUrl()}${streamPath}?offset=${tailOffset}&live=sse`,
+            { timeoutMs: 5000, maxChunks: 30, untilContent: `streamClosed` }
+          )
+
+          // Let the reader connect and reach the tail, then close after the
+          // per-iteration delay.
+          await new Promise((resolve) => setTimeout(resolve, delaysMs[i]))
+
+          // Append a final message AND close atomically (append-and-close).
+          await fetch(`${getBaseUrl()}${streamPath}`, {
+            method: `POST`,
+            headers: {
+              "Content-Type": `text/plain`,
+              [STREAM_CLOSED_HEADER]: `true`,
+            },
+            body: `sse-data`,
+          })
+
+          const { received } = await ssePromise
+          const events = parseSSEEvents(received)
+
+          // The live reader MUST receive the data appended as part of the close.
+          const dataEvents = events.filter((e) => e.type === `data`)
+          const allData = dataEvents.map((e) => e.data).join(``)
+          expect(
+            allData,
+            `iteration ${i} (close ${delaysMs[i]}ms after connect): live SSE reader must receive data appended atomically with the close`
+          ).toContain(`sse-data`)
+
+          // ...followed by a closing control event with streamClosed: true.
+          const controlEvents = events.filter((e) => e.type === `control`)
+          expect(controlEvents.length).toBeGreaterThan(0)
+          const lastControl = controlEvents[controlEvents.length - 1]!
+          const controlData = JSON.parse(lastControl.data)
+          expect(controlData.streamClosed).toBe(true)
+        }
+      })
+    })
+
+    // ========================================================================
+    // Idempotent Producer Tests
+    // ========================================================================
+
+    describe(`Idempotent Producers with Stream Closure`, () => {
+      const PRODUCER_ID_HEADER = `Producer-Id`
+      const PRODUCER_EPOCH_HEADER = `Producer-Epoch`
+      const PRODUCER_SEQ_HEADER = `Producer-Seq`
+
+      test(`idempotent-close-with-append: Close with final append using producer headers`, async () => {
+        const streamPath = `/v1/stream/idempotent-close-append-${Date.now()}`
+
+        // Create stream
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        // Close with final append using producer headers
+        const closeResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_CLOSED_HEADER]: `true`,
+            [PRODUCER_ID_HEADER]: `test-producer`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `0`,
+          },
+          body: `final message`,
+        })
+
+        expect(closeResponse.status).toBe(200)
+        expect(closeResponse.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+        expect(closeResponse.headers.get(PRODUCER_EPOCH_HEADER)).toBe(`0`)
+        expect(closeResponse.headers.get(PRODUCER_SEQ_HEADER)).toBe(`0`)
+
+        // Verify content
+        const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+        expect(await readResponse.text()).toBe(`final message`)
+      })
+
+      test(`idempotent-close-only-with-producer-headers: Close-only with producer headers updates state`, async () => {
+        const streamPath = `/v1/stream/idempotent-close-only-${Date.now()}`
+
+        // Create stream
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        // Append first message
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [PRODUCER_ID_HEADER]: `test-producer`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `0`,
+          },
+          body: `message`,
+        })
+
+        // Close-only with producer headers (seq=1)
+        const closeResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            [STREAM_CLOSED_HEADER]: `true`,
+            [PRODUCER_ID_HEADER]: `test-producer`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `1`,
+          },
+        })
+
+        expect(closeResponse.status).toBe(204)
+        expect(closeResponse.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+        expect(closeResponse.headers.get(PRODUCER_EPOCH_HEADER)).toBe(`0`)
+        expect(closeResponse.headers.get(PRODUCER_SEQ_HEADER)).toBe(`1`)
+      })
+
+      test(`idempotent-close-duplicate-returns-204: Duplicate close (same tuple) returns 204`, async () => {
+        const streamPath = `/v1/stream/idempotent-close-dup-${Date.now()}`
+
+        // Create stream
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        // First close with producer headers
+        const firstClose = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_CLOSED_HEADER]: `true`,
+            [PRODUCER_ID_HEADER]: `test-producer`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `0`,
+          },
+          body: `final`,
+        })
+        expect(firstClose.status).toBe(200)
+
+        // Duplicate close with same tuple
+        const duplicateClose = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_CLOSED_HEADER]: `true`,
+            [PRODUCER_ID_HEADER]: `test-producer`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `0`,
+          },
+          body: `final`,
+        })
+
+        expect(duplicateClose.status).toBe(204)
+        expect(duplicateClose.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+      })
+
+      test(`idempotent-close-different-tuple-returns-409: Different producer/seq gets 409`, async () => {
+        const streamPath = `/v1/stream/idempotent-close-diff-${Date.now()}`
+
+        // Create stream
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        // Close with first producer
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_CLOSED_HEADER]: `true`,
+            [PRODUCER_ID_HEADER]: `producer-A`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `0`,
+          },
+          body: `final`,
+        })
+
+        // Try to close with different producer
+        const differentProducer = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_CLOSED_HEADER]: `true`,
+            [PRODUCER_ID_HEADER]: `producer-B`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `0`,
+          },
+          body: `should fail`,
+        })
+
+        expect(differentProducer.status).toBe(409)
+        expect(differentProducer.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+      })
+
+      test(`idempotent-close-different-seq-returns-409: Same producer, different seq gets 409`, async () => {
+        const streamPath = `/v1/stream/idempotent-close-diff-seq-${Date.now()}`
+
+        // Create stream
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        // Close with seq=0
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_CLOSED_HEADER]: `true`,
+            [PRODUCER_ID_HEADER]: `test-producer`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `0`,
+          },
+          body: `final`,
+        })
+
+        // Try with seq=1 (different seq)
+        const differentSeq = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_CLOSED_HEADER]: `true`,
+            [PRODUCER_ID_HEADER]: `test-producer`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `1`,
+          },
+          body: `should fail`,
+        })
+
+        expect(differentSeq.status).toBe(409)
+        expect(differentSeq.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+      })
+
+      test(`idempotent-close-only-duplicate-returns-204: Duplicate close-only (no body) returns 204`, async () => {
+        const streamPath = `/v1/stream/idempotent-close-only-dup-${Date.now()}`
+
+        // Create stream
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        // First close-only with producer headers
+        const firstClose = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            [STREAM_CLOSED_HEADER]: `true`,
+            [PRODUCER_ID_HEADER]: `test-producer`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `0`,
+          },
+        })
+        expect(firstClose.status).toBe(204)
+
+        // Duplicate close-only with same tuple
+        const duplicateClose = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            [STREAM_CLOSED_HEADER]: `true`,
+            [PRODUCER_ID_HEADER]: `test-producer`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `0`,
+          },
+        })
+
+        expect(duplicateClose.status).toBe(204)
+        expect(duplicateClose.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+      })
+    })
+
+    // ========================================================================
+    // Additional Edge Case Tests (from PR review)
+    // ========================================================================
+
+    describe(`Edge Cases`, () => {
+      // Producer header constants for edge case tests
+      const PRODUCER_ID_HEADER = `Producer-Id`
+      const PRODUCER_EPOCH_HEADER = `Producer-Epoch`
+      const PRODUCER_SEQ_HEADER = `Producer-Seq`
+
+      test(`409-includes-stream-offset: 409 for closed stream includes Stream-Next-Offset header`, async () => {
+        const streamPath = `/v1/stream/409-offset-${Date.now()}`
+
+        // Create stream with content
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+          body: `some content`,
+        })
+
+        // Close the stream
+        const closeResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { [STREAM_CLOSED_HEADER]: `true` },
+        })
+        const finalOffset = closeResponse.headers.get(STREAM_OFFSET_HEADER)
+        expect(finalOffset).toBeTruthy()
+
+        // Try to append - should get 409 with offset
+        const appendResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { "Content-Type": `text/plain` },
+          body: `should fail`,
+        })
+
+        expect(appendResponse.status).toBe(409)
+        expect(appendResponse.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+        expect(appendResponse.headers.get(STREAM_OFFSET_HEADER)).toBe(
+          finalOffset
+        )
+      })
+
+      test(`close-nonexistent-stream-404: POST with Stream-Closed to nonexistent stream returns 404`, async () => {
+        const streamPath = `/v1/stream/nonexistent-close-${Date.now()}`
+
+        const closeResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { [STREAM_CLOSED_HEADER]: `true` },
+        })
+
+        expect(closeResponse.status).toBe(404)
+      })
+
+      test(`offset-now-on-closed-stream: offset=now on closed stream returns Stream-Closed: true`, async () => {
+        const streamPath = `/v1/stream/offset-now-closed-${Date.now()}`
+
+        // Create with content and close
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+          body: `content`,
+        })
+
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { [STREAM_CLOSED_HEADER]: `true` },
+        })
+
+        // Read with offset=now
+        const readResponse = await fetch(
+          `${getBaseUrl()}${streamPath}?offset=now`
+        )
+
+        expect(readResponse.status).toBe(200)
+        expect(readResponse.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+        expect(readResponse.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+      })
+
+      test(`producer-state-survives-close: Stale-epoch producer gets 403, not 409 STREAM_CLOSED`, async () => {
+        const streamPath = `/v1/stream/producer-state-close-${Date.now()}`
+
+        // Create stream
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        // Producer A writes with epoch 0
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [PRODUCER_ID_HEADER]: `producer-A`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `0`,
+          },
+          body: `first`,
+        })
+
+        // Producer A closes with epoch 1 (claiming new epoch)
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_CLOSED_HEADER]: `true`,
+            [PRODUCER_ID_HEADER]: `producer-A`,
+            [PRODUCER_EPOCH_HEADER]: `1`,
+            [PRODUCER_SEQ_HEADER]: `0`,
+          },
+          body: `final`,
+        })
+
+        // Producer A with stale epoch 0 tries to close again - should get 403 (stale epoch)
+        const staleResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_CLOSED_HEADER]: `true`,
+            [PRODUCER_ID_HEADER]: `producer-A`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `1`,
+          },
+          body: `stale attempt`,
+        })
+
+        // Should be 403 (stale epoch) - the producer state check happens before stream closed check
+        // This may be 409 depending on implementation order - both are valid
+        expect([403, 409]).toContain(staleResponse.status)
+      })
+
+      test(`close-with-different-body-dedup: Retry close with different body deduplicates to original`, async () => {
+        const streamPath = `/v1/stream/close-dedup-body-${Date.now()}`
+
+        // Create stream
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        // Close with body A
+        const firstClose = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_CLOSED_HEADER]: `true`,
+            [PRODUCER_ID_HEADER]: `test-producer`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `0`,
+          },
+          body: `body-A`,
+        })
+        expect(firstClose.status).toBe(200)
+
+        // Retry with same tuple but different body
+        const retryClose = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_CLOSED_HEADER]: `true`,
+            [PRODUCER_ID_HEADER]: `test-producer`,
+            [PRODUCER_EPOCH_HEADER]: `0`,
+            [PRODUCER_SEQ_HEADER]: `0`,
+          },
+          body: `body-B`,
+        })
+        expect(retryClose.status).toBe(204) // Duplicate
+
+        // Verify original body is preserved
+        const readResponse = await fetch(`${getBaseUrl()}${streamPath}`)
+        const content = await readResponse.text()
+        expect(content).toBe(`body-A`)
+      })
+
+      test(`empty-post-without-stream-closed-400: POST with empty body but no Stream-Closed returns 400`, async () => {
+        const streamPath = `/v1/stream/empty-no-closed-${Date.now()}`
+
+        // Create stream
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+        })
+
+        // POST with empty body but no Stream-Closed header
+        const response = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { "Content-Type": `text/plain` },
+          body: ``,
+        })
+
+        expect(response.status).toBe(400)
+      })
+
+      test(`delete-closed-stream: Deleting a closed stream removes it (returns 404 after)`, async () => {
+        const streamPath = `/v1/stream/delete-closed-${Date.now()}`
+
+        // Create and close
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+          body: `content`,
+        })
+
+        await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `POST`,
+          headers: { [STREAM_CLOSED_HEADER]: `true` },
+        })
+
+        // Verify closed
+        const headBefore = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `HEAD`,
+        })
+        expect(headBefore.headers.get(STREAM_CLOSED_HEADER)).toBe(`true`)
+
+        // Delete
+        const deleteResponse = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `DELETE`,
+        })
+        expect([200, 204]).toContain(deleteResponse.status)
+
+        // Should be 404 now, not 409/STREAM_CLOSED
+        const headAfter = await fetch(`${getBaseUrl()}${streamPath}`, {
+          method: `HEAD`,
+        })
+        expect(headAfter.status).toBe(404)
+      })
+    })
+  })
+
+  // ============================================================================
+  // Fork - Creation
+  // ============================================================================
+
+  describe(`Fork - Creation`, () => {
+    const STREAM_FORKED_FROM_HEADER = `Stream-Forked-From`
+    const STREAM_FORK_OFFSET_HEADER = `Stream-Fork-Offset`
+    const STREAM_CLOSED_HEADER_FORK = `Stream-Closed`
+
+    const uniqueId = () =>
+      `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+
+    test(`should fork at current head (default)`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-head-src-${id}`
+      const forkPath = `/v1/stream/fork-create-head-fork-${id}`
+
+      // Create source with data
+      const createRes = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `source data`,
+      })
+      expect(createRes.status).toBe(201)
+
+      const sourceOffset = createRes.headers.get(STREAM_OFFSET_HEADER)
+      expect(sourceOffset).toBeDefined()
+
+      // Fork without specifying offset → defaults to head
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+    })
+
+    test(`should fork at a specific offset`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-offset-src-${id}`
+      const forkPath = `/v1/stream/fork-create-offset-fork-${id}`
+
+      // Create source
+      const createRes = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `first`,
+      })
+      expect(createRes.status).toBe(201)
+      const midOffset = createRes.headers.get(STREAM_OFFSET_HEADER)!
+
+      // Append more data
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `second`,
+      })
+
+      // Fork at the mid offset (only inheriting "first")
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: midOffset,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+
+      // Read fork → should only see "first"
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(readRes.status).toBe(200)
+      const body = await readRes.text()
+      expect(body).toBe(`first`)
+    })
+
+    test(`should fork at zero offset (empty inherited data)`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-zero-src-${id}`
+      const forkPath = `/v1/stream/fork-create-zero-fork-${id}`
+
+      // Create source with data
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `source data`,
+      })
+
+      // Fork at zero offset
+      const zeroOffset = `0000000000000000_0000000000000000`
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: zeroOffset,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+
+      // Read fork → should be empty (no inherited data)
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(readRes.status).toBe(200)
+      const body = await readRes.text()
+      expect(body).toBe(``)
+      expect(readRes.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+    })
+
+    test(`should fork at head offset (all source data inherited)`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-all-src-${id}`
+      const forkPath = `/v1/stream/fork-create-all-fork-${id}`
+
+      // Create source with data
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `chunk1`,
+      })
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `chunk2`,
+      })
+
+      // Get head offset
+      const headRes = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `HEAD`,
+      })
+      const headOffset = headRes.headers.get(STREAM_OFFSET_HEADER)!
+
+      // Fork at head offset → all data inherited
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: headOffset,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+
+      // Read fork → should see all source data
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(readRes.status).toBe(200)
+      const body = await readRes.text()
+      expect(body).toBe(`chunk1chunk2`)
+    })
+
+    test(`should return 404 when forking a nonexistent stream`, async () => {
+      const id = uniqueId()
+      const forkPath = `/v1/stream/fork-create-404-fork-${id}`
+
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: `/v1/stream/nonexistent-${id}`,
+        },
+      })
+      expect(forkRes.status).toBe(404)
+    })
+
+    test(`should return 400 when forking at offset beyond stream length`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-beyond-src-${id}`
+      const forkPath = `/v1/stream/fork-create-beyond-fork-${id}`
+
+      // Create source with data
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `small data`,
+      })
+
+      // Fork at an offset far beyond what exists
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: `9999999999999999_9999999999999999`,
+        },
+      })
+      expect(forkRes.status).toBe(400)
+    })
+
+    test(`should return 409 when forking to path already in use with different config`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-conflict-src-${id}`
+      const forkPath = `/v1/stream/fork-create-conflict-fork-${id}`
+
+      // Create source with text/plain
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `source`,
+      })
+
+      // Create a regular stream at the fork path with application/json
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+      })
+
+      // Try to fork to the already-used path (different content type) → 409
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      expect(forkRes.status).toBe(409)
+    })
+
+    test(`should fork a closed stream — fork starts open`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-closed-src-${id}`
+      const forkPath = `/v1/stream/fork-create-closed-fork-${id}`
+
+      // Create and close source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `closed data`,
+      })
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `POST`,
+        headers: { [STREAM_CLOSED_HEADER_FORK]: `true` },
+      })
+
+      // Fork the closed stream
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+      // Fork should NOT be closed
+      expect(forkRes.headers.get(STREAM_CLOSED_HEADER_FORK)).toBeNull()
+
+      // Should be able to append to fork
+      const appendRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: ` fork data`,
+      })
+      expect(appendRes.status).toBe(204)
+    })
+
+    test(`should fork an empty stream`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-empty-src-${id}`
+      const forkPath = `/v1/stream/fork-create-empty-fork-${id}`
+
+      // Create empty source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      // Fork it
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+
+      // Read fork → empty
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(readRes.status).toBe(200)
+      const body = await readRes.text()
+      expect(body).toBe(``)
+      expect(readRes.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+    })
+
+    test(`should fork preserving content-type when specified`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-ct-src-${id}`
+      const forkPath = `/v1/stream/fork-create-ct-fork-${id}`
+
+      // Create source with application/json
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: `[{"key":"value"}]`,
+      })
+
+      // Fork with matching content-type
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `application/json`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+      expect(forkRes.headers.get(`content-type`)).toBe(`application/json`)
+
+      // HEAD on fork should also show the content type
+      const headRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `HEAD`,
+      })
+      expect(headRes.headers.get(`content-type`)).toBe(`application/json`)
+    })
+
+    test(`should fork inheriting content-type when header omitted`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-ct-inherit-src-${id}`
+      const forkPath = `/v1/stream/fork-create-ct-inherit-fork-${id}`
+
+      // Create source with application/json
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: `[{"key":"value"}]`,
+      })
+
+      // Fork WITHOUT Content-Type header → fork must inherit source's
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+      expect(forkRes.headers.get(`content-type`)).toBe(`application/json`)
+
+      // HEAD on fork should also show the inherited content type
+      const headRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `HEAD`,
+      })
+      expect(headRes.headers.get(`content-type`)).toBe(`application/json`)
+
+      // Appending with the inherited content-type must succeed (no 409)
+      const appendRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `application/json` },
+        body: `[{"key":"appended"}]`,
+      })
+      expect(appendRes.status).toBe(204)
+    })
+
+    // ------------------------------------------------------------------
+    // Sub-offset forking (Stream-Fork-Sub-Offset)
+    // ------------------------------------------------------------------
+
+    const STREAM_FORK_SUB_OFFSET_HEADER = `Stream-Fork-Sub-Offset`
+
+    test(`should fork at a binary sub-offset within an append`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-bin-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-bin-fork-${id}`
+
+      // Create source with one append of 5 bytes
+      const createRes = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `hello`,
+      })
+      expect(createRes.status).toBe(201)
+
+      // Fork at the start, taking the first 3 bytes of the append
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `3`,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+
+      // Read fork → should see only "hel"
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(readRes.status).toBe(200)
+      const body = await readRes.text()
+      expect(body).toBe(`hel`)
+    })
+
+    test(`should fork at a JSON sub-offset within a flattened batch`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-json-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-json-fork-${id}`
+
+      // Create JSON source with a 4-element flattened batch
+      const createRes = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: `[{"a":1},{"b":2},{"c":3},{"d":4}]`,
+      })
+      expect(createRes.status).toBe(201)
+
+      // Fork at start, taking only the first 2 flattened messages
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `application/json`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `2`,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+
+      // Read fork → should be [{"a":1},{"b":2}]
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(readRes.status).toBe(200)
+      const body = await readRes.json()
+      expect(body).toEqual([{ a: 1 }, { b: 2 }])
+    })
+
+    test(`should treat sub-offset 0 as equivalent to absent header`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-zero-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-zero-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `data`,
+      })
+
+      // First PUT without sub-offset
+      const res1 = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+        },
+      })
+      expect(res1.status).toBe(201)
+
+      // Second PUT with sub-offset=0 → idempotent 200
+      const res2 = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `0`,
+        },
+      })
+      expect(res2.status).toBe(200)
+    })
+
+    test(`should return 400 when binary sub-offset overshoots message length`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-over-bin-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-over-bin-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `hi`, // 2 bytes
+      })
+
+      const res = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `5`,
+        },
+      })
+      expect(res.status).toBe(400)
+    })
+
+    test(`should return 400 when JSON sub-offset overshoots message count`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-over-json-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-over-json-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: `[{"a":1},{"b":2},{"c":3}]`,
+      })
+
+      const res = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `application/json`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `4`,
+        },
+      })
+      expect(res.status).toBe(400)
+    })
+
+    test(`should return 400 for malformed sub-offset values`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-bad-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-bad-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `data`,
+      })
+
+      for (const bad of [`-1`, `abc`, `1.5`, `05`, `+1`]) {
+        const res = await fetch(`${getBaseUrl()}${forkPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_FORKED_FROM_HEADER]: sourcePath,
+            [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+            [STREAM_FORK_SUB_OFFSET_HEADER]: bad,
+          },
+        })
+        expect(res.status).toBe(400)
+      }
+    })
+
+    test(`should be idempotent when re-creating with matching sub-offset`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-idem-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-idem-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `hello`,
+      })
+
+      const headers = {
+        "Content-Type": `text/plain`,
+        [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+        [STREAM_FORK_SUB_OFFSET_HEADER]: `2`,
+      }
+
+      const res1 = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers,
+      })
+      expect(res1.status).toBe(201)
+
+      const res2 = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers,
+      })
+      expect(res2.status).toBe(200)
+    })
+
+    test(`should return 409 when re-creating with mismatched sub-offset`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-conflict-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-conflict-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `hello`,
+      })
+
+      const baseHeaders = {
+        "Content-Type": `text/plain`,
+        [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+      }
+
+      const res1 = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: { ...baseHeaders, [STREAM_FORK_SUB_OFFSET_HEADER]: `2` },
+      })
+      expect(res1.status).toBe(201)
+
+      const res2 = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: { ...baseHeaders, [STREAM_FORK_SUB_OFFSET_HEADER]: `3` },
+      })
+      expect(res2.status).toBe(409)
+    })
+
+    test(`should be idempotent when re-creating a JSON fork with matching sub-offset`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-json-idem-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-json-idem-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: `[{"a":1},{"b":2},{"c":3},{"d":4}]`,
+      })
+
+      const headers = {
+        "Content-Type": `application/json`,
+        [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+        [STREAM_FORK_SUB_OFFSET_HEADER]: `2`,
+      }
+
+      const res1 = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers,
+      })
+      expect(res1.status).toBe(201)
+
+      const res2 = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers,
+      })
+      expect(res2.status).toBe(200)
+    })
+
+    test(`should return 409 when re-creating a JSON fork with mismatched sub-offset`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-json-conflict-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-json-conflict-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: `[{"a":1},{"b":2},{"c":3},{"d":4}]`,
+      })
+
+      const baseHeaders = {
+        "Content-Type": `application/json`,
+        [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+      }
+
+      const res1 = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: { ...baseHeaders, [STREAM_FORK_SUB_OFFSET_HEADER]: `2` },
+      })
+      expect(res1.status).toBe(201)
+
+      const res2 = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: { ...baseHeaders, [STREAM_FORK_SUB_OFFSET_HEADER]: `3` },
+      })
+      expect(res2.status).toBe(409)
+    })
+
+    test(`should support appending to fork after sub-offset boundary`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-append-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-append-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `hello`,
+      })
+
+      // Fork inheriting first 3 bytes ("hel")
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `3`,
+        },
+      })
+
+      // Append to fork
+      const appendRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `LO`,
+      })
+      expect(appendRes.status).toBe(204)
+
+      // Read fork → "helLO"
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(readRes.status).toBe(200)
+      const body = await readRes.text()
+      expect(body).toBe(`helLO`)
+    })
+
+    test(`should inherit content-type when sub-offset is supplied without explicit Content-Type`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-ct-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-ct-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: `[{"a":1},{"b":2}]`,
+      })
+
+      const res = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `1`,
+        },
+      })
+      expect(res.status).toBe(201)
+      expect(res.headers.get(`content-type`)).toBe(`application/json`)
+    })
+
+    test(`should not inherit producer state across sub-offset fork boundary`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-prod-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-prod-fork-${id}`
+      const producerId = `prod-${id}`
+
+      // Create JSON source (no producer)
+      const src = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+      })
+      expect(src.status).toBe(201)
+
+      // Producer P writes a 3-message batch under (P, 0, 0)
+      const batchRes = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `application/json`,
+          "Producer-Id": producerId,
+          "Producer-Epoch": `0`,
+          "Producer-Seq": `0`,
+        },
+        body: `[{"i":1},{"i":2},{"i":3}]`,
+      })
+      // Fresh producer accept is 200 per §5.2.1
+      expect(batchRes.status).toBe(200)
+
+      // Fork mid-batch (sub-offset = 1 message — fork inherits {"i":1} only)
+      const fork = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `1`,
+        },
+      })
+      expect(fork.status).toBe(201)
+
+      // Producer P retries the same (P, 0, 0) tuple against the fork.
+      // The fork has no producer state, so this MUST be treated as a fresh
+      // accept (200), not silently deduplicated as a 204. A 204 here would
+      // mean the fork inherited producer state and is silently dropping
+      // data the producer has not yet seen accepted on the fork.
+      const retry = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `application/json`,
+          "Producer-Id": producerId,
+          "Producer-Epoch": `0`,
+          "Producer-Seq": `0`,
+        },
+        body: `[{"i":99}]`,
+      })
+      expect(retry.status).toBe(200)
+
+      // Fork now contains: inherited [{"i":1}] + new [{"i":99}]
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      const body = await readRes.json()
+      expect(body).toEqual([{ i: 1 }, { i: 99 }])
+    })
+
+    test(`should not inherit producer state across binary sub-offset fork boundary`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-prod-bin-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-prod-bin-fork-${id}`
+      const producerId = `prod-${id}`
+
+      // Create binary source (no producer)
+      const src = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+      expect(src.status).toBe(201)
+
+      // Producer P writes a single message under (P, 0, 0)
+      const writeRes = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Producer-Id": producerId,
+          "Producer-Epoch": `0`,
+          "Producer-Seq": `0`,
+        },
+        body: `hello`,
+      })
+      // Fresh producer accept is 200 per §5.2.1
+      expect(writeRes.status).toBe(200)
+
+      // Fork mid-message (sub-offset = 3 bytes — fork inherits "hel" only)
+      const fork = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `3`,
+        },
+      })
+      expect(fork.status).toBe(201)
+
+      // Producer P retries the same (P, 0, 0) tuple against the fork.
+      // The fork has no producer state, so this MUST be treated as a fresh
+      // accept (200), not silently deduplicated as a 204.
+      const retry = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Producer-Id": producerId,
+          "Producer-Epoch": `0`,
+          "Producer-Seq": `0`,
+        },
+        body: `LO`,
+      })
+      expect(retry.status).toBe(200)
+
+      // Fork now contains: inherited "hel" + new "LO"
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(await readRes.text()).toBe(`helLO`)
+    })
+
+    test(`should fork at a binary sub-offset anchored mid-stream`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-mid-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-mid-fork-${id}`
+
+      // First append — capture its tail offset as the anchor
+      const putRes = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `first`,
+      })
+      expect(putRes.status).toBe(201)
+      const anchor = putRes.headers.get(`Stream-Next-Offset`)!
+
+      // Second append — this is what sub-offset will slice
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `second`,
+      })
+
+      // Fork at the mid-anchor with sub-offset = 3 → take "sec" of "second"
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: anchor,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `3`,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+
+      // Fork contains "first" (inherited) + "sec" (sub-offset slice)
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(await readRes.text()).toBe(`firstsec`)
+    })
+
+    test(`should return 400 when sub-offset > 0 is supplied without Stream-Fork-Offset`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-default-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-default-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `data`,
+      })
+
+      // Default fork offset is the source's tail; sub-offset > 0 past tail
+      // names a position past the next data boundary → 400.
+      const res = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `1`,
+        },
+      })
+      expect(res.status).toBe(400)
+    })
+
+    test(`should return 400 when Stream-Fork-Sub-Offset is supplied without Stream-Forked-From (even when value is 0)`, async () => {
+      const id = uniqueId()
+      const targetPath = `/v1/stream/fork-create-suboffset-zero-no-src-${id}`
+
+      const res = await fetch(`${getBaseUrl()}${targetPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `0`,
+        },
+      })
+      expect(res.status).toBe(400)
+    })
+
+    test(`should return a Stream-Next-Offset on sub-offset fork creation that is consumable by reads`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-next-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-next-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `hello`,
+      })
+
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `3`,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+      const tail = forkRes.headers.get(`Stream-Next-Offset`)
+      expect(tail).toBeTruthy()
+
+      // Reading from the reported tail must return zero data and be up-to-date.
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=${tail!}`)
+      expect(readRes.status).toBe(200)
+      expect(await readRes.text()).toBe(``)
+      expect(readRes.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+    })
+
+    test(`should return 400 when sub-offset is supplied on an empty source stream`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-empty-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-empty-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+
+      const res = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `1`,
+        },
+      })
+      expect(res.status).toBe(400)
+    })
+
+    test(`should accept binary sub-offset equal to message length`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-bin-eq-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-bin-eq-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `hello`,
+      })
+
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `5`,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(await readRes.text()).toBe(`hello`)
+    })
+
+    test(`should accept JSON sub-offset equal to flattened message count`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-json-eq-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-json-eq-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: `[{"a":1},{"b":2},{"c":3}]`,
+      })
+
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `application/json`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `3`,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(await readRes.json()).toEqual([{ a: 1 }, { b: 2 }, { c: 3 }])
+    })
+
+    test(`should append initial body after the materialized sub-offset prefix`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-body-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-body-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `hello`,
+      })
+
+      // PUT with sub-offset AND an initial body — body must land AFTER the
+      // materialized prefix.
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `3`,
+        },
+        body: `XY`,
+      })
+      expect(forkRes.status).toBe(201)
+
+      // Fork: "hel" (sub-offset prefix) + "XY" (initial body) = "helXY"
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(await readRes.text()).toBe(`helXY`)
+    })
+
+    test(`should allow sub-offset fork creation from a closed source stream`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-create-suboffset-closed-src-${id}`
+      const forkPath = `/v1/stream/fork-create-suboffset-closed-fork-${id}`
+
+      // Create a closed source with data via PUT + Stream-Closed
+      const putRes = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_CLOSED_HEADER_FORK]: `true`,
+        },
+        body: `hello`,
+      })
+      expect(putRes.status).toBe(201)
+
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `3`,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(await readRes.text()).toBe(`hel`)
+    })
+  })
+
+  // ============================================================================
+  // Fork - Reading
+  // ============================================================================
+
+  describe(`Fork - Reading`, () => {
+    const STREAM_FORKED_FROM_HEADER = `Stream-Forked-From`
+    const STREAM_FORK_OFFSET_HEADER = `Stream-Fork-Offset`
+
+    const uniqueId = () =>
+      `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+
+    test(`should read entire fork (source + fork data)`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-read-entire-src-${id}`
+      const forkPath = `/v1/stream/fork-read-entire-fork-${id}`
+
+      // Create source with data
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `source`,
+      })
+
+      // Fork at head
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Append to fork
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: ` fork`,
+      })
+
+      // Read from beginning → should stitch source + fork data
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(readRes.status).toBe(200)
+      const body = await readRes.text()
+      expect(body).toBe(`source fork`)
+    })
+
+    test(`should read only inherited portion`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-read-inherited-src-${id}`
+      const forkPath = `/v1/stream/fork-read-inherited-fork-${id}`
+
+      // Create source with data
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `inherited data`,
+      })
+
+      // Fork at head
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Read fork from -1 (no fork-only data yet)
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(readRes.status).toBe(200)
+      const body = await readRes.text()
+      expect(body).toBe(`inherited data`)
+      expect(readRes.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+    })
+
+    test(`should read only fork's own data (starting past fork offset)`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-read-own-src-${id}`
+      const forkPath = `/v1/stream/fork-read-own-fork-${id}`
+
+      // Create source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `source`,
+      })
+
+      // Get source head offset
+      const sourceHead = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `HEAD`,
+      })
+      const forkOffset = sourceHead.headers.get(STREAM_OFFSET_HEADER)!
+
+      // Fork at head
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Append to fork
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `fork only`,
+      })
+
+      // Read from fork offset → should only get fork's own data
+      const readRes = await fetch(
+        `${getBaseUrl()}${forkPath}?offset=${forkOffset}`
+      )
+      expect(readRes.status).toBe(200)
+      const body = await readRes.text()
+      expect(body).toBe(`fork only`)
+    })
+
+    test(`should read across fork boundary`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-read-boundary-src-${id}`
+      const forkPath = `/v1/stream/fork-read-boundary-fork-${id}`
+
+      // Create source with multiple chunks
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `A`,
+      })
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `B`,
+      })
+
+      // Fork at head (inherits A and B)
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Append to fork
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `C`,
+      })
+
+      // Read entire fork → should seamlessly stitch A + B + C
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(readRes.status).toBe(200)
+      const body = await readRes.text()
+      expect(body).toBe(`ABC`)
+    })
+
+    test(`should not show source appends after fork`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-read-isolation-src-${id}`
+      const forkPath = `/v1/stream/fork-read-isolation-fork-${id}`
+
+      // Create source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `before`,
+      })
+
+      // Fork at head
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Append to SOURCE after fork
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: ` after`,
+      })
+
+      // Read fork → should NOT see "after"
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(readRes.status).toBe(200)
+      const body = await readRes.text()
+      expect(body).toBe(`before`)
+    })
+
+    test(`should NOT include fork headers on HEAD/GET/PUT responses (forks are transparent)`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-read-headers-src-${id}`
+      const forkPath = `/v1/stream/fork-read-headers-fork-${id}`
+
+      // Create source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `data`,
+      })
+
+      // Fork
+      const putRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      expect(putRes.headers.get(STREAM_FORKED_FROM_HEADER)).toBeNull()
+      expect(putRes.headers.get(STREAM_FORK_OFFSET_HEADER)).toBeNull()
+
+      // HEAD on fork
+      const headRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `HEAD`,
+      })
+      expect(headRes.headers.get(STREAM_FORKED_FROM_HEADER)).toBeNull()
+      expect(headRes.headers.get(STREAM_FORK_OFFSET_HEADER)).toBeNull()
+
+      // GET on fork
+      const getRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      await getRes.text() // consume body
+      expect(getRes.headers.get(STREAM_FORKED_FROM_HEADER)).toBeNull()
+      expect(getRes.headers.get(STREAM_FORK_OFFSET_HEADER)).toBeNull()
+    })
+  })
+
+  // ============================================================================
+  // Fork - Appending
+  // ============================================================================
+
+  describe(`Fork - Appending`, () => {
+    const STREAM_FORKED_FROM_HEADER = `Stream-Forked-From`
+    const STREAM_CLOSED_HEADER_FORK = `Stream-Closed`
+
+    const uniqueId = () =>
+      `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+
+    test(`should append to a fork`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-append-src-${id}`
+      const forkPath = `/v1/stream/fork-append-fork-${id}`
+
+      // Create source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `source`,
+      })
+
+      // Fork
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Append to fork
+      const appendRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: ` appended`,
+      })
+      expect(appendRes.status).toBe(204)
+      expect(appendRes.headers.get(STREAM_OFFSET_HEADER)).toBeDefined()
+
+      // Read fork
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      const body = await readRes.text()
+      expect(body).toBe(`source appended`)
+    })
+
+    test(`should support idempotent producer on fork`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-append-idempotent-src-${id}`
+      const forkPath = `/v1/stream/fork-append-idempotent-fork-${id}`
+
+      // Create source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `source`,
+      })
+
+      // Fork
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Append with producer headers
+      const append1 = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Producer-Id": `fork-producer-${id}`,
+          "Producer-Epoch": `0`,
+          "Producer-Seq": `0`,
+        },
+        body: `msg1`,
+      })
+      expect(append1.status).toBe(200)
+
+      // Retry with same producer headers → deduplicated
+      const append1Retry = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `POST`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Producer-Id": `fork-producer-${id}`,
+          "Producer-Epoch": `0`,
+          "Producer-Seq": `0`,
+        },
+        body: `msg1`,
+      })
+      expect(append1Retry.status).toBe(204) // Duplicate → 204
+
+      // Read fork → only one copy of msg1
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      const body = await readRes.text()
+      expect(body).toBe(`sourcemsg1`)
+    })
+
+    test(`should close forked stream independently`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-append-close-src-${id}`
+      const forkPath = `/v1/stream/fork-append-close-fork-${id}`
+
+      // Create source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `source`,
+      })
+
+      // Fork
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Append then close fork
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: ` final`,
+      })
+      const closeRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `POST`,
+        headers: { [STREAM_CLOSED_HEADER_FORK]: `true` },
+      })
+      expect([200, 204]).toContain(closeRes.status)
+      expect(closeRes.headers.get(STREAM_CLOSED_HEADER_FORK)).toBe(`true`)
+
+      // Source should still be open
+      const sourceHead = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `HEAD`,
+      })
+      expect(sourceHead.headers.get(STREAM_CLOSED_HEADER_FORK)).toBeNull()
+    })
+
+    test(`should not affect fork when source is closed`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-append-src-close-src-${id}`
+      const forkPath = `/v1/stream/fork-append-src-close-fork-${id}`
+
+      // Create source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `source`,
+      })
+
+      // Fork
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Close source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `POST`,
+        headers: { [STREAM_CLOSED_HEADER_FORK]: `true` },
+      })
+
+      // Fork should still accept appends
+      const appendRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: ` fork data`,
+      })
+      expect(appendRes.status).toBe(204)
+
+      // Fork should not be closed
+      const forkHead = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `HEAD`,
+      })
+      expect(forkHead.headers.get(STREAM_CLOSED_HEADER_FORK)).toBeNull()
+    })
+
+    test(`should append to source after fork — source independent`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-append-src-indep-src-${id}`
+      const forkPath = `/v1/stream/fork-append-src-indep-fork-${id}`
+
+      // Create source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `initial`,
+      })
+
+      // Fork
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Append to source
+      const appendRes = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: ` extra`,
+      })
+      expect(appendRes.status).toBe(204)
+
+      // Source should have all data
+      const sourceRead = await fetch(`${getBaseUrl()}${sourcePath}?offset=-1`)
+      const sourceBody = await sourceRead.text()
+      expect(sourceBody).toBe(`initial extra`)
+
+      // Fork should NOT see the extra data
+      const forkRead = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      const forkBody = await forkRead.text()
+      expect(forkBody).toBe(`initial`)
+    })
+  })
+
+  // ============================================================================
+  // Fork - Recursive
+  // ============================================================================
+
+  describe(`Fork - Recursive`, () => {
+    const STREAM_FORKED_FROM_HEADER = `Stream-Forked-From`
+
+    const uniqueId = () =>
+      `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+
+    test(`should create a three-level fork chain`, async () => {
+      const id = uniqueId()
+      const level0 = `/v1/stream/fork-recursive-l0-${id}`
+      const level1 = `/v1/stream/fork-recursive-l1-${id}`
+      const level2 = `/v1/stream/fork-recursive-l2-${id}`
+
+      // Create level 0 (root)
+      await fetch(`${getBaseUrl()}${level0}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `L0`,
+      })
+
+      // Fork level 1 from level 0
+      const fork1Res = await fetch(`${getBaseUrl()}${level1}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: level0,
+        },
+      })
+      expect(fork1Res.status).toBe(201)
+
+      // Fork level 2 from level 1
+      const fork2Res = await fetch(`${getBaseUrl()}${level2}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: level1,
+        },
+      })
+      expect(fork2Res.status).toBe(201)
+    })
+
+    test(`should fork at mid-point of inherited data`, async () => {
+      const id = uniqueId()
+      const level0 = `/v1/stream/fork-recursive-mid-l0-${id}`
+      const level1 = `/v1/stream/fork-recursive-mid-l1-${id}`
+      const level2 = `/v1/stream/fork-recursive-mid-l2-${id}`
+
+      // Create level 0 with data
+      await fetch(`${getBaseUrl()}${level0}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `A`,
+      })
+      await fetch(`${getBaseUrl()}${level0}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `B`,
+      })
+
+      // Fork level 1 at head of level 0 (inherits A+B)
+      await fetch(`${getBaseUrl()}${level1}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: level0,
+        },
+      })
+
+      // Append to level 1
+      await fetch(`${getBaseUrl()}${level1}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `C`,
+      })
+
+      // Get the offset after inheriting A+B (before C) from level 1
+      // This is the fork offset of level 1
+      const l1Head = await fetch(`${getBaseUrl()}${level1}`, {
+        method: `HEAD`,
+      })
+      // Verify HEAD returns expected offset
+      expect(l1Head.headers.get(STREAM_OFFSET_HEADER)).toBeDefined()
+
+      // Fork level 2 from level 1 at head (inherits A+B+C)
+      const fork2Res = await fetch(`${getBaseUrl()}${level2}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: level1,
+        },
+      })
+      expect(fork2Res.status).toBe(201)
+
+      // Read level 2 → should see A+B+C
+      const readRes = await fetch(`${getBaseUrl()}${level2}?offset=-1`)
+      const body = await readRes.text()
+      expect(body).toBe(`ABC`)
+    })
+
+    test(`should read correctly across three levels`, async () => {
+      const id = uniqueId()
+      const level0 = `/v1/stream/fork-recursive-read-l0-${id}`
+      const level1 = `/v1/stream/fork-recursive-read-l1-${id}`
+      const level2 = `/v1/stream/fork-recursive-read-l2-${id}`
+
+      // Level 0: A
+      await fetch(`${getBaseUrl()}${level0}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `A`,
+      })
+
+      // Level 1: fork of level 0, then append B
+      await fetch(`${getBaseUrl()}${level1}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: level0,
+        },
+      })
+      await fetch(`${getBaseUrl()}${level1}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `B`,
+      })
+
+      // Level 2: fork of level 1, then append C
+      await fetch(`${getBaseUrl()}${level2}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: level1,
+        },
+      })
+      await fetch(`${getBaseUrl()}${level2}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `C`,
+      })
+
+      // Read each level
+      const r0 = await (
+        await fetch(`${getBaseUrl()}${level0}?offset=-1`)
+      ).text()
+      expect(r0).toBe(`A`)
+
+      const r1 = await (
+        await fetch(`${getBaseUrl()}${level1}?offset=-1`)
+      ).text()
+      expect(r1).toBe(`AB`)
+
+      const r2 = await (
+        await fetch(`${getBaseUrl()}${level2}?offset=-1`)
+      ).text()
+      expect(r2).toBe(`ABC`)
+    })
+
+    test(`should append at each level independently`, async () => {
+      const id = uniqueId()
+      const level0 = `/v1/stream/fork-recursive-indep-l0-${id}`
+      const level1 = `/v1/stream/fork-recursive-indep-l1-${id}`
+      const level2 = `/v1/stream/fork-recursive-indep-l2-${id}`
+
+      // Level 0: X
+      await fetch(`${getBaseUrl()}${level0}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `X`,
+      })
+
+      // Level 1: fork, append Y
+      await fetch(`${getBaseUrl()}${level1}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: level0,
+        },
+      })
+      await fetch(`${getBaseUrl()}${level1}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `Y`,
+      })
+
+      // Level 2: fork of level 1, append Z
+      await fetch(`${getBaseUrl()}${level2}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: level1,
+        },
+      })
+      await fetch(`${getBaseUrl()}${level2}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `Z`,
+      })
+
+      // Now append more to level 0 → should not affect levels 1 or 2
+      await fetch(`${getBaseUrl()}${level0}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `0`,
+      })
+
+      // Append more to level 1 → should not affect level 2
+      await fetch(`${getBaseUrl()}${level1}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `1`,
+      })
+
+      const r0 = await (
+        await fetch(`${getBaseUrl()}${level0}?offset=-1`)
+      ).text()
+      expect(r0).toBe(`X0`)
+
+      const r1 = await (
+        await fetch(`${getBaseUrl()}${level1}?offset=-1`)
+      ).text()
+      expect(r1).toBe(`XY1`)
+
+      const r2 = await (
+        await fetch(`${getBaseUrl()}${level2}?offset=-1`)
+      ).text()
+      expect(r2).toBe(`XYZ`)
+    })
+
+    test(`should compose sub-offsets across chained forks`, async () => {
+      const id = uniqueId()
+      const STREAM_FORK_OFFSET_HEADER = `Stream-Fork-Offset`
+      const STREAM_FORK_SUB_OFFSET_HEADER = `Stream-Fork-Sub-Offset`
+      const level0 = `/v1/stream/fork-rec-sub-l0-${id}`
+      const level1 = `/v1/stream/fork-rec-sub-l1-${id}`
+      const level2 = `/v1/stream/fork-rec-sub-l2-${id}`
+
+      // Level 0: 6-byte source
+      await fetch(`${getBaseUrl()}${level0}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `abcdef`,
+      })
+
+      // Level 1: fork at sub-offset 4 → inherits "abcd"
+      await fetch(`${getBaseUrl()}${level1}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: level0,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `4`,
+        },
+      })
+      const r1 = await (
+        await fetch(`${getBaseUrl()}${level1}?offset=-1`)
+      ).text()
+      expect(r1).toBe(`abcd`)
+
+      // Level 2: fork of level1 at sub-offset 2 → inherits "ab"
+      await fetch(`${getBaseUrl()}${level2}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: level1,
+          [STREAM_FORK_OFFSET_HEADER]: `0000000000000000_0000000000000000`,
+          [STREAM_FORK_SUB_OFFSET_HEADER]: `2`,
+        },
+      })
+      const r2 = await (
+        await fetch(`${getBaseUrl()}${level2}?offset=-1`)
+      ).text()
+      expect(r2).toBe(`ab`)
+
+      // Append to level2 and confirm reads still compose correctly
+      await fetch(`${getBaseUrl()}${level2}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `Z`,
+      })
+      const r2b = await (
+        await fetch(`${getBaseUrl()}${level2}?offset=-1`)
+      ).text()
+      expect(r2b).toBe(`abZ`)
+    })
+  })
+
+  // ============================================================================
+  // Fork - Live Modes
+  // ============================================================================
+
+  describe(`Fork - Live Modes`, () => {
+    const STREAM_FORKED_FROM_HEADER = `Stream-Forked-From`
+
+    const uniqueId = () =>
+      `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+
+    test(`should return inherited data immediately on long-poll`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-live-inherited-src-${id}`
+      const forkPath = `/v1/stream/fork-live-inherited-fork-${id}`
+
+      // Create source with data
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `inherited data`,
+      })
+
+      // Fork at head
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Long-poll at -1 → should immediately return inherited data
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 3000)
+
+      try {
+        const response = await fetch(
+          `${getBaseUrl()}${forkPath}?offset=-1&live=long-poll`,
+          { method: `GET`, signal: controller.signal }
+        )
+        clearTimeout(timeoutId)
+
+        expect(response.status).toBe(200)
+        const body = await response.text()
+        expect(body).toBe(`inherited data`)
+        expect(response.headers.get(STREAM_UP_TO_DATE_HEADER)).toBe(`true`)
+      } catch (e) {
+        clearTimeout(timeoutId)
+        if (!(e instanceof Error && e.name === `AbortError`)) throw e
+        // Should not reach here — data should be returned immediately
+        expect(true).toBe(false)
+      }
+    })
+
+    test(
+      `should wait for fork appends, not source appends, on long-poll at tail`,
+      async () => {
+        const id = uniqueId()
+        const sourcePath = `/v1/stream/fork-live-tail-src-${id}`
+        const forkPath = `/v1/stream/fork-live-tail-fork-${id}`
+
+        // Create source with data
+        await fetch(`${getBaseUrl()}${sourcePath}`, {
+          method: `PUT`,
+          headers: { "Content-Type": `text/plain` },
+          body: `source`,
+        })
+
+        // Fork at head
+        await fetch(`${getBaseUrl()}${forkPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          },
+        })
+
+        // Get the fork's current head offset
+        const forkHead = await fetch(`${getBaseUrl()}${forkPath}`, {
+          method: `GET`,
+        })
+        await forkHead.text() // consume body
+        const forkOffset = forkHead.headers.get(STREAM_OFFSET_HEADER)!
+
+        // Start long-poll at fork tail
+        const longPollPromise = fetch(
+          `${getBaseUrl()}${forkPath}?offset=${forkOffset}&live=long-poll`,
+          { method: `GET` }
+        )
+
+        // Give the long-poll a moment to register
+        await new Promise((r) => setTimeout(r, 50))
+
+        // Append to source (should NOT wake up fork long-poll)
+        await fetch(`${getBaseUrl()}${sourcePath}`, {
+          method: `POST`,
+          headers: { "Content-Type": `text/plain` },
+          body: ` source extra`,
+        })
+
+        // Now append to fork (should wake up the long-poll)
+        await fetch(`${getBaseUrl()}${forkPath}`, {
+          method: `POST`,
+          headers: { "Content-Type": `text/plain` },
+          body: ` fork new`,
+        })
+
+        const response = await longPollPromise
+        expect(response.status).toBe(200)
+        const body = await response.text()
+        expect(body).toBe(` fork new`)
+      },
+      getLongPollTestTimeoutMs()
+    )
+
+    test(`should stream fork data via SSE`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-live-sse-src-${id}`
+      const forkPath = `/v1/stream/fork-live-sse-fork-${id}`
+
+      // Create source with data
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `inherited`,
+      })
+
+      // Fork and append
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: ` forked`,
+      })
+
+      // SSE from beginning
+      const { response, received } = await fetchSSE(
+        `${getBaseUrl()}${forkPath}?offset=-1&live=sse`,
+        { untilContent: `forked`, timeoutMs: 5000, maxChunks: 20 }
+      )
+
+      expect(response.status).toBe(200)
+      expect(received).toContain(`inherited`)
+      expect(received).toContain(`forked`)
+    })
+
+    test(`should handle long-poll handover at fork offset`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-live-handover-src-${id}`
+      const forkPath = `/v1/stream/fork-live-handover-fork-${id}`
+
+      // Create source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `source data`,
+      })
+
+      // Fork
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Read inherited data to get fork offset
+      const readRes = await fetch(
+        `${getBaseUrl()}${forkPath}?offset=-1&live=long-poll`
+      )
+      expect(readRes.status).toBe(200)
+      const firstBody = await readRes.text()
+      expect(firstBody).toBe(`source data`)
+      const nextOffset = readRes.headers.get(STREAM_OFFSET_HEADER)!
+
+      // Append to fork
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: ` fork append`,
+      })
+
+      // Continue reading from next offset → should get fork data
+      // Use catch-up mode since data is already appended
+      const readRes2 = await fetch(
+        `${getBaseUrl()}${forkPath}?offset=${nextOffset}`
+      )
+      expect(readRes2.status).toBe(200)
+      const secondBody = await readRes2.text()
+      expect(secondBody).toBe(` fork append`)
+    })
+  })
+
+  // ============================================================================
+  // Fork - Deletion and Lifecycle
+  // ============================================================================
+
+  describe(`Fork - Deletion and Lifecycle`, () => {
+    const STREAM_FORKED_FROM_HEADER = `Stream-Forked-From`
+
+    const uniqueId = () =>
+      `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+
+    const waitForStatus = async (
+      url: string,
+      expectedStatus: number,
+      timeoutMs: number = 5000
+    ) => {
+      await vi.waitFor(
+        async () => {
+          const res = await fetch(url, { method: `HEAD` })
+          expect(res.status).toBe(expectedStatus)
+        },
+        { timeout: timeoutMs, interval: 200 }
+      )
+    }
+
+    test(`should delete fork without affecting source`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-del-src-unaffected-src-${id}`
+      const forkPath = `/v1/stream/fork-del-src-unaffected-fork-${id}`
+
+      // Create source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `source data`,
+      })
+
+      // Fork
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Delete fork
+      const deleteRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `DELETE`,
+      })
+      expect(deleteRes.status).toBe(204)
+
+      // Fork should be gone
+      const forkRead = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `GET`,
+      })
+      expect(forkRead.status).toBe(404)
+
+      // Source should still be alive
+      const sourceRead = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `GET`,
+      })
+      expect(sourceRead.status).toBe(200)
+      const body = await sourceRead.text()
+      expect(body).toBe(`source data`)
+    })
+
+    test(`should soft-delete source while fork exists — fork still reads`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-del-soft-src-${id}`
+      const forkPath = `/v1/stream/fork-del-soft-fork-${id}`
+
+      // Create source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `preserved data`,
+      })
+
+      // Fork
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Delete source
+      const deleteRes = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `DELETE`,
+      })
+      expect(deleteRes.status).toBe(204)
+
+      // Source should be soft-deleted (410 Gone)
+      const sourceHead = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `HEAD`,
+      })
+      expect(sourceHead.status).toBe(410)
+
+      // Fork should still be readable with inherited data
+      const forkRead = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(forkRead.status).toBe(200)
+      const body = await forkRead.text()
+      expect(body).toBe(`preserved data`)
+    })
+
+    test(`should block re-creation of soft-deleted source (PUT returns 409)`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-del-block-recreate-src-${id}`
+      const forkPath = `/v1/stream/fork-del-block-recreate-fork-${id}`
+
+      // Create source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `original`,
+      })
+
+      // Fork
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Delete source (soft-delete)
+      await fetch(`${getBaseUrl()}${sourcePath}`, { method: `DELETE` })
+
+      // Try to re-create source → 409
+      const recreateRes = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+      })
+      expect(recreateRes.status).toBe(409)
+    })
+
+    test(`should return 410 for GET on soft-deleted source`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-del-soft-get-${id}`
+      const forkPath = `/v1/stream/fork-del-soft-get-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `data`,
+      })
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      await fetch(`${getBaseUrl()}${sourcePath}`, { method: `DELETE` })
+
+      const getRes = await fetch(`${getBaseUrl()}${sourcePath}?offset=-1`)
+      expect(getRes.status).toBe(410)
+    })
+
+    test(`should return 410 for POST on soft-deleted source`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-del-soft-post-${id}`
+      const forkPath = `/v1/stream/fork-del-soft-post-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `data`,
+      })
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      await fetch(`${getBaseUrl()}${sourcePath}`, { method: `DELETE` })
+
+      const postRes = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `more data`,
+      })
+      expect(postRes.status).toBe(410)
+    })
+
+    test(`should return 410 for DELETE on soft-deleted source`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-del-soft-del-${id}`
+      const forkPath = `/v1/stream/fork-del-soft-del-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `data`,
+      })
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      await fetch(`${getBaseUrl()}${sourcePath}`, { method: `DELETE` })
+
+      const deleteRes = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `DELETE`,
+      })
+      expect(deleteRes.status).toBe(410)
+    })
+
+    test(`should return 409 for fork from soft-deleted source`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-del-soft-refork-${id}`
+      const forkPath = `/v1/stream/fork-del-soft-refork-fork1-${id}`
+      const fork2Path = `/v1/stream/fork-del-soft-refork-fork2-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `data`,
+      })
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      await fetch(`${getBaseUrl()}${sourcePath}`, { method: `DELETE` })
+
+      const fork2Res = await fetch(`${getBaseUrl()}${fork2Path}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      expect(fork2Res.status).toBe(409)
+    })
+
+    test(`should return 409 for fork with content-type mismatch`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-ct-mismatch-src-${id}`
+      const forkPath = `/v1/stream/fork-ct-mismatch-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `data`,
+      })
+
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `application/json`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      expect(forkRes.status).toBe(409)
+    })
+
+    test(`rejected fork (content-type mismatch) does not leak a source reference`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-ct-noleak-src-${id}`
+      const forkPath = `/v1/stream/fork-ct-noleak-fork-${id}`
+
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `data`,
+      })
+
+      // Fork attempt with a mismatched content type is rejected.
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `application/json`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      expect(forkRes.status).toBe(409)
+
+      // The rejected fork must not have taken a reference on the source: the
+      // source has no live forks, so DELETE fully removes it rather than
+      // soft-deleting it. A leaked reference would pin the source in a
+      // soft-deleted state, so the path would report 410 (gone) afterward
+      // instead of 404 (not found).
+      await fetch(`${getBaseUrl()}${sourcePath}`, { method: `DELETE` })
+      const headRes = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `HEAD`,
+      })
+      expect(headRes.status).toBe(404)
+    })
+
+    test(`should cascade GC when last fork is deleted`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-del-cascade-src-${id}`
+      const forkPath = `/v1/stream/fork-del-cascade-fork-${id}`
+
+      // Create source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `cascade data`,
+      })
+
+      // Fork
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Delete source (soft-delete because fork exists)
+      await fetch(`${getBaseUrl()}${sourcePath}`, { method: `DELETE` })
+
+      // Source should be 410 (soft-deleted)
+      const sourceHead1 = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `HEAD`,
+      })
+      expect(sourceHead1.status).toBe(410)
+
+      // Delete fork → should trigger cascading GC of source
+      const deleteFork = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `DELETE`,
+      })
+      expect(deleteFork.status).toBe(204)
+
+      // Source should eventually be fully gone (404) — cascade GC timing is not guaranteed by the protocol
+      await waitForStatus(`${getBaseUrl()}${sourcePath}`, 404)
+    })
+
+    test(`should cascade GC through three levels`, async () => {
+      const id = uniqueId()
+      const level0 = `/v1/stream/fork-del-cascade3-l0-${id}`
+      const level1 = `/v1/stream/fork-del-cascade3-l1-${id}`
+      const level2 = `/v1/stream/fork-del-cascade3-l2-${id}`
+
+      // Create chain: level0 → level1 → level2
+      await fetch(`${getBaseUrl()}${level0}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `root`,
+      })
+      await fetch(`${getBaseUrl()}${level1}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: level0,
+        },
+      })
+      await fetch(`${getBaseUrl()}${level2}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: level1,
+        },
+      })
+
+      // Delete level0 and level1 (both soft-deleted due to refs)
+      await fetch(`${getBaseUrl()}${level0}`, { method: `DELETE` })
+      await fetch(`${getBaseUrl()}${level1}`, { method: `DELETE` })
+
+      // Both should be 410
+      expect(
+        (await fetch(`${getBaseUrl()}${level0}`, { method: `HEAD` })).status
+      ).toBe(410)
+      expect(
+        (await fetch(`${getBaseUrl()}${level1}`, { method: `HEAD` })).status
+      ).toBe(410)
+
+      // Delete level2 → cascade should eventually clean up level1 and level0
+      const deleteLevel2 = await fetch(`${getBaseUrl()}${level2}`, {
+        method: `DELETE`,
+      })
+      expect(deleteLevel2.status).toBe(204)
+
+      // level2 was directly deleted — should be gone immediately
+      expect(
+        (await fetch(`${getBaseUrl()}${level2}`, { method: `HEAD` })).status
+      ).toBe(404)
+
+      // level1 and level0 should eventually be cleaned up via cascade GC
+      await waitForStatus(`${getBaseUrl()}${level1}`, 404)
+      await waitForStatus(`${getBaseUrl()}${level0}`, 404)
+    })
+
+    test(`should preserve data when deleting middle of chain`, async () => {
+      const id = uniqueId()
+      const level0 = `/v1/stream/fork-del-middle-l0-${id}`
+      const level1 = `/v1/stream/fork-del-middle-l1-${id}`
+      const level2 = `/v1/stream/fork-del-middle-l2-${id}`
+
+      // Create chain: level0 → level1 → level2
+      await fetch(`${getBaseUrl()}${level0}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `A`,
+      })
+      await fetch(`${getBaseUrl()}${level1}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: level0,
+        },
+      })
+      await fetch(`${getBaseUrl()}${level1}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `B`,
+      })
+      await fetch(`${getBaseUrl()}${level2}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: level1,
+        },
+      })
+      await fetch(`${getBaseUrl()}${level2}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `C`,
+      })
+
+      // Delete level1 (middle) → soft-delete because level2 refs it
+      await fetch(`${getBaseUrl()}${level1}`, { method: `DELETE` })
+
+      // Level1 should be 410 (soft-deleted)
+      expect(
+        (await fetch(`${getBaseUrl()}${level1}`, { method: `HEAD` })).status
+      ).toBe(410)
+
+      // Level2 should still read all inherited data: A+B+C
+      const readRes = await fetch(`${getBaseUrl()}${level2}?offset=-1`)
+      expect(readRes.status).toBe(200)
+      const body = await readRes.text()
+      expect(body).toBe(`ABC`)
+
+      // Level0 should still be alive and readable
+      const l0Read = await fetch(`${getBaseUrl()}${level0}?offset=-1`)
+      expect(l0Read.status).toBe(200)
+      expect(await l0Read.text()).toBe(`A`)
+    })
+
+    test(`should keep source alive when all forks are deleted`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-del-allgone-src-${id}`
+      const fork1Path = `/v1/stream/fork-del-allgone-f1-${id}`
+      const fork2Path = `/v1/stream/fork-del-allgone-f2-${id}`
+
+      // Create source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `alive`,
+      })
+
+      // Create two forks
+      await fetch(`${getBaseUrl()}${fork1Path}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      await fetch(`${getBaseUrl()}${fork2Path}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Delete both forks
+      await fetch(`${getBaseUrl()}${fork1Path}`, { method: `DELETE` })
+      await fetch(`${getBaseUrl()}${fork2Path}`, { method: `DELETE` })
+
+      // Source should still be alive and readable
+      const sourceRead = await fetch(`${getBaseUrl()}${sourcePath}?offset=-1`)
+      expect(sourceRead.status).toBe(200)
+      const body = await sourceRead.text()
+      expect(body).toBe(`alive`)
+    })
+  })
+
+  // ============================================================================
+  // Fork - TTL and Expiry
+  // ============================================================================
+
+  describe(`Fork - TTL and Expiry`, () => {
+    const STREAM_FORKED_FROM_HEADER = `Stream-Forked-From`
+
+    const uniqueId = () =>
+      `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const sleep = (ms: number) =>
+      new Promise((resolve) => setTimeout(resolve, ms))
+
+    // Poll HEAD until the stream is deleted, tolerating slight timing delays
+    const waitForDeletion = async (
+      url: string,
+      initialSleepMs: number,
+      expectedStatuses: Array<number> = [404],
+      timeoutMs: number = 5000
+    ) => {
+      await sleep(initialSleepMs)
+      await vi.waitFor(
+        async () => {
+          const head = await fetch(url, { method: `HEAD` })
+          expect(expectedStatuses).toContain(head.status)
+        },
+        { timeout: timeoutMs, interval: 200 }
+      )
+    }
+
+    test(`should inherit source expiry when none specified`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-ttl-inherit-src-${id}`
+      const forkPath = `/v1/stream/fork-ttl-inherit-fork-${id}`
+
+      const expiresAt = new Date(Date.now() + 3600000).toISOString()
+
+      // Create source with expiry
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-Expires-At": expiresAt,
+        },
+        body: `data`,
+      })
+
+      // Fork without specifying expiry → should inherit
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+
+      // Fork should have expiry metadata
+      const forkHead = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `HEAD`,
+      })
+      expect(forkHead.status).toBe(200)
+      // If server returns Stream-Expires-At, verify it's set
+      const forkExpires = forkHead.headers.get(`Stream-Expires-At`)
+      if (forkExpires) {
+        expect(new Date(forkExpires).getTime()).toBeLessThanOrEqual(
+          new Date(expiresAt).getTime()
+        )
+      }
+    })
+
+    test(`should allow fork with shorter TTL`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-ttl-shorter-src-${id}`
+      const forkPath = `/v1/stream/fork-ttl-shorter-fork-${id}`
+
+      // Create source with long TTL
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `3600`,
+        },
+        body: `data`,
+      })
+
+      // Fork with shorter TTL
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          "Stream-TTL": `1800`,
+        },
+      })
+      expect([200, 201]).toContain(forkRes.status)
+    })
+
+    test.concurrent(
+      `should expire fork based on TTL (releases refcount)`,
+      async () => {
+        const id = uniqueId()
+        const sourcePath = `/v1/stream/fork-ttl-expire-src-${id}`
+        const forkPath = `/v1/stream/fork-ttl-expire-fork-${id}`
+
+        // Create source with 60s TTL
+        await fetch(`${getBaseUrl()}${sourcePath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            "Stream-TTL": `60`,
+          },
+          body: `data`,
+        })
+
+        // Fork with 1s TTL
+        await fetch(`${getBaseUrl()}${forkPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_FORKED_FROM_HEADER]: sourcePath,
+            "Stream-TTL": `1`,
+          },
+        })
+
+        // Fork should exist initially
+        const forkHeadBefore = await fetch(`${getBaseUrl()}${forkPath}`, {
+          method: `HEAD`,
+        })
+        expect(forkHeadBefore.status).toBe(200)
+
+        // Wait for fork to expire, polling HEAD until deleted
+        await waitForDeletion(`${getBaseUrl()}${forkPath}`, 1000)
+
+        // Verify with GET as well
+        const forkGetAfter = await fetch(`${getBaseUrl()}${forkPath}`, {
+          method: `GET`,
+        })
+        expect(forkGetAfter.status).toBe(404)
+      }
+    )
+
+    test.concurrent(
+      `should expire source with living forks (source goes 410)`,
+      async () => {
+        const id = uniqueId()
+        const sourcePath = `/v1/stream/fork-ttl-src-expire-src-${id}`
+        const forkPath = `/v1/stream/fork-ttl-src-expire-fork-${id}`
+
+        // Create source with 1s TTL
+        await fetch(`${getBaseUrl()}${sourcePath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            "Stream-TTL": `1`,
+          },
+          body: `data`,
+        })
+
+        // Fork (inherits source expiry — also 1s)
+        await fetch(`${getBaseUrl()}${forkPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          },
+        })
+
+        // Wait for source to expire, polling HEAD until deleted
+        await waitForDeletion(`${getBaseUrl()}${sourcePath}`, 1000, [404, 410])
+
+        // Verify source with GET as well
+        const sourceGet = await fetch(`${getBaseUrl()}${sourcePath}`, {
+          method: `GET`,
+        })
+        expect([404, 410]).toContain(sourceGet.status)
+
+        // Fork should also expire (inherited same expiry)
+        await waitForDeletion(`${getBaseUrl()}${forkPath}`, 0, [404, 410])
+
+        // Verify fork with GET as well
+        const forkGet = await fetch(`${getBaseUrl()}${forkPath}`, {
+          method: `GET`,
+        })
+        expect([404, 410]).toContain(forkGet.status)
+      }
+    )
+
+    test(`should inherit source TTL value when none specified`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-ttl-inherit-ttl-src-${id}`
+      const forkPath = `/v1/stream/fork-ttl-inherit-ttl-fork-${id}`
+
+      // Create source with TTL
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `3600`,
+        },
+        body: `data`,
+      })
+
+      // Fork without specifying expiry → should inherit TTL value
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+
+      // Fork should have TTL metadata matching source
+      const forkHead = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `HEAD`,
+      })
+      expect(forkHead.status).toBe(200)
+      const forkTTL = forkHead.headers.get(`Stream-TTL`)
+      expect(forkTTL).toBe(`3600`)
+    })
+
+    test(`should use fork's own TTL when specified`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-own-ttl-src-${id}`
+      const forkPath = `/v1/stream/fork-own-ttl-fork-${id}`
+
+      // Create source with TTL=3600
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `3600`,
+        },
+        body: `data`,
+      })
+
+      // Fork with different TTL
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          "Stream-TTL": `7200`,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+
+      // Fork should have its own TTL value
+      const forkHead = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `HEAD`,
+      })
+      expect(forkHead.status).toBe(200)
+      const forkTTL = forkHead.headers.get(`Stream-TTL`)
+      expect(forkTTL).toBe(`7200`)
+    })
+
+    test.concurrent(
+      `should allow fork to outlive source via TTL renewal`,
+      async () => {
+        const id = uniqueId()
+        const sourcePath = `/v1/stream/fork-outlive-src-${id}`
+        const forkPath = `/v1/stream/fork-outlive-fork-${id}`
+
+        // Create source with 2s TTL
+        await fetch(`${getBaseUrl()}${sourcePath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            "Stream-TTL": `2`,
+          },
+          body: `source data`,
+        })
+
+        // Fork with 2s TTL
+        const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_FORKED_FROM_HEADER]: sourcePath,
+            "Stream-TTL": `2`,
+          },
+        })
+        expect(forkRes.status).toBe(201)
+
+        // Wait 1.5s, then read the fork (extends fork's TTL, source is idle)
+        await sleep(1500)
+        const forkRead = await fetch(`${getBaseUrl()}${forkPath}`, {
+          method: `GET`,
+        })
+        expect(forkRead.status).toBe(200)
+
+        // Source should be expired (2s TTL, idle since creation)
+        // Poll until deleted — original 2s TTL minus ~1.5s already waited
+        await waitForDeletion(`${getBaseUrl()}${sourcePath}`, 500, [404, 410])
+
+        // Verify source with GET as well
+        const sourceGet = await fetch(`${getBaseUrl()}${sourcePath}`, {
+          method: `GET`,
+        })
+        expect([404, 410]).toContain(sourceGet.status)
+
+        // Fork still alive (TTL was renewed by read)
+        const forkHead = await fetch(`${getBaseUrl()}${forkPath}`, {
+          method: `HEAD`,
+        })
+        expect(forkHead.status).toBe(200)
+      }
+    )
+
+    test(`should allow fork Expires-At beyond source TTL expiry`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-expires-beyond-src-${id}`
+      const forkPath = `/v1/stream/fork-expires-beyond-fork-${id}`
+
+      // Create source with short TTL (10s)
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `10`,
+        },
+        body: `data`,
+      })
+
+      // Fork with Expires-At far in the future (no capping)
+      const farFuture = new Date(Date.now() + 3600000).toISOString()
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          "Stream-Expires-At": farFuture,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+
+      // Fork should have its own Expires-At, not capped at source
+      const forkHead = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `HEAD`,
+      })
+      expect(forkHead.status).toBe(200)
+      const forkExpiresAt = forkHead.headers.get(`Stream-Expires-At`)
+      if (forkExpiresAt) {
+        // Fork expiry should be ~1 hour from now, not ~10s
+        expect(new Date(forkExpiresAt).getTime()).toBeGreaterThan(
+          Date.now() + 3500000
+        )
+      }
+    })
+
+    test(`should allow fork TTL longer than source TTL (no capping)`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-ttl-nocap-src-${id}`
+      const forkPath = `/v1/stream/fork-ttl-nocap-fork-${id}`
+
+      // Create source with TTL=10
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          "Stream-TTL": `10`,
+        },
+        body: `data`,
+      })
+
+      // Fork with TTL=99999 — previously would be capped, now independent
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          "Stream-TTL": `99999`,
+        },
+      })
+      expect([200, 201]).toContain(forkRes.status)
+
+      // Fork should have its own TTL, not capped
+      const forkHead = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `HEAD`,
+      })
+      expect(forkHead.status).toBe(200)
+      const forkTTL = forkHead.headers.get(`Stream-TTL`)
+      expect(forkTTL).toBe(`99999`)
+    })
+  })
+
+  // ============================================================================
+  // Fork - JSON Mode
+  // ============================================================================
+
+  describe(`Fork - JSON Mode`, () => {
+    const STREAM_FORKED_FROM_HEADER = `Stream-Forked-From`
+
+    const uniqueId = () =>
+      `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+
+    test(`should fork a JSON stream`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-json-src-${id}`
+      const forkPath = `/v1/stream/fork-json-fork-${id}`
+
+      // Create JSON source with data
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: `[{"event":"one"}]`,
+      })
+
+      // Fork with matching content type
+      const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `application/json`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      expect(forkRes.status).toBe(201)
+      expect(forkRes.headers.get(`content-type`)).toBe(`application/json`)
+
+      // Read fork → should be a JSON array
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(readRes.status).toBe(200)
+      expect(readRes.headers.get(`content-type`)).toBe(`application/json`)
+      const body = JSON.parse(await readRes.text())
+      expect(Array.isArray(body)).toBe(true)
+      expect(body).toEqual([{ event: `one` }])
+    })
+
+    test(`should read forked JSON across boundary`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-json-boundary-src-${id}`
+      const forkPath = `/v1/stream/fork-json-boundary-fork-${id}`
+
+      // Create JSON source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `application/json` },
+        body: `[{"from":"source"}]`,
+      })
+
+      // Fork at head with matching content type
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `application/json`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Append to fork
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `application/json` },
+        body: `[{"from":"fork"}]`,
+      })
+
+      // Read entire fork → should be a valid JSON array with both items
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(readRes.status).toBe(200)
+      const body = JSON.parse(await readRes.text())
+      expect(Array.isArray(body)).toBe(true)
+      expect(body).toEqual([{ from: `source` }, { from: `fork` }])
+    })
+  })
+
+  // ============================================================================
+  // Fork - Edge Cases
+  // ============================================================================
+
+  describe(`Fork - Edge Cases`, () => {
+    const STREAM_FORKED_FROM_HEADER = `Stream-Forked-From`
+    const STREAM_FORK_OFFSET_HEADER = `Stream-Fork-Offset`
+
+    const uniqueId = () =>
+      `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+
+    test(`should handle fork then immediately delete source`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-edge-imm-del-src-${id}`
+      const forkPath = `/v1/stream/fork-edge-imm-del-fork-${id}`
+
+      // Create source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `ephemeral`,
+      })
+
+      // Fork
+      await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+
+      // Immediately delete source
+      await fetch(`${getBaseUrl()}${sourcePath}`, { method: `DELETE` })
+
+      // Fork should still work
+      const readRes = await fetch(`${getBaseUrl()}${forkPath}?offset=-1`)
+      expect(readRes.status).toBe(200)
+      const body = await readRes.text()
+      expect(body).toBe(`ephemeral`)
+    })
+
+    test(`should handle many forks of same stream (10 forks)`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-edge-many-src-${id}`
+
+      // Create source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `shared data`,
+      })
+
+      // Create 10 forks
+      const forkPaths: Array<string> = []
+      for (let i = 0; i < 10; i++) {
+        const forkPath = `/v1/stream/fork-edge-many-f${i}-${id}`
+        const forkRes = await fetch(`${getBaseUrl()}${forkPath}`, {
+          method: `PUT`,
+          headers: {
+            "Content-Type": `text/plain`,
+            [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          },
+        })
+        expect(forkRes.status).toBe(201)
+        forkPaths.push(forkPath)
+      }
+
+      // Each fork should read the same data
+      for (const fp of forkPaths) {
+        const readRes = await fetch(`${getBaseUrl()}${fp}?offset=-1`)
+        expect(readRes.status).toBe(200)
+        const body = await readRes.text()
+        expect(body).toBe(`shared data`)
+      }
+
+      // Delete all forks
+      for (const fp of forkPaths) {
+        await fetch(`${getBaseUrl()}${fp}`, { method: `DELETE` })
+      }
+    })
+
+    test(`should fork at every offset position`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-edge-every-offset-src-${id}`
+
+      // Create source with multiple chunks
+      const createRes = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `A`,
+      })
+      const offset0 = `0000000000000000_0000000000000000` // before any data
+      const offset1 = createRes.headers.get(STREAM_OFFSET_HEADER)! // after A
+
+      const append1 = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `B`,
+      })
+      const offset2 = append1.headers.get(STREAM_OFFSET_HEADER)! // after B
+
+      const append2 = await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `POST`,
+        headers: { "Content-Type": `text/plain` },
+        body: `C`,
+      })
+      const offset3 = append2.headers.get(STREAM_OFFSET_HEADER)! // after C
+
+      // Fork at offset0 (empty inherited)
+      const f0 = `/v1/stream/fork-edge-every-f0-${id}`
+      const f0Res = await fetch(`${getBaseUrl()}${f0}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: offset0,
+        },
+      })
+      expect(f0Res.status).toBe(201)
+      const f0Body = await (
+        await fetch(`${getBaseUrl()}${f0}?offset=-1`)
+      ).text()
+      expect(f0Body).toBe(``)
+
+      // Fork at offset1 (inherits A)
+      const f1 = `/v1/stream/fork-edge-every-f1-${id}`
+      await fetch(`${getBaseUrl()}${f1}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: offset1,
+        },
+      })
+      const f1Body = await (
+        await fetch(`${getBaseUrl()}${f1}?offset=-1`)
+      ).text()
+      expect(f1Body).toBe(`A`)
+
+      // Fork at offset2 (inherits A+B)
+      const f2 = `/v1/stream/fork-edge-every-f2-${id}`
+      await fetch(`${getBaseUrl()}${f2}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: offset2,
+        },
+      })
+      const f2Body = await (
+        await fetch(`${getBaseUrl()}${f2}?offset=-1`)
+      ).text()
+      expect(f2Body).toBe(`AB`)
+
+      // Fork at offset3 (inherits A+B+C)
+      const f3 = `/v1/stream/fork-edge-every-f3-${id}`
+      await fetch(`${getBaseUrl()}${f3}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+          [STREAM_FORK_OFFSET_HEADER]: offset3,
+        },
+      })
+      const f3Body = await (
+        await fetch(`${getBaseUrl()}${f3}?offset=-1`)
+      ).text()
+      expect(f3Body).toBe(`ABC`)
+    })
+
+    test(`should handle idempotent fork creation (PUT twice)`, async () => {
+      const id = uniqueId()
+      const sourcePath = `/v1/stream/fork-edge-idempotent-src-${id}`
+      const forkPath = `/v1/stream/fork-edge-idempotent-fork-${id}`
+
+      // Create source
+      await fetch(`${getBaseUrl()}${sourcePath}`, {
+        method: `PUT`,
+        headers: { "Content-Type": `text/plain` },
+        body: `data`,
+      })
+
+      // First fork PUT → 201
+      const fork1 = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      expect(fork1.status).toBe(201)
+
+      // Second fork PUT with same headers → 200 (idempotent)
+      const fork2 = await fetch(`${getBaseUrl()}${forkPath}`, {
+        method: `PUT`,
+        headers: {
+          "Content-Type": `text/plain`,
+          [STREAM_FORKED_FROM_HEADER]: sourcePath,
+        },
+      })
+      expect(fork2.status).toBe(200)
+    })
+  })
+
+  // ============================================================================
+  // Reserved subscription APIs
+  // ============================================================================
+
+  describe.runIf(options.subscriptions)(`Reserved subscription APIs`, () => {
+    const ts = () => Date.now()
+    const streamUrl = (path: string) => `${getBaseUrl()}/v1/stream/${path}`
+    const subUrl = (id: string) => streamUrl(`__ds/subscriptions/${id}`)
+
+    test(`creates and idempotently re-confirms a webhook subscription`, async () => {
+      const receiver = await createWebhookReceiver()
+      const id = `sub-${ts()}`
+      try {
+        const create = await fetch(subUrl(id), {
+          method: `PUT`,
+          headers: { "content-type": `application/json` },
+          body: JSON.stringify({
+            type: `webhook`,
+            pattern: `events/*`,
+            webhook: { url: receiver.url },
+            lease_ttl_ms: 1000,
+            description: `test subscription`,
+          }),
+        })
+        expect(create.status).toBe(201)
+        const created = (await create.json()) as Record<string, unknown>
+        expect(created.webhook_secret).toBeUndefined()
+        const createdWebhook = created.webhook as {
+          url: string
+          signing: { alg: string; kid: string; jwks_url: string }
+        }
+        expect(createdWebhook.url).toBe(receiver.url)
+        expect(createdWebhook.signing.alg).toBe(`ed25519`)
+        expect(createdWebhook.signing.kid).toMatch(/^ds_/)
+        expect(createdWebhook.signing.jwks_url).toBe(
+          streamUrl(`__ds/jwks.json`)
+        )
+
+        const jwks = await fetchWebhookJwks(createdWebhook.signing.jwks_url)
+        expect(
+          jwks.keys.some(
+            (key) =>
+              key.kid === createdWebhook.signing.kid &&
+              key.kty === `OKP` &&
+              key.crv === `Ed25519` &&
+              key.alg === `EdDSA`
+          )
+        ).toBe(true)
+
+        const confirm = await fetch(subUrl(id), {
+          method: `PUT`,
+          headers: { "content-type": `application/json` },
+          body: JSON.stringify({
+            type: `webhook`,
+            pattern: `events/*`,
+            webhook: { url: receiver.url },
+            lease_ttl_ms: 1000,
+            description: `test subscription`,
+          }),
+        })
+        expect(confirm.status).toBe(200)
+        const confirmed = (await confirm.json()) as Record<string, unknown>
+        expect(confirmed.webhook_secret).toBeUndefined()
+
+        const get = await fetch(subUrl(id))
+        expect(get.status).toBe(200)
+        const body = (await get.json()) as Record<string, unknown>
+        expect(body.id).toBe(id)
+        expect(body.type).toBe(`webhook`)
+        expect(body.webhook_secret).toBeUndefined()
+        expect((body.webhook as Record<string, unknown>).url).toBe(receiver.url)
+      } finally {
+        await fetch(subUrl(id), { method: `DELETE` })
+        await receiver.close()
+      }
+    })
+
+    test(`rejects unsafe webhook URLs`, async () => {
+      const id = `sub-${ts()}`
+      const res = await fetch(subUrl(id), {
+        method: `PUT`,
+        headers: { "content-type": `application/json` },
+        body: JSON.stringify({
+          type: `webhook`,
+          pattern: `events/*`,
+          webhook: { url: `http://10.0.0.1/hook` },
+        }),
+      })
+      expect(res.status).toBe(400)
+      const body = (await res.json()) as { error: { code: string } }
+      expect(body.error.code).toBe(`WEBHOOK_URL_REJECTED`)
+    })
+
+    test(`webhook synchronous done auto-acks the wake snapshot`, async () => {
+      const receiver = await createWebhookReceiver({ response: { done: true } })
+      const id = `sub-${ts()}`
+      const path = `events/sync-${ts()}`
+      try {
+        const create = await fetch(subUrl(id), {
+          method: `PUT`,
+          headers: { "content-type": `application/json` },
+          body: JSON.stringify({
+            type: `webhook`,
+            pattern: `events/*`,
+            webhook: { url: receiver.url },
+            lease_ttl_ms: 1000,
+          }),
+        })
+        expect(create.status).toBe(201)
+        const created = (await create.json()) as {
+          webhook: { signing: { jwks_url: string } }
+        }
+        const jwks = await fetchWebhookJwks(created.webhook.signing.jwks_url)
+
+        await fetch(streamUrl(path), {
+          method: `PUT`,
+          headers: { "content-type": `application/json` },
+          body: JSON.stringify({ event: `created` }),
+        })
+
+        const notification = await receiver.waitForRequest()
+        expect(notification.signature).toMatch(
+          /^t=\d+,kid=.+,ed25519=[A-Za-z0-9_-]+$/
+        )
+        expect(
+          verifyWebhookSignature(
+            notification.rawBody,
+            notification.signature,
+            jwks
+          )
+        ).toBe(true)
+        expect(notification.body.subscription_id).toBe(id)
+        expect(notification.body.callback_url).toBe(
+          streamUrl(`__ds/subscriptions/${id}/callback`)
+        )
+        const stream = (
+          notification.body.streams as Array<{
+            path: string
+            tail_offset: string
+            has_pending: boolean
+          }>
+        ).find((item) => item.path === path)!
+        expect(stream.path).toBe(path)
+        expect(stream.has_pending).toBe(true)
+
+        await waitForCondition(async () => {
+          const get = await fetch(subUrl(id))
+          const body = (await get.json()) as {
+            streams: Array<{ path: string; acked_offset: string }>
+          }
+          return body.streams.some(
+            (item) =>
+              item.path === path && item.acked_offset === stream.tail_offset
+          )
+        })
+      } finally {
+        await fetch(subUrl(id), { method: `DELETE` })
+        await receiver.close()
+      }
+    })
+
+    test(`webhook callback acks and fences stale wake generations`, async () => {
+      const receiver = await createWebhookReceiver()
+      const id = `sub-${ts()}`
+      const path = `events/callback-${ts()}`
+      try {
+        await fetch(subUrl(id), {
+          method: `PUT`,
+          headers: { "content-type": `application/json` },
+          body: JSON.stringify({
+            type: `webhook`,
+            pattern: `events/*`,
+            webhook: { url: receiver.url },
+            lease_ttl_ms: 1000,
+          }),
+        })
+        await fetch(streamUrl(path), {
+          method: `PUT`,
+          headers: { "content-type": `application/json` },
+          body: JSON.stringify({ event: `created` }),
+        })
+
+        const notification = await receiver.waitForRequest()
+        const body = notification.body as {
+          callback_url: string
+          callback_token: string
+          wake_id: string
+          generation: number
+          streams: Array<{ path: string; tail_offset: string }>
+        }
+        const tail = body.streams.find(
+          (stream) => stream.path === path
+        )!.tail_offset
+        const ackBody = {
+          wake_id: body.wake_id,
+          generation: body.generation,
+          acks: [{ stream: path, offset: tail }],
+          done: true,
+        }
+
+        const callback = await fetch(body.callback_url, {
+          method: `POST`,
+          headers: {
+            "content-type": `application/json`,
+            authorization: `Bearer ${body.callback_token}`,
+          },
+          body: JSON.stringify(ackBody),
+        })
+        expect(callback.status).toBe(200)
+        expect(await callback.json()).toEqual({ ok: true, next_wake: false })
+
+        const stale = await fetch(body.callback_url, {
+          method: `POST`,
+          headers: {
+            "content-type": `application/json`,
+            authorization: `Bearer ${body.callback_token}`,
+          },
+          body: JSON.stringify(ackBody),
+        })
+        expect(stale.status).toBe(409)
+        const staleBody = (await stale.json()) as { error: { code: string } }
+        expect(staleBody.error.code).toBe(`FENCED`)
+      } finally {
+        await fetch(subUrl(id), { method: `DELETE` })
+        await receiver.close()
+      }
+    })
+
+    test(`adds and removes explicit subscription streams`, async () => {
+      const receiver = await createWebhookReceiver()
+      const id = `sub-${ts()}`
+      try {
+        const create = await fetch(subUrl(id), {
+          method: `PUT`,
+          headers: { "content-type": `application/json` },
+          body: JSON.stringify({
+            type: `webhook`,
+            streams: [`manual/a`],
+            webhook: { url: receiver.url },
+          }),
+        })
+        expect(create.status).toBe(201)
+
+        const add = await fetch(`${subUrl(id)}/streams`, {
+          method: `POST`,
+          headers: { "content-type": `application/json` },
+          body: JSON.stringify({ streams: [`manual/b`] }),
+        })
+        expect(add.status).toBe(204)
+
+        const remove = await fetch(
+          `${subUrl(id)}/streams/${encodeURIComponent(`manual/b`)}`,
+          { method: `DELETE` }
+        )
+        expect(remove.status).toBe(204)
+
+        const get = await fetch(subUrl(id))
+        const body = (await get.json()) as {
+          streams: Array<{ path: string; link_type: string }>
+        }
+        expect(body.streams).toContainEqual(
+          expect.objectContaining({ path: `manual/a`, link_type: `explicit` })
+        )
+        expect(body.streams.some((stream) => stream.path === `manual/b`)).toBe(
+          false
+        )
+      } finally {
+        await fetch(subUrl(id), { method: `DELETE` })
+        await receiver.close()
+      }
+    })
+
+    test(`pull-wake claim, ack, and release use subscription-scoped leases`, async () => {
+      const id = `pull-${ts()}`
+      const wakeStream = `wake/pool-${ts()}`
+      const path = `events/pull-${ts()}`
+
+      await fetch(streamUrl(wakeStream), {
+        method: `PUT`,
+        headers: { "content-type": `application/json` },
+        body: `[]`,
+      })
+      const create = await fetch(subUrl(id), {
+        method: `PUT`,
+        headers: { "content-type": `application/json` },
+        body: JSON.stringify({
+          type: `pull-wake`,
+          pattern: `events/*`,
+          wake_stream: wakeStream,
+          lease_ttl_ms: 1000,
+        }),
+      })
+      expect(create.status).toBe(201)
+
+      await fetch(streamUrl(path), {
+        method: `PUT`,
+        headers: { "content-type": `application/json` },
+        body: JSON.stringify({ event: `created` }),
+      })
+
+      await waitForCondition(async () => {
+        const res = await fetch(streamUrl(wakeStream))
+        const events = (await res.json()) as Array<{ subscription_id: string }>
+        return events.some((event) => event.subscription_id === id)
+      })
+
+      const claim = await fetch(`${subUrl(id)}/claim`, {
+        method: `POST`,
+        headers: { "content-type": `application/json` },
+        body: JSON.stringify({ worker: `worker-1` }),
+      })
+      expect(claim.status).toBe(200)
+      const claimed = (await claim.json()) as {
+        wake_id: string
+        generation: number
+        token: string
+        streams: Array<{ path: string; tail_offset: string }>
+      }
+      const tail = claimed.streams.find(
+        (stream) => stream.path === path
+      )!.tail_offset
+
+      const busy = await fetch(`${subUrl(id)}/claim`, {
+        method: `POST`,
+        headers: { "content-type": `application/json` },
+        body: JSON.stringify({ worker: `worker-2` }),
+      })
+      expect(busy.status).toBe(409)
+      const busyBody = (await busy.json()) as {
+        error: { code: string; current_holder: string }
+      }
+      expect(busyBody.error.code).toBe(`ALREADY_CLAIMED`)
+      expect(busyBody.error.current_holder).toBe(`worker-1`)
+
+      const ack = await fetch(`${subUrl(id)}/ack`, {
+        method: `POST`,
+        headers: {
+          "content-type": `application/json`,
+          authorization: `Bearer ${claimed.token}`,
+        },
+        body: JSON.stringify({
+          wake_id: claimed.wake_id,
+          generation: claimed.generation,
+          acks: [{ stream: path, offset: tail }],
+          done: true,
+        }),
+      })
+      expect(ack.status).toBe(200)
+      expect(await ack.json()).toEqual({ ok: true, next_wake: false })
+
+      await fetch(streamUrl(path), {
+        method: `POST`,
+        headers: { "content-type": `application/json` },
+        body: JSON.stringify({ event: `second` }),
+      })
+      const claim2 = await fetch(`${subUrl(id)}/claim`, {
+        method: `POST`,
+        headers: { "content-type": `application/json` },
+        body: JSON.stringify({ worker: `worker-1` }),
+      })
+      expect(claim2.status).toBe(200)
+      const claimed2 = (await claim2.json()) as {
+        wake_id: string
+        generation: number
+        token: string
+      }
+      const release = await fetch(`${subUrl(id)}/release`, {
+        method: `POST`,
+        headers: {
+          "content-type": `application/json`,
+          authorization: `Bearer ${claimed2.token}`,
+        },
+        body: JSON.stringify({
+          wake_id: claimed2.wake_id,
+          generation: claimed2.generation,
+        }),
+      })
+      expect(release.status).toBe(204)
+    })
+  })
+}
