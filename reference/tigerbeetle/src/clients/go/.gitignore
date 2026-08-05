@@ -1,0 +1,12 @@
+zig/
+zig-cache/
+zig-out/
+
+tb
+zigcc*
+*.tigerbeetle
+main
+main.exe
+
+native/*.a
+native/*.lib
