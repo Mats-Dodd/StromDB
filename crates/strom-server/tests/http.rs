@@ -5,10 +5,10 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt as _;
+use strom_db::Db;
+use strom_db::object_store::ObjectStore;
+use strom_db::object_store::memory::InMemory;
 use strom_server::router;
-use stromdb::Db;
-use stromdb::object_store::ObjectStore;
-use stromdb::object_store::memory::InMemory;
 use tower::ServiceExt as _;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;

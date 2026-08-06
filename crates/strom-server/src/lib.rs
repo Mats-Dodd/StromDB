@@ -9,7 +9,7 @@ use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderName, HeaderValue, header};
 use axum::routing::{any, put};
-use stromdb::Db;
+use strom_db::Db;
 use tower::ServiceBuilder;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;

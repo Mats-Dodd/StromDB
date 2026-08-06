@@ -1,5 +1,5 @@
 [package]
-name = "stromdb"
+name = "strom-db"
 description = "StromDB, the embeddable durable streams database"
 version.workspace = true
 edition.workspace = true

@@ -7,7 +7,7 @@ members = [
     "crates/strom-server",
     "crates/strom-storage-domain",
     "crates/strom-storage-engine",
-    "crates/stromdb",
+    "crates/strom-db",
 ]
 
 [workspace.dependencies]

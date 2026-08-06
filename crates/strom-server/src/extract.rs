@@ -8,8 +8,8 @@ use std::convert::Infallible;
 use axum::extract::{FromRequestParts, Path};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, header};
+use strom_db::StreamId;
 use strom_domain::{ExpiresAt, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamTtl};
-use stromdb::StreamId;
 
 use crate::error::ApiError;
 use crate::headers::{STREAM_CLOSED, STREAM_EXPIRES_AT, STREAM_TTL};
@@ -69,7 +69,7 @@ impl<S: Send + Sync> FromRequestParts<S> for Lifecycle {
 
 fn stream_id(path: &str) -> Result<StreamId, ApiError> {
     path.parse()
-        .map_err(|error: stromdb::StreamIdError| ApiError::BadRequest(error.to_string()))
+        .map_err(|error: strom_db::StreamIdError| ApiError::BadRequest(error.to_string()))
 }
 
 fn content_type(headers: &HeaderMap) -> Result<StreamContentType, ApiError> {

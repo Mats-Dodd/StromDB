@@ -14,7 +14,7 @@
 
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use stromdb::StreamError;
+use strom_db::StreamError;
 
 /// A protocol-facing refusal or failure at the HTTP edge.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

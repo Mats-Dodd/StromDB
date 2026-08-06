@@ -1,4 +1,4 @@
-//! Durable Streams verb handlers over an embedded [`stromdb::Db`].
+//! Durable Streams verb handlers over an embedded [`strom_db::Db`].
 
 use std::sync::Arc;
 
@@ -6,7 +6,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::IntoResponse;
-use stromdb::{
+use strom_db::{
     CloseStreamOutcome, CreateOutcome, Db, StreamError, StreamId, StreamLifecycle, StreamStatus,
 };
 

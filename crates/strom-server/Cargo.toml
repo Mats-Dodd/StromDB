@@ -19,7 +19,7 @@ secretspec = { workspace = true }
 secretspec-derive = { workspace = true }
 serde = { workspace = true }
 strom-domain = { path = "../strom-domain", version = "0.1.0" }
-stromdb = { path = "../stromdb", version = "0.1.0" }
+strom-db = { path = "../strom-db", version = "0.1.0" }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tower = { workspace = true }

@@ -22,12 +22,12 @@ strom-domain            Durable Streams protocol vocabulary
 strom-storage-domain    storage vocabulary and durable codecs
 strom-object-store      object-store adapter (opaque bytes)
 strom-storage-engine    writer, bootstrap, admission, forest, stores
-stromdb                 the embeddable library; the public API
+strom-db                the embeddable library; the public API
 ```
 
 Layering: protocol types stay in `strom-domain`; storage spelling stays in
 `strom-storage-domain`; I/O stays in `strom-object-store`; the engine owns
-typed stores, fold, and the correctness protocol; `stromdb` exposes the `Db`
+typed stores, fold, and the correctness protocol; `strom-db` exposes the `Db`
 handle and re-exports the vocabulary callers must name.
 
 As you work on this codebase, if you encounter any friction in the development environment you can record it in [docs/nits.md](docs/nits.md).  Contributors will review these to help improve the lives of all devs and "make the world a better place".  

@@ -9,15 +9,15 @@
 //! ```
 //! use std::sync::Arc;
 //!
-//! use stromdb::{
+//! use strom_db::{
 //!     CreateOutcome, Db, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamStatus,
 //! };
 //!
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-//! let store = Arc::new(stromdb::object_store::memory::InMemory::new());
+//! let store = Arc::new(strom_db::object_store::memory::InMemory::new());
 //! let db = Db::open(store).await?;
 //!
-//! let id: stromdb::StreamId = "events/a".parse()?;
+//! let id: strom_db::StreamId = "events/a".parse()?;
 //! assert_eq!(
 //!     CreateOutcome::Created,
 //!     db.create_stream(
@@ -38,7 +38,7 @@
 /// Re-export of the `object_store` crate behind [`Db::open`].
 ///
 /// Use these types instead of a separate `object_store` dependency, so the
-/// trait object you inject and the one `stromdb` expects are the same type.
+/// trait object you inject and the one `strom-db` expects are the same type.
 pub use object_store;
 pub use strom_domain::{
     CloseStreamOutcome, CreateOutcome, ExpiryPolicy, StreamContentType, StreamId, StreamIdError,
@@ -148,7 +148,7 @@ impl Db {
     }
 }
 
-/// Returns the `stromdb` crate version.
+/// Returns the `strom-db` crate version.
 #[must_use]
 pub const fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")

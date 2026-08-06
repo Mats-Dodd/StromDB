@@ -4,9 +4,9 @@ use std::error::Error;
 use std::sync::Arc;
 
 use clap::Parser as _;
+use strom_db::{CloseOutcome, Db};
 use strom_server::config::ServerConfig;
 use strom_server::router;
-use stromdb::{CloseOutcome, Db};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 

@@ -4,9 +4,9 @@
 
 use std::sync::Arc;
 
-use stromdb::object_store::ObjectStore;
-use stromdb::object_store::memory::InMemory;
-use stromdb::{
+use strom_db::object_store::ObjectStore;
+use strom_db::object_store::memory::InMemory;
+use strom_db::{
     CloseOutcome, CloseStreamOutcome, CreateOutcome, Db, ExpiryPolicy, StreamContentType,
     StreamError, StreamId, StreamLifecycle, StreamStatus,
 };

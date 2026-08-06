@@ -6,7 +6,7 @@ The bar to add something here is low, if we dont like it we just delete the nit,
 
 eg. text x is flaky, lint x is too cumbersome, module structure led to unclear boundaries.  
 
-- `crates/stromdb/src/lib.rs` carries three `panic!` arms (`create_outcome`,
+- `crates/strom-db/src/lib.rs` carries three `panic!` arms (`create_outcome`,
   `close_outcome_for_reply`, `delete_outcome`) because every command shares the
   one `StreamReply` enum, so the compiler cannot see the command/reply pairing.
   Possible fix: give each command a typed reply (typed `oneshot` per command)
