@@ -100,6 +100,14 @@ the correct injection seam.
 
 The suite has four layers. Each layer has one job.
 
+Test friction is design feedback. If a focused claim needs large setup or many
+internal stubs, first check whether production code mixes a pure decision with
+an external effect. Prefer a cleaner production seam or a smaller pure function
+when that change makes both the implementation and its test simpler.
+
+Do not answer every difficult test with a more powerful test helper. A helper
+cannot repair the wrong production boundary.
+
 ### Pure protocol tests
 
 Pure tests feed domain inputs and effect completions into protocol logic. They
@@ -152,10 +160,10 @@ Use this layer for:
 
 Do not repeat raw adapter claims in every typed store.
 
-### Engine scenarios
+### Durable engine tests
 
-Engine scenarios prove complete behavior across the public engine boundary and
-durable recovery boundaries.
+Durable engine tests prove complete behavior across the public engine boundary
+and durable recovery boundaries.
 
 Use this layer for:
 
@@ -169,7 +177,11 @@ Use this layer for:
 - process loss; and
 - reopen.
 
-Each scenario checks invariants after every meaningful transition.
+Write these as direct narrative tests. Each test keeps its control flow visible
+and checks invariants after every meaningful transition.
+
+Do not start with a general scenario language or a generic step runner. Extract
+a shared `check` function only when a closed matrix repeats the same test shape.
 
 ## Scripted object store
 
@@ -180,9 +192,9 @@ feature. It wraps `object_store::memory::InMemory` and implements
 The wrapper has four responsibilities:
 
 1. Match selected operations.
-2. apply a deterministic action;
-3. gate an operation when the scenario needs an exact boundary; and
-4. record a complete trace.
+2. Apply a deterministic action.
+3. Gate an operation when a test needs an exact boundary.
+4. Record a complete trace.
 
 All operations outside a selected strict scope delegate to `InMemory`.
 
@@ -214,7 +226,7 @@ dependents that enable `test-support`.
 builds.
 
 Do not create a workspace test crate until more than one independent subsystem
-needs the same higher-level scenario vocabulary.
+needs the same higher-level test vocabulary.
 
 ## Script vocabulary
 
@@ -331,7 +343,7 @@ enum ReadAction {
 proves that bounded-read and occupant-comparison code handles streamed body
 failure.
 
-Do not add arbitrary body replacement to normal engine scenarios. Plant exact
+Do not add arbitrary body replacement to normal engine tests. Plant exact
 bytes in `InMemory` when a test needs foreign or malformed durable state.
 
 ### List actions
@@ -347,8 +359,8 @@ enum ListAction {
 }
 ```
 
-The invalid actions exist to prove adapter contradiction checks. Engine
-scenarios normally use `Pass` or `Fail`.
+The invalid actions exist to prove adapter contradiction checks. Engine tests
+normally use `Pass` or `Fail`.
 
 ### Delete actions
 
@@ -423,9 +435,9 @@ phase 2: read the same WAL
 ```
 
 If a call matches a later phase before the current phase is complete, the
-harness reports an order failure.
+scripted store reports an order failure.
 
-Do not add a general dependency graph until a real scenario cannot use phases.
+Do not add a general dependency graph until a real test cannot use phases.
 
 ## Gates
 
@@ -495,34 +507,49 @@ An unexpected operation must be recorded immediately. The operation can return
 a synthetic backend error so the engine task can stop. `verify()` reports the
 script mismatch in domain language.
 
-## Engine scenario harness
+## Durable engine test shape
 
-Add one scenario harness under the storage-engine integration tests. It drives
-the public `Engine` boundary and owns deterministic entropy, the scripted
-backend, command helpers, observations, and reopen.
+Use direct test functions. The test body must show the protocol sequence without
+an interpreter or fluent language between the reader and the engine.
 
-The scenario vocabulary is:
+A durable test usually has this shape:
 
 ```rust
-enum Step {
-    Open,
-    Command(StreamCommand),
-    AwaitGate(GateId),
-    ReleaseGate(GateId),
-    ExpectReply(ExpectedReply),
-    ExpectView(ExpectedView),
-    ExpectWriterExit(ExpectedExit),
-    Shutdown,
-    Crash,
-    Reopen,
-    VerifyStore,
-}
+let store = ScriptedObjectStore::builder()
+    .strict(wal_key.clone())
+    .expect_create(wal_key.clone(), CreateAction::ApplyThenFail(Transport))
+    .expect_read(wal_key, ReadAction::Pass)
+    .build();
+
+let engine = open_engine(&store).await?;
+let reply = engine.command(command).await?;
+assert_created(reply);
+assert_live(&engine, &path)?;
+
+drop(engine);
+
+let reopened = open_engine(&store).await?;
+assert_live(&reopened, &path)?;
+store.verify()?;
 ```
 
-`Crash` drops the active engine without graceful shutdown. It does not remove
-durable objects or clear the script.
+The exact API can differ. The important part is that the storage script is data
+and the engine sequence remains normal Rust control flow.
 
-The runner checks general invariants after each meaningful step:
+Small helpers can own:
+
+- deterministic entropy;
+- engine open and reopen;
+- command construction;
+- published-view observations;
+- durable object planting; and
+- repeated domain assertions.
+
+Helpers must not hide operation order, failure placement, publication, process
+loss, or reopen.
+
+Each durable test checks the applicable invariants after every meaningful
+transition:
 
 - the published view contains only acknowledged or correctly committed facts;
 - a refused command does not change the view;
@@ -532,9 +559,15 @@ The runner checks general invariants after each meaningful step:
 - writer loss makes the old engine unavailable; and
 - every operation remains within named bounds.
 
-The first implementation must stay small. Add a scenario step only when at
-least two tests need the same action or when the action names a protocol
-boundary. Do not hide a clear test behind a fluent language.
+Use a data table and one narrow `check_case` function when many cases have the
+same shape. Examples include every backend error class and every reconciliation
+result. The case data names inputs and expected observations. The check function
+owns repeated setup and diagnostics.
+
+Do not add a generic `Step` enum, scenario interpreter, or fluent engine DSL.
+Those forms duplicate Rust control flow and make simple tests harder to read.
+Reconsider this rule only when direct tests contain proven repetition that a
+narrow case checker cannot remove.
 
 ## Fixtures
 
@@ -555,8 +588,78 @@ Do not create one large default world. Prefer small builders that require the
 test to name authority, generation, batch, key, and body when those facts
 matter.
 
-Use golden byte fixtures only when exact encoding is the claim. Engine scenario
+Use golden byte fixtures only when exact encoding is the claim. Durable engine
 fixtures should use checked production encoders.
+
+## Test readability
+
+Test code is maintained code. It must meet the same standard for names, types,
+diagnostics, and deletion as production code.
+
+### Value builders
+
+A small domain value builder can remove facts that do not affect the claim:
+
+```rust
+let wal = WalFixture::run()
+    .at_batch(batch)
+    .with_create(path);
+```
+
+A value builder constructs data. It does not run the engine or hide control
+flow. Its defaults must be valid, deterministic, and irrelevant to the claim.
+Require the test to name every fact that changes authority, ordering,
+durability, identity, or a bound.
+
+Do not confuse a value builder with an engine DSL. Value builders are useful.
+A fluent language for open, command, failure, shutdown, and reopen hides the
+protocol sequence and is not part of this design.
+
+### Case matrices
+
+Use a parameterized case matrix when setup, execution, and invariant checks are
+the same for every case.
+
+Each case must:
+
+- have a semantic name;
+- contain only facts that differ between cases;
+- state the expected domain result directly; and
+- print its name, input, expected result, and actual result on failure.
+
+Split the matrix when a case needs different control flow. Do not add flags and
+optional fields until the case type becomes an interpreter.
+
+Closed small domains should be exhaustive. Examples include every backend error
+class, every `CreateEvidence` variant, and every reconciliation result.
+
+### Semantic assertions
+
+Prefer one complete comparison of a relevant domain projection over many
+fragmented assertions.
+
+For example:
+
+```rust
+assert_eq!(
+    expected_view,
+    observe(&engine),
+    "published view after ambiguous WAL reconciliation"
+);
+```
+
+Avoid checking a length, then selected members, then selected fields when one
+comparison can show the complete mismatch. Assertion helpers must report domain
+facts, not private fields, call stacks, or incidental debug structure.
+
+### Relevant detail
+
+A test body should make the claim visible at a glance. Hide repetitive
+construction that cannot affect the result. Keep operation order, fault
+placement, authority, publication, process loss, and reopen explicit.
+
+When a fixture change causes unrelated tests to change, the fixture contains too
+much policy. Split it or move the changing fact back into each affected test.
 
 ## Required coverage
 
@@ -582,7 +685,7 @@ The adapter suite must cover:
 
 ### Bootstrap
 
-Bootstrap scenarios must cover:
+Bootstrap tests must cover:
 
 - genesis create wins directly;
 - genesis race finds matching durable bytes;
@@ -599,7 +702,7 @@ Bootstrap scenarios must cover:
 
 ### Writer
 
-Writer scenarios must cover:
+Writer tests must cover:
 
 - direct WAL completion;
 - ambiguous WAL create with matching bytes;
@@ -618,7 +721,7 @@ Writer scenarios must cover:
 
 ### Checkpoint
 
-Checkpoint scenarios must cover:
+Checkpoint tests must cover:
 
 - all child tables are durable before Seal create;
 - one child create fails before apply;
@@ -638,7 +741,7 @@ Checkpoint scenarios must cover:
 
 ### Collection
 
-Collection scenarios must cover:
+Collection tests must cover:
 
 - all authorized deletes succeed;
 - one WAL delete fails before apply;
@@ -659,7 +762,7 @@ The change is one complete test-architecture project.
 Implement all four operations, strict scopes, phases, gates, traces, and
 verification.
 
-Test the harness itself before engine tests depend on it. The harness tests must
+Test the scripted store before engine tests depend on it. Its tests must
 prove:
 
 - pass-through;
@@ -680,16 +783,18 @@ prove:
 Add all adversarial adapter cases. Keep the existing normal contract cases.
 Separate portable backend claims from scripted-backend self-tests.
 
-### Add engine scenario support
+### Add durable engine test support
 
-Create the integration harness and central fixtures. First express existing
-public engine tests with it. This proves that the harness does not weaken normal
-claims.
+Add narrow fixtures and assertion helpers. Keep test control flow in each test
+body. First use the helpers in existing public engine tests. This proves that
+the support code does not weaken normal claims.
 
 ### Add the failure matrix
 
-Add bootstrap, writer, checkpoint, and collection scenarios. Every scenario
-must include reopen when durable state can differ from memory state.
+Add bootstrap, writer, checkpoint, and collection failure tests. Use direct
+tests for distinct protocol sequences. Use a data table with one `check_case`
+function for a closed matrix. Every test must include reopen when durable state
+can differ from memory state.
 
 ### Reduce private mocks
 
@@ -703,7 +808,7 @@ Storage claims must use `ScriptedObjectStore`.
 After coverage moves to the correct layer:
 
 - remove repeated raw adapter claims from Seal and WAL tests;
-- remove repeated in-memory setup from scenario bodies;
+- remove repeated in-memory setup from durable test bodies;
 - remove copied partition, key, and entropy helpers;
 - replace polling loops with gates;
 - remove helpers that only supported deleted tests; and
@@ -717,15 +822,19 @@ claim.
 A test change must answer:
 
 1. What semantic claim does this test prove?
-2. Which test layer owns that claim?
-3. What is the commit or authority boundary?
-4. Does the test check the state immediately before and after that boundary?
-5. Can a fixed script or closed matrix replace repeated control flow?
-6. Does a storage claim pass through `ObjectStoreAdapter`?
-7. Does a durable claim cross reopen?
-8. Does the failure output show the expected and observed domain facts?
-9. Did the change add a duplicate source of truth?
-10. Can old test code now be deleted?
+2. What plausible incorrect implementation does it reject?
+3. Would it survive a structurally different correct implementation?
+4. Which test layer owns the claim?
+5. Is this the purest faithful level for the claim?
+6. What is the commit or authority boundary?
+7. Does the test check the state immediately before and after that boundary?
+8. Does each helper hide only irrelevant construction?
+9. Can a property, exhaustive matrix, or fixed script replace repeated cases?
+10. Does a storage claim pass through `ObjectStoreAdapter`?
+11. Does a durable claim cross reopen?
+12. Does failure output show the expected and observed domain facts?
+13. Did the change add a duplicate source of truth?
+14. Can a superseded private test or helper now be deleted?
 
 ## Completion criteria
 
@@ -737,7 +846,7 @@ The test-architecture work is complete when:
 - checkpoint table and Seal failure matrices are complete;
 - collection is tested after every partial delete prefix;
 - ambiguous WAL and Seal creates are tested through the adapter;
-- durable scenarios reopen after each meaningful failure point;
+- durable tests reopen after each meaningful failure point;
 - typed stores no longer repeat raw adapter contracts;
 - common fixtures have one source;
 - script mismatches produce a useful trace; and
