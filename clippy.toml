@@ -2,6 +2,8 @@ allow-renamed-params-for = [
   "..",
   "core::fmt::Debug",
   "core::fmt::Display",
+  # The trait spells its parameter `res`, which disallowed-names rejects.
+  "axum::response::IntoResponseParts",
 ]
 
 missing-docs-in-crate-items = false

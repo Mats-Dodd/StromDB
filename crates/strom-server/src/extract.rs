@@ -1,30 +1,78 @@
-//! Parse foreign HTTP bytes into domain values at the edge.
+//! Typed extractors that parse foreign HTTP bytes into domain values at the edge.
 //!
-//! No storage lookups. Domain `FromStr` / `TryFrom` owns every validation rule.
+//! No storage lookups. Domain `FromStr` / `TryFrom` owns every validation rule;
+//! each fallible extractor rejects with a protocol 400 before its handler runs.
 
+use std::convert::Infallible;
+
+use axum::extract::{FromRequestParts, Path};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, header};
-use strom_domain::{ExpiresAt, ExpiryPolicy, StreamContentType, StreamTtl};
+use strom_domain::{ExpiresAt, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamTtl};
 use stromdb::StreamId;
 
 use crate::error::ApiError;
 use crate::headers::{STREAM_CLOSED, STREAM_EXPIRES_AT, STREAM_TTL};
 
-/// Parse a stream-root-relative path into a [`StreamId`].
-///
-/// # Errors
-///
-/// Returns [`ApiError::BadRequest`] when the path is not a valid stream id.
-pub(crate) fn stream_id(path: &str) -> Result<StreamId, ApiError> {
+/// The stream-root-relative request path parsed into a [`StreamId`].
+#[derive(Debug)]
+pub(crate) struct StreamPath(pub(crate) StreamId);
+
+impl<S: Send + Sync> FromRequestParts<S> for StreamPath {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Path(path) = Path::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(|rejection| ApiError::BadRequest(rejection.to_string()))?;
+        stream_id(&path).map(Self)
+    }
+}
+
+/// `Content-Type` parsed into a [`StreamContentType`]; absent defaults to
+/// `application/octet-stream` (§5.1).
+#[derive(Debug)]
+pub(crate) struct RequestContentType(pub(crate) StreamContentType);
+
+impl<S: Send + Sync> FromRequestParts<S> for RequestContentType {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        content_type(&parts.headers).map(Self)
+    }
+}
+
+/// Optional `Stream-TTL` / `Stream-Expires-At` parsed into an [`ExpiryPolicy`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Expiry(pub(crate) ExpiryPolicy);
+
+impl<S: Send + Sync> FromRequestParts<S> for Expiry {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        expiry(&parts.headers).map(Self)
+    }
+}
+
+/// `Stream-Closed` parsed into a [`StreamLifecycle`]: exactly `true`
+/// (case-insensitive, §4.1) closes; anything else leaves the stream open.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Lifecycle(pub(crate) StreamLifecycle);
+
+impl<S: Send + Sync> FromRequestParts<S> for Lifecycle {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(Self(lifecycle(&parts.headers)))
+    }
+}
+
+fn stream_id(path: &str) -> Result<StreamId, ApiError> {
     path.parse()
         .map_err(|error: stromdb::StreamIdError| ApiError::BadRequest(error.to_string()))
 }
 
-/// Parse `Content-Type`, defaulting to `application/octet-stream` when absent.
-///
-/// # Errors
-///
-/// Returns [`ApiError::BadRequest`] when the header is present but invalid.
-pub(crate) fn content_type(headers: &HeaderMap) -> Result<StreamContentType, ApiError> {
+fn content_type(headers: &HeaderMap) -> Result<StreamContentType, ApiError> {
     match headers.get(header::CONTENT_TYPE) {
         None => Ok(StreamContentType::octet_stream()),
         Some(value) => {
@@ -39,12 +87,7 @@ pub(crate) fn content_type(headers: &HeaderMap) -> Result<StreamContentType, Api
     }
 }
 
-/// Parse optional `Stream-TTL` / `Stream-Expires-At` into an [`ExpiryPolicy`].
-///
-/// # Errors
-///
-/// Returns [`ApiError::BadRequest`] on malformed values or the both-present conflict.
-pub(crate) fn expiry(headers: &HeaderMap) -> Result<ExpiryPolicy, ApiError> {
+fn expiry(headers: &HeaderMap) -> Result<ExpiryPolicy, ApiError> {
     let ttl = match headers.get(STREAM_TTL) {
         None => None,
         Some(value) => {
@@ -73,20 +116,24 @@ pub(crate) fn expiry(headers: &HeaderMap) -> Result<ExpiryPolicy, ApiError> {
         .map_err(|error| ApiError::BadRequest(error.to_string()))
 }
 
-/// True only when `Stream-Closed` is exactly `true` (case-insensitive, §4.1).
-#[must_use]
-pub(crate) fn stream_closed(headers: &HeaderMap) -> bool {
-    headers
+fn lifecycle(headers: &HeaderMap) -> StreamLifecycle {
+    let closed = headers
         .get(STREAM_CLOSED)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    if closed {
+        StreamLifecycle::Closed
+    } else {
+        StreamLifecycle::Open
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
+    use strom_domain::StreamLifecycle;
 
-    use super::{content_type, expiry, stream_closed, stream_id};
+    use super::{content_type, expiry, lifecycle, stream_id};
     use crate::error::ApiError;
     use crate::headers::{STREAM_CLOSED, STREAM_EXPIRES_AT, STREAM_TTL};
 
@@ -146,16 +193,16 @@ mod tests {
     }
 
     #[test]
-    fn stream_closed_true_case_insensitive() {
+    fn lifecycle_true_is_case_insensitive() {
         let mut headers = HeaderMap::new();
         headers.insert(STREAM_CLOSED, HeaderValue::from_static("TRUE"));
-        assert!(stream_closed(&headers));
+        assert_eq!(StreamLifecycle::Closed, lifecycle(&headers));
     }
 
     #[test]
-    fn stream_closed_yes_is_ignored() {
+    fn lifecycle_yes_is_ignored() {
         let mut headers = HeaderMap::new();
         headers.insert(STREAM_CLOSED, HeaderValue::from_static("yes"));
-        assert!(!stream_closed(&headers));
+        assert_eq!(StreamLifecycle::Open, lifecycle(&headers));
     }
 }
