@@ -145,6 +145,84 @@ predicates may return `bool`, and effectful completion may return `Result<(), Er
 read back from durable storage are foreign again and re-enter the path at the top.
 
 
+### Let the compiler guide changes
+
+Adding a new variant to a domain type is easy. The hard part is finding every piece of code
+whose assumptions are now stale. An exhaustive match turns that search into a compile error:
+add a variant, and the compiler lists every operation that must reconsider its decision. Each
+error sits inside the operation it affects, where the context needed to decide what the new
+variant means is at hand. We never have to remember where a domain type affects behavior or
+hope that a text search finds every relevant condition.
+
+```rust
+match current_user.role {
+    Role::User => Err(BanUserError::NotAllowed),
+    Role::Admin => ban(user_id),
+}
+// After adding Role::Staff:
+// error[E0004]: non-exhaustive patterns: `Role::Staff` not covered
+```
+
+- Matches on domain enums we own MUST be exhaustive, with no `_` arm, so the
+  compiler shows every location a new variant touches. A `_` arm is acceptable
+  only on foreign or `#[non_exhaustive]` enums, where the compiler forces it.
+
+- An enum we own MUST NOT be `#[non_exhaustive]`. The attribute exists so a published
+  library can add variants without breaking downstream code; inside one workspace with no
+  compatibility promise it only forces `_` arms and takes the compiler's change list away.
+
+- A decision on a domain enum SHOULD be a full `match`. `if let`, `matches!`, and `==`
+  against a variant are silent catch-alls: they ignore every other variant without asking.
+  Use them only where a new variant genuinely cannot change the decision.
+
+- Do not collapse a domain enum into a `bool` classifier such as `is_privileged`. The
+  helper answers an abstract question—"is staff privileged?"—when each operation needs its
+  own: "can staff ban this user?", "can staff view this audit log?". When a variant is
+  added, the compiler points at the helper instead of at the operations, and no single
+  boolean is correct for every call site. Match inside each operation; extract a predicate
+  only when its answer is genuinely identical everywhere it is used.
+
+- The same guidance applies to product types. Code that must be revisited when a field is
+  added—codecs, invariant checks, merges—SHOULD destructure the struct exhaustively,
+  without `..`, so a new field is a compile error there.
+
+- A compilation error caused by a domain-model change is a list of obligations to reconsider.
+  Do not silence it with an `Option`, default value, cast, clone, or wildcard match unless the
+  new domain semantics justify that choice.
+
+- A function MUST NOT contain dead arms or `unreachable!` blocks. A dead arm on a type
+  we own means the type is wider than the domain: go back to the source and narrow the
+  type until the arm disappears. Do not confuse a dead arm with a relational invariant.
+  A fact that spans several values or a span of time—a checkpoint at or below the tail,
+  a buffer length equal to a header field—may cost more to encode than it removes (see
+  the escalation ladder). That fact gets an `assert!` per §3, never an unreachable arm.
+
+### Focus on one case at a time
+
+When several inputs decide one result, the hard part is not any individual case but tracking
+every combination. Match on a tuple of the inputs and the compiler takes over the
+bookkeeping: the code does not compile until every combination is covered, so attention can
+rest entirely on the case at hand.
+
+```rust
+match (destination, speed) {
+    (Destination::Domestic, Speed::Standard) => 3,
+    (Destination::Domestic, Speed::Express) => 1,
+    (Destination::International, Speed::Standard) => 10,
+    (Destination::International, Speed::Express) => 3,
+}
+```
+
+- When more than one domain value determines an outcome, the decision SHOULD be a single
+  match on the tuple, not a nest of `if`/`else` chains. A chain of conditions carries no
+  guarantee that every valid combination was considered; the tuple match does.
+
+- The match MUST contain only meaningful combinations. If a combination is impossible in
+  the domain, narrow the types until it is impossible in the code—this is the dead-arm rule
+  above applied to products of enums. The real design work is identifying which inputs
+  affect the output; once the types say that, handling the combinations is mechanical.
+
+
 ## 2. Typestate and witnesses
 
 - Use typestate for small, in-process protocols where the legal operations
@@ -295,21 +373,6 @@ pure transformation.
   can change between deciding and applying, the implementation MUST either retain exclusive
   ownership across both steps or carry an expected generation that the singular commit point
   atomically revalidates.
-
-- Matches on domain enums we own MUST be exhaustive, with no `_` arm, so the
-  compiler shows every location a new variant touches. A `_` arm is acceptable
-  only on foreign or `#[non_exhaustive]` enums.
-
-- A compilation error caused by a domain-model change is a list of obligations to reconsider.
-  Do not silence it with an `Option`, default value, cast, clone, or wildcard match unless the
-  new domain semantics justify that choice.
-
-- A function MUST NOT contain dead arms or `unreachable!` blocks. A dead arm on a type
-  we own means the type is wider than the domain: go back to the source and narrow the
-  type until the arm disappears. Do not confuse a dead arm with a relational invariant.
-  A fact that spans several values or a span of time—a checkpoint at or below the tail,
-  a buffer length equal to a header field—may cost more to encode than it removes (see
-  the escalation ladder). That fact gets an `assert!` per §3, never an unreachable arm.
 
 ## 6. Module and crate structure
 
