@@ -1,130 +1,164 @@
-//! Sequential Directory SST rows.
+//! Directory SST archive root.
+
+use rkyv::rancor::Failure;
 
 use super::{
-    Cursor, RowCodec, RowField, SstDecodeError, SstEncodeError, begin_table,
-    decode_expected_header, finish_table,
+    SST_OBJECT_BYTES_MAX_USIZE, SstDecodeError, SstEncodeError, check_decode_bound,
+    check_encode_rows,
 };
-use crate::bounds::DIRECTORY_KEY_BYTES_MAX;
-use crate::{DirectoryEntry, DirectoryKey, StreamUid, TableKey};
+use crate::archive;
+use crate::bounds::{
+    DIRECTORY_KEY_BYTES_MAX, DIRECTORY_ROW_LOGICAL_BYTES_MAX, PARTITION_PATH_OCCUPANCIES_MAX_V2,
+    PARTITION_RESIDENT_LOGICAL_BYTES_MAX_V2,
+};
+use crate::{DirectoryEntry, DirectoryKey, FreshIdentity, PartitionId, StoreKind, TableKey};
 
-const ROW_FIXED_BYTES: usize = 2 + 2 + 1 + 8;
+#[derive(Debug, rkyv::Archive, rkyv::Serialize)]
+#[rkyv(bytecheck(bounds(__C: rkyv::validation::ArchiveContext)))]
+// This encoding-only root borrows rows only for one synchronous archive call.
+// ast-grep-ignore: types-own-their-data
+struct DirectorySstArchive<'rows> {
+    partition: PartitionId,
+    fresh: FreshIdentity,
+    #[rkyv(with = rkyv::with::InlineAsBox)]
+    rows: &'rows [(DirectoryKey, DirectoryEntry)],
+}
 
 /// Encodes one non-empty, strictly ordered Directory table.
 ///
 /// # Errors
 ///
-/// Returns [`SstEncodeError`] when the object store is not Directory, rows are
-/// empty or not strictly ordered, a count overflows, or the object is over-bound.
+/// Returns [`SstEncodeError`] when the key names another store, the row set is
+/// empty or unordered, serialization fails, or the complete object is over-bound.
 pub fn encode_directory_sst(
     expected: &TableKey,
     rows: &[(DirectoryKey, DirectoryEntry)],
 ) -> Result<Vec<u8>, SstEncodeError> {
+    if expected.object().store() != StoreKind::Directory {
+        return Err(SstEncodeError::StoreMismatch);
+    }
+    check_encode_rows::<(DirectoryKey, DirectoryEntry)>(rows.len())?;
+    let mut previous = None;
+    for (key, _entry) in rows {
+        if previous.is_some_and(|previous_key| key.as_bytes() <= previous_key) {
+            return Err(SstEncodeError::RowsNotStrictlyOrdered);
+        }
+        previous = Some(key.as_bytes());
+    }
     if rows.is_empty() {
         return Err(SstEncodeError::EmptyTable);
     }
-    let mut bytes = begin_table(expected, RowCodec::DirectoryV1)?;
-    let mut previous: &[u8] = &[];
-    let mut row_count = 0usize;
-    for (key, entry) in rows {
-        if !previous.is_empty() && key.as_bytes() <= previous {
-            return Err(SstEncodeError::RowsNotStrictlyOrdered);
-        }
-        let shared = longest_common_prefix(previous, key.as_bytes());
-        let suffix = key
-            .as_bytes()
-            .get(shared..)
-            .ok_or(SstEncodeError::RowLengthOverflow)?;
-        let shared = u16::try_from(shared).map_err(|_detail| SstEncodeError::RowLengthOverflow)?;
-        let suffix_length =
-            u16::try_from(suffix.len()).map_err(|_detail| SstEncodeError::RowLengthOverflow)?;
-        bytes.extend_from_slice(&shared.to_be_bytes());
-        bytes.extend_from_slice(&suffix_length.to_be_bytes());
-        let (tag, uid) = match entry {
-            DirectoryEntry::Live(uid) => (1, *uid),
-            DirectoryEntry::Tombstone(uid) => (2, *uid),
-        };
-        bytes.push(tag);
-        bytes.extend_from_slice(&uid.encoded().to_be_bytes());
-        bytes.extend_from_slice(suffix);
-        previous = key.as_bytes();
-        row_count = row_count
-            .checked_add(1)
-            .ok_or(SstEncodeError::RowCountOverflow)?;
-    }
-    finish_table(bytes)
+
+    let root = DirectorySstArchive {
+        partition: expected.partition(),
+        fresh: expected.object().fresh(),
+        rows,
+    };
+    archive::encode(&root, SST_OBJECT_BYTES_MAX_USIZE).map_err(SstEncodeError::from)
 }
 
 /// Decodes a complete Directory SST into an all-or-nothing owned row set.
 ///
 /// # Errors
 ///
-/// Returns [`SstDecodeError`] when any header or row gate fails. No decoded
-/// prefix is returned when a later row is malformed.
+/// Returns [`SstDecodeError`] when the byte, structure, identity, resource, or
+/// row-domain gates fail.
 pub fn decode_directory_sst(
     expected: &TableKey,
     bytes: &[u8],
 ) -> Result<Vec<(DirectoryKey, DirectoryEntry)>, SstDecodeError> {
-    let body = decode_expected_header(expected, RowCodec::DirectoryV1, bytes)?;
-    let mut cursor = Cursor::new();
-    let mut rows = Vec::new();
-    let mut previous = Vec::new();
-    let mut row_count = 0usize;
-    while !cursor.is_empty(body) {
-        let shared = usize::from(cursor.u16(body, RowField::DirectoryShared)?);
-        let suffix_length = usize::from(cursor.u16(body, RowField::DirectorySuffixLength)?);
-        let tag = cursor.u8(body, RowField::DirectoryEntryTag)?;
-        let uid = cursor.u64(body, RowField::DirectoryUid)?;
-        let suffix = cursor.take(body, suffix_length, RowField::DirectorySuffix)?;
-        if shared > previous.len() {
-            return Err(SstDecodeError::PrefixPastPreviousKey);
-        }
-        let key_length = shared
-            .checked_add(suffix_length)
-            .ok_or(SstDecodeError::DirectoryKeyLength)?;
-        if key_length == 0 || key_length > DIRECTORY_KEY_BYTES_MAX {
-            return Err(SstDecodeError::DirectoryKeyLength);
-        }
-        let mut materialized = Vec::with_capacity(key_length);
-        materialized.extend_from_slice(
-            previous
-                .get(..shared)
-                .ok_or(SstDecodeError::PrefixPastPreviousKey)?,
-        );
-        materialized.extend_from_slice(suffix);
-        if longest_common_prefix(&previous, &materialized) != shared {
-            return Err(SstDecodeError::NonLongestPrefix);
-        }
-        if !previous.is_empty() && materialized <= previous {
-            return Err(SstDecodeError::RowsNotStrictlyOrdered);
-        }
-        let key = DirectoryKey::try_from(materialized.clone().into_boxed_slice())
-            .map_err(|_detail| SstDecodeError::InvalidDirectoryKey)?;
-        let uid = StreamUid::try_from(uid).map_err(|_detail| SstDecodeError::ZeroUid)?;
-        let entry = match tag {
-            1 => DirectoryEntry::Live(uid),
-            2 => DirectoryEntry::Tombstone(uid),
-            observed => return Err(SstDecodeError::UnknownDirectoryTag { observed }),
-        };
-        rows.push((key, entry));
-        previous = materialized;
-        row_count = row_count
-            .checked_add(1)
-            .ok_or(SstDecodeError::RowCountOverflow)?;
+    check_decode_bound(bytes)?;
+    if expected.object().store() != StoreKind::Directory {
+        return Err(SstDecodeError::StoreMismatch);
     }
-    if rows.len() != row_count {
-        return Err(SstDecodeError::RowCountOverflow);
+    let root = rkyv::access::<ArchivedDirectorySstArchive<'_>, Failure>(bytes)
+        .map_err(|_archive_error| SstDecodeError::MalformedArchive)?;
+    let partition = PartitionId::try_from(&root.partition)
+        .map_err(|_domain_error| SstDecodeError::InvalidBody)?;
+    let fresh = FreshIdentity::try_from(&root.fresh)
+        .map_err(|_domain_error| SstDecodeError::InvalidBody)?;
+    if partition != expected.partition() || fresh != expected.object().fresh() {
+        return Err(SstDecodeError::IdentityMismatch);
+    }
+    if root.rows.is_empty() {
+        return Err(SstDecodeError::InvalidBody);
+    }
+    if u64::try_from(root.rows.len()).unwrap_or(u64::MAX) > PARTITION_PATH_OCCUPANCIES_MAX_V2 {
+        return Err(SstDecodeError::ResourceBound);
+    }
+
+    let mut previous = None;
+    let mut resident_bytes = 0u64;
+    for row in root.rows.iter() {
+        let key = row.0.as_bytes();
+        if key.is_empty() || key.len() > DIRECTORY_KEY_BYTES_MAX {
+            return Err(SstDecodeError::InvalidBody);
+        }
+        if previous.is_some_and(|previous_key| key <= previous_key) {
+            return Err(SstDecodeError::InvalidBody);
+        }
+        row.0
+            .validated_bytes()
+            .map_err(|_domain_error| SstDecodeError::InvalidBody)?;
+        resident_bytes = resident_bytes
+            .checked_add(DIRECTORY_ROW_LOGICAL_BYTES_MAX)
+            .ok_or(SstDecodeError::ResourceBound)?;
+        if resident_bytes > PARTITION_RESIDENT_LOGICAL_BYTES_MAX_V2 {
+            return Err(SstDecodeError::ResourceBound);
+        }
+        previous = Some(key);
+    }
+
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(root.rows.len())
+        .map_err(|_allocation_error| SstDecodeError::ResourceBound)?;
+    for row in root.rows.iter() {
+        rows.push((
+            DirectoryKey::try_from(&row.0).map_err(|_domain_error| SstDecodeError::InvalidBody)?,
+            DirectoryEntry::from(&row.1),
+        ));
     }
     Ok(rows)
 }
 
-pub(super) fn longest_common_prefix(left: &[u8], right: &[u8]) -> usize {
-    left.iter()
-        .zip(right)
-        .take_while(|(left_byte, right_byte)| left_byte == right_byte)
-        .count()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AttemptId, SealGeneration, StreamUid, TableObjectId};
 
-const _: () = assert!(
-    ROW_FIXED_BYTES == 13,
-    "Directory V1 rows have thirteen fixed bytes before the path suffix"
-);
+    #[test]
+    fn decoder_rejects_a_structurally_valid_duplicate_key() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let expected = table_key()?;
+        let key = "events/a"
+            .parse::<strom_domain::StreamId>()
+            .map(|stream_id| DirectoryKey::from(&stream_id))?;
+        let rows = [
+            (key.clone(), DirectoryEntry::Live(StreamUid::try_from(1)?)),
+            (key, DirectoryEntry::Tombstone(StreamUid::try_from(2)?)),
+        ];
+        let root = DirectorySstArchive {
+            partition: expected.partition(),
+            fresh: expected.object().fresh(),
+            rows: &rows,
+        };
+        let bytes = archive::encode(&root, SST_OBJECT_BYTES_MAX_USIZE)?;
+        assert_eq!(
+            decode_directory_sst(&expected, &bytes),
+            Err(SstDecodeError::InvalidBody)
+        );
+        Ok(())
+    }
+
+    fn table_key() -> Result<TableKey, Box<dyn std::error::Error>> {
+        let fresh = FreshIdentity::new(
+            SealGeneration::try_from(2)?,
+            AttemptId::new(SealGeneration::genesis(), 4),
+            0,
+        )?;
+        Ok(TableKey::new(
+            "00112233-4455-6677-8899-aabbccddeeff".parse()?,
+            TableObjectId::new(fresh, StoreKind::Directory),
+        ))
+    }
+}

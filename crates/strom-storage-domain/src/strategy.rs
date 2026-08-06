@@ -7,8 +7,8 @@ use proptest::prelude::{Just, Strategy, prop_oneof};
 
 use crate::{
     BatchId, BoundedNonEmptyVec, DirectoryEntry, DirectoryKey, LedgerCell, OperationFact,
-    OwnerToken, PartitionId, Seal, SealFormat, SealGeneration, StreamRecord, StreamUid,
-    TreeVersion, WalFence, WalObject, WalReplayPoint, WalRun,
+    OwnerToken, PartitionId, Seal, SealGeneration, StreamRecord, StreamUid, TreeVersion, WalFence,
+    WalObject, WalReplayPoint, WalRun,
 };
 
 pub fn partition_id() -> impl Strategy<Value = PartitionId> {
@@ -112,7 +112,6 @@ pub fn seal() -> impl Strategy<Value = Seal> {
                     partition,
                     generation,
                     replay,
-                    SealFormat::V2,
                     TreeVersion::empty(),
                     TreeVersion::empty(),
                     TreeVersion::empty(),

@@ -13,10 +13,8 @@ workspace = true
 proptest = ["dep:proptest", "strom-domain/proptest"]
 
 [dependencies]
-crc32c = { workspace = true }
-postcard = { workspace = true }
 proptest = { workspace = true, optional = true }
-serde = { workspace = true, features = ["derive"] }
+rkyv = { workspace = true }
 strom-domain = { path = "../strom-domain", version = "0.1.0" }
 thiserror = { workspace = true }
 

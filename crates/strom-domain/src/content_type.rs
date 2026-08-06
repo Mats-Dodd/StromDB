@@ -21,8 +21,7 @@ enum MediaType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GeneralMediaType {
-    essence: Box<str>,
-    charset: Option<Box<str>>,
+    canonical: Box<str>,
 }
 
 /// Upper bound on a content-type string, in bytes.
@@ -53,23 +52,62 @@ impl StreamContentType {
         Self(MediaType::OctetStream)
     }
 
+    /// The canonical spelling carried across protocol and durability seams.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match &self.0 {
+            MediaType::OctetStream => ESSENCE_OCTET_STREAM,
+            MediaType::Json => ESSENCE_JSON,
+            MediaType::General(content_type) => &content_type.canonical,
+        }
+    }
+
+    /// Validates and returns one borrowed canonical content-type spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentTypeError`] when `input` is malformed, over-bound, or
+    /// is a spelling that the protocol parser would normalize.
+    pub fn validate_canonical(input: &str) -> Result<&str, ContentTypeError> {
+        if input.len() > CONTENT_TYPE_BYTES_MAX {
+            return Err(ContentTypeError::OverMaxBytes);
+        }
+        let (essence, charset) = match input.split_once("; charset=") {
+            Some((essence, charset)) => (essence, Some(charset)),
+            None => (input, None),
+        };
+        if essence.contains(';') || charset.is_some_and(|value| value.contains(';')) {
+            return Err(ContentTypeError::Malformed);
+        }
+        let (media_type, subtype) = essence.split_once('/').ok_or(ContentTypeError::Malformed)?;
+        if !is_token(media_type)
+            || !is_token(subtype)
+            || media_type.bytes().any(|byte| byte.is_ascii_uppercase())
+            || subtype.bytes().any(|byte| byte.is_ascii_uppercase())
+        {
+            return Err(ContentTypeError::NonCanonical);
+        }
+        if let Some(charset) = charset
+            && (!is_token(charset) || charset.bytes().any(|byte| byte.is_ascii_uppercase()))
+        {
+            return Err(ContentTypeError::NonCanonical);
+        }
+        Ok(input)
+    }
+
     /// True for `application/json` (JSON-mode message boundaries, §9.1).
     #[must_use]
     pub fn is_json(&self) -> bool {
-        match &self.0 {
-            MediaType::Json => true,
-            MediaType::OctetStream => false,
-            MediaType::General(general) => &*general.essence == ESSENCE_JSON,
-        }
+        self.as_str()
+            .split_once(';')
+            .map_or(self.as_str(), |(essence, _parameters)| essence)
+            == ESSENCE_JSON
     }
 
     /// True for any `text/*` type (SSE text encoding, §5.8).
     #[must_use]
     pub fn is_text(&self) -> bool {
-        match &self.0 {
-            MediaType::OctetStream | MediaType::Json => false,
-            MediaType::General(general) => general.essence.starts_with(ESSENCE_TEXT_PREFIX),
-        }
+        self.as_str().starts_with(ESSENCE_TEXT_PREFIX)
     }
 }
 
@@ -127,37 +165,29 @@ impl FromStr for StreamContentType {
                 return Ok(Self(MediaType::Json));
             }
         }
-        let essence = format!(
-            "{}/{}",
-            type_raw.to_ascii_lowercase(),
-            subtype_raw.to_ascii_lowercase()
-        )
-        .into_boxed_str();
+        let mut canonical = String::with_capacity(canonical_bytes);
+        canonical.push_str(&type_raw.to_ascii_lowercase());
+        canonical.push('/');
+        canonical.push_str(&subtype_raw.to_ascii_lowercase());
+        if let Some(charset) = charset {
+            canonical.push_str("; charset=");
+            canonical.push_str(&charset);
+        }
         Ok(Self(MediaType::General(Box::new(GeneralMediaType {
-            essence,
-            charset: charset.map(String::into_boxed_str),
+            canonical: canonical.into_boxed_str(),
         }))))
     }
 }
 
 impl fmt::Display for StreamContentType {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.0 {
-            MediaType::OctetStream => formatter.write_str(ESSENCE_OCTET_STREAM),
-            MediaType::Json => formatter.write_str(ESSENCE_JSON),
-            MediaType::General(general) => match &general.charset {
-                Some(charset) => {
-                    write!(formatter, "{}; charset={}", general.essence, charset)
-                }
-                None => formatter.write_str(&general.essence),
-            },
-        }
+        formatter.write_str(self.as_str())
     }
 }
 
 impl serde::Serialize for StreamContentType {
     fn serialize<Ser: serde::Serializer>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error> {
-        serializer.collect_str(self)
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -184,4 +214,6 @@ pub enum ContentTypeError {
     Malformed,
     #[error("content type has a parameter other than `charset`")]
     UnsupportedParameter,
+    #[error("content type is not in canonical lowercase form")]
+    NonCanonical,
 }

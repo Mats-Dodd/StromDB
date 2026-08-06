@@ -125,6 +125,12 @@ pub enum StreamTtlError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExpiresAt(Timestamp);
 
+impl From<ExpiresAt> for i128 {
+    fn from(expires_at: ExpiresAt) -> Self {
+        expires_at.0.as_nanosecond()
+    }
+}
+
 impl FromStr for ExpiresAt {
     type Err = ExpiresAtError;
 

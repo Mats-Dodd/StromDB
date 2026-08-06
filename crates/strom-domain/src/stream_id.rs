@@ -22,12 +22,13 @@ impl StreamId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-}
 
-impl FromStr for StreamId {
-    type Err = StreamIdError;
-
-    fn from_str(path: &str) -> Result<Self, Self::Err> {
+    /// Validates and returns one borrowed canonical stream-id spelling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StreamIdError`] when `path` violates a stream-id invariant.
+    pub fn validate(path: &str) -> Result<&str, StreamIdError> {
         if path.len() > STREAM_ID_BYTES_MAX {
             return Err(StreamIdError::OverMaxBytes);
         }
@@ -45,7 +46,15 @@ impl FromStr for StreamId {
                 return Err(StreamIdError::ReservedRootSegment);
             }
         }
-        Ok(Self(path.to_owned()))
+        Ok(path)
+    }
+}
+
+impl FromStr for StreamId {
+    type Err = StreamIdError;
+
+    fn from_str(path: &str) -> Result<Self, Self::Err> {
+        Self::validate(path).map(|canonical| Self(canonical.to_owned()))
     }
 }
 

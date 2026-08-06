@@ -1,6 +1,6 @@
 # durable streams server architecture
 
-This document specifies StromDb's storage engine.  Its correctness protocol, storage layout, program shape, writes, reads, maintenance and garbage collection. It remains authority unless superseded by explicit RFC's.  
+This document specifies StromDb's storage engine.  Its correctness protocol, storage layout, program shape, writes, reads, maintenance and garbage collection. It remains authority unless superseded by explicit RFC's.
 
 [`durable-streams-protocol.md`](durable-streams-protocol.md) remains the external Durable Streams contract.
 
@@ -12,16 +12,17 @@ The design rule is:
 
 ## overview
 
-A stromdb instance operates over a logical partition.  
+A stromdb instance operates over a logical partition.
 
 One partition is a serialized fact stream backed only by immutable S3 objects.
 Its complete current state is:
 
 ```text
 newest permanent Seal at WAL cut W
-        |-- Ledger: inline adaptive ordered-range LSM manifest
-        |-- Tally:  inline adaptive ordered-range LSM manifest
-        `-- Annals: inline adaptive ordered-range LSM manifest
+        |-- Directory: inline adaptive ordered-range LSM manifest
+        |-- Ledger:    inline adaptive ordered-range LSM manifest
+        |-- Tally:     inline adaptive ordered-range LSM manifest
+        `-- Annals:    inline adaptive ordered-range LSM manifest
                          |
                          `-- immutable bounded payload packs
 
@@ -42,7 +43,7 @@ The durable concepts each job:
 
 | Concept | Job |
 | --- | --- |
-| Seal | choose the unique current version, serialize writer succession, and atomically publish the complete three-tree manifest |
+| Seal | choose the unique current version, serialize writer succession, and atomically publish the complete four-tree manifest |
 | WAL RUN/FENCE | make mutations durable with one PUT and make takeover exact |
 | SST | incrementally organize ordered index state |
 | Payload pack | retain large values without rewriting them during index compaction |
@@ -51,7 +52,7 @@ The durable concepts each job:
 
 The engine must uphold the following:
 
-1. A successfull write must survive process loss, object storage is the systems only source of durability. RAM and NVME are only ever treated as accelerators. 
+1. A successfull write must survive process loss, object storage is the systems only source of durability. RAM and NVME are only ever treated as accelerators.
 2. A successful write only requires one obejct storage round trip.
 3. A most one writer process is the current authority for a partition and this correctness does not depend on clocks or leases.
 4. Recovery reconstructs every agkownledged write exactly and in order.
@@ -59,8 +60,8 @@ The engine must uphold the following:
 7. Every compaction, checkpoint, read, replay step, buffer, queue, object,
    manifest, and collection batch has a named bound or is finite and
    resumable in bounded turns.
-8. GC may leak. 
-9.  One partition should remain viable at a scale of 10 million streams.  
+8. GC may leak.
+9.  One partition should remain viable at a scale of 10 million streams.
 
 The engine does not provide transactions between independent public requests
 or streams. One admitted request is atomic; ordering between requests is the
@@ -70,12 +71,12 @@ A partition is the serialization and recovery boundary. A stream and its fork
 family must route together so lineage, pins, retention, and inherited reads can
 remain one bounded fact protocol. V1 may deploy one partition; later partition
 placement and movement belong to the router/control plane and must not create
-a second storage authority. 
+a second storage authority.
 
 
 ## system anatomy
 
-The system is built around 4 primitives who compose into our corrctness protocol and performance characteristics. 
+The system is built around 4 primitives who compose into our corrctness protocol and performance characteristics.
 
 ```text
 Seal       commits
@@ -84,11 +85,11 @@ LSM forest organizes
 packs      carry bytes
 ```
 
-The seal is our clean serialization point for the many trees in our lsm forest. It is our immutable serving manifest. 
+The seal is our clean serialization point for the many trees in our lsm forest. It is our immutable serving manifest.
 
-The wal is our linearization point, it carries the data for all stores into one point of linearizibility for a write.  
+The wal is our linearization point, it carries the data for all stores into one point of linearizibility for a write.
 
-The LSM forest is a set of individual LSM stores tuned to the different requirements of workload prescribed to servers in the durable streams protocol.  
+The LSM forest is a set of individual LSM stores tuned to the different requirements of workload prescribed to servers in the durable streams protocol.
 
 payloads are payloads, our machinery revolves around serving these correctly and efficiently.
 
@@ -107,38 +108,49 @@ is no intermediate root object.
 ## protocol state and physical projections
 
 The public protocol exposes one stream abstraction. The engine represents its
-state through three ordered projections because their workloads differ. They
-are not three transactions or three authorities. One `OperationFact` can
-change all three atomically at one WAL coordinate.
+state through four ordered projections because their workloads differ. They
+are not four transactions or four authorities. One `OperationFact` can
+change multiple projections atomically at one WAL coordinate.
+
+
+### directory: ordered paths
+
+
+Directory is keyed by canonical stream path and resolves protocol names to
+partition-local identities:
+
+```text
+stream path
+    -> Live(stream uid) | Tombstone(stream uid)
+```
+
+Directory tombstones are permanent logical values because the protocol
+discourages reusing a deleted stream URL. Compaction does not silently erase
+that fact.
 
 
 ### ledger: ordered identity and lifecycle
 
 
-Ledger is keyed primarily by canonical stream path and stores cold identity:
+Ledger is keyed by partition-local stream UID and stores stream metadata:
 
 ```text
-stream path
-    -> stream identity
-       content type and configuration
-       creation and permanent path tombstone
+stream uid
+    -> content type and configuration
+       creation coordinate
        open/closed/soft-deleted lifecycle
        TTL or absolute-expiry policy
        parent stream and exact fork boundary
 ```
 
-Its dominant operations are exact lookup, ordered prefix scan, glob build,
-fork-lineage traversal, and rare lifecycle mutation. Lexical range order is
-part of the workload rather than an incidental implementation property.
-
-Path tombstones are permanent logical values because the protocol discourages
-reusing a deleted stream URL. Compaction does not silently erase that fact.
+Directory owns ordered prefix scans and glob construction. Ledger owns exact
+UID lookup, fork-lineage traversal, and rare lifecycle mutation.
 
 
 
 ### tally: current state and admission
 
-NB the exact semantics/ layout of the tally LSM are still subejct to change by a further RFC.  They still adhere to the currect correctness protocol though. 
+NB the exact semantics/ layout of the tally LSM are still subejct to change by a further RFC.  They still adhere to the currect correctness protocol though.
 
 Tally is a set of ordered last-value namespaces:
 
@@ -156,8 +168,9 @@ sequences, per-writer `Stream-Seq` state, cumulative positions, fork pins,
 logical capacity, subscription cursors, wake generations, leases, retry
 schedules, and bidirectional stream membership.
 
-Tally is the authoritative logical capacity projection. Admission-critical
-Tally and Ledger state is rebuilt locally before a partition becomes Ready.
+Tally is the authoritative logical capacity projection once its RFC defines
+that state. The currently implemented Directory and Ledger state is rebuilt
+locally before a partition becomes Ready.
 
 For fork accounting, a stream row distinguishes:
 
@@ -174,7 +187,7 @@ therefore adds no owned-unique bytes.
 
 ### annals: ordered retained history
 
-NB the exact semantics/ layout of the tally LSM are still subejct to change by a further RFC.  They still adhere to the currect correctness protocol though. 
+NB the exact semantics/ layout of the tally LSM are still subejct to change by a further RFC.  They still adhere to the currect correctness protocol though.
 
 Annals is keyed by canonical owner and stream offset:
 
@@ -209,7 +222,7 @@ strom db depends on a deliberatly narrow object store adapter.  It must provide:
 7. idempotent deletion for other authorized content objects;
 8. bounded decode before allocation, including key/body agreement; and
 
-Explicit operation concerns ie IAM are explicitly out of scope.  
+Explicit operation concerns ie IAM are explicitly out of scope.
 
 Seal deletion is denied outright.
 
@@ -286,20 +299,37 @@ a new claim before preparing objects, so a legal writer never reuses
 `(owner_claim, local_counter)`. An attempt never adopts an arbitrary orphan
 found by LIST or content hash.
 
-Every object envelope contains its logical identity, format, bounded lengths,
-and checksum. Decode verifies:
+Every typed durable object is one concrete rkyv archive selected by its typed
+object-store key and decoder. The archive contains its logical identity.
+Decode verifies:
+
+```text
+SealKey             -> Seal
+WalKey              -> WalObject::Run | WalObject::Fence
+TableKey(Directory) -> DirectorySstArchive
+TableKey(Ledger)    -> LedgerSstArchive
+```
+
+`StreamRecord` appears only inside a Ledger SST value; it has no standalone
+durable codec or object location. Decode verifies:
 
 ```text
 length bound
--> magic, object kind, and format
--> checksum
--> bounded body with no trailing bytes
+-> checked archived access
+-> collection-count and resident-memory bounds before allocation
 -> domain invariants
--> canonical key/body identity
+-> key/body identity
 ```
 
-Foreign or noncanonical objects under a Courant-owned prefix are durable
-contradictions, not candidates to ignore.
+There is no envelope, application checksum, or content-format version before
+StromDB makes a released compatibility promise. Foreign, malformed, or
+semantically invalid objects under a Courant-owned prefix are durable
+contradictions, not candidates to ignore. rkyv locates its root at the end of
+the supplied slice, so unreachable leading bytes are tolerated inside the
+complete-object bound but are never emitted. The exact rkyv release and
+format-control features are the current archive contract;
+[`rkyv.md`](rkyv.md) records the implemented boundary. The `v1` path segment
+remains a key-spelling namespace and is not an archive version.
 
 ## permanent seals
 
@@ -311,17 +341,16 @@ version:
 struct Seal {
     partition: PartitionId,
     generation: SealGeneration,
-    through: WalCut,
-    wal_owner_at_through: ReplayOwner,
-    format: SealFormat,
+    replay: WalReplayPoint,
+    directory: TreeVersion,
     ledger: TreeVersion,
     tally: TreeVersion,
     annals: TreeVersion,
 }
 
-enum ReplayOwner {
-    NoOwner,
-    Owner(OwnerToken),
+enum WalReplayPoint {
+    Genesis,
+    Through { batch: BatchId, owner: OwnerToken },
 }
 ```
 
@@ -330,16 +359,14 @@ Every persisted field has one recovery obligation:
 | Field | Why it cannot be derived later |
 | --- | --- |
 | `partition`, `generation` | authenticate key/body identity and exact succession |
-| `through` | separate the materialized prefix from the readable WAL suffix and authorize covered-RUN collection |
-| `wal_owner_at_through` | resume strict owner folding after covered RUNs have been deleted |
-| `format` | choose the durable decoder and comparator semantics |
-| three `TreeVersion`s | name the complete current physical serving state |
+| `replay` | separate the materialized prefix from the readable WAL suffix and retain the owner in force after folding |
+| four `TreeVersion`s | name the complete current physical serving state |
 
-`WalCut` includes the virtual genesis cut zero. Real WAL objects use nonzero
-`BatchId` values. `ReplayOwner::NoOwner` is legal only at cut zero; every real
-cut records the owner in force after folding that coordinate.
+`WalReplayPoint::Genesis` represents the virtual cut zero. Real WAL objects
+use nonzero `BatchId` values, and every `Through` point records the owner in
+force after folding that coordinate.
 
-Genesis is generation 1 at cut zero with `NoOwner` and one canonical empty
+Genesis is generation 1 at `WalReplayPoint::Genesis` and one canonical empty
 `TreeVersion` for each store. Every later Seal is the exact successor of one
 observed permanent Seal. Seal keys are never overwritten, deleted, or reused:
 
@@ -348,12 +375,12 @@ observed permanent Seal. Seal keys are never overwritten, deleted, or reused:
 ```
 
 Every Seal carries a complete manifest and can serve while it is newest.  Serving and recovery never need to load an earlier Seal. The Seal generation
-is therefore the exact physical view identity; `through` remains only the
-logical WAL coverage boundary.
+is therefore the exact physical view identity; `replay` remains only the
+logical WAL coverage boundary and owner at that boundary.
 
 “Self-contained” means that the Seal names the complete dependency graph
-without consulting a predecessor manifest. It does not mean SST footers,
-blocks, or payload bytes are embedded in the Seal.
+without consulting a predecessor manifest. It does not mean SST row bodies or
+payload bytes are embedded in the Seal.
 
 ## legal seal transitions
 
@@ -362,8 +389,8 @@ is illegal even if the skipped key appears absent.
 
 ### genesis
 
-Provisioning creates one canonical generation-1 Seal with empty trees, cut
-zero, and `NoOwner`. Genesis grants no ownership.
+Provisioning creates one canonical generation-1 Seal with empty trees and
+`WalReplayPoint::Genesis`. Genesis grants no ownership.
 
 
 ### claim
@@ -373,9 +400,8 @@ manifest:
 
 ```text
 candidate.generation = head.generation + 1
-candidate.through = head.through
-candidate.wal_owner_at_through = head.wal_owner_at_through
-candidate.{ledger,tally,annals} = head.{ledger,tally,annals}
+candidate.replay = head.replay
+candidate.{directory,ledger,tally,annals} = head.{directory,ledger,tally,annals}
 ```
 
 Only the caller receiving `Direct` may construct `AuthoredClaim`. A
@@ -390,15 +416,15 @@ A Ready writer may publish a Seal at a greater WAL cut:
 
 ```text
 candidate.generation           = source.generation + 1
-candidate.through              > source.through
-candidate.wal_owner_at_through = owner produced by exact fold through candidate.through
+candidate.replay.batch         > source.replay.batch
+candidate.replay.owner         = owner produced by exact fold through candidate.replay.batch
 logical(candidate)             = fold(logical(source), selected WAL prefix)
 candidate children             = source-carried or candidate-generation-fresh
 ```
 
 When the source is genesis, its logical source is the empty state at virtual
-cut zero with `NoOwner`; the first advancing Seal ends at a nonzero occupied
-WAL coordinate and records the owner in force there.
+cut zero; the first advancing Seal ends at a nonzero occupied WAL coordinate
+and records the owner in force there.
 
 The stored owner is historical replay state. It need not equal the publisher's
 current owner token when a bounded checkpoint stops inside a suffix written by
@@ -415,13 +441,12 @@ A Ready writer may select a new physical version at the same cut:
 
 ```text
 candidate.generation           = source.generation + 1
-candidate.through              = source.through
-candidate.wal_owner_at_through = source.wal_owner_at_through
+candidate.replay               = source.replay
 logical(candidate)             = logical(source)
 candidate children             = source-carried or candidate-generation-fresh
 ```
 
-There is no useful same-cut physical rewrite while all three genesis trees are
+There is no useful same-cut physical rewrite while all four genesis trees are
 empty.
 
 Maintenance may compact SSTs, rewrite range boundaries, or move payload bytes.
@@ -627,14 +652,14 @@ Ready. Bootstrap performs:
 discover and validate newest permanent Seal H
 decode H's bounded inline manifest and capacity metadata
 Direct-create claim C = H + 1 carrying H's complete manifest
-load complete admission-resident Ledger/Tally state
+load complete admission-resident Directory/Ledger state
 find and create one permanent first-hole WAL fence for owner C
-strictly replay every coordinate from H.through + 1 through that fence
+strictly replay every coordinate after H.replay through that fence
 perform one mandatory newest-generation refresh
 publish Ready only if the newest generation is still C
 ```
 
-From genesis, replay starts at batch 1 with `NoOwner`.
+From `WalReplayPoint::Genesis`, replay starts at batch 1 without a prior owner.
 
 ### first-hole fence
 
@@ -654,7 +679,7 @@ WAL names use reverse batch ordinals as a placement optimization:
 
 ```text
 listed_tail = ascending LIST MaxKeys=1
-base_through = claimed_seal.through
+base_through = claimed_seal.replay.batch_or_zero
 candidate_tail = max(base_through, listed_tail or none)
 try FENCE at checked(candidate_tail + 1)
 on collision, re-list and retry
@@ -668,7 +693,8 @@ surviving object at a historical FENCE below the Seal cut.
 
 ### strict replay
 
-Replay begins with the claimed Seal's `wal_owner_at_through`:
+Replay begins with the owner recorded by the claimed Seal's replay point, or
+with no prior owner at genesis:
 
 ```text
 FENCE: owner must strictly increase
@@ -704,6 +730,7 @@ The current published view is:
 struct PublishedView {
     identity: ViewIdentity,
     seal: LoadedSeal,
+    directory: ResidentDirectory,
     ledger: ResidentLedger,
     tally: ResidentTally,
     annals: AnnalsReadDirectory,
@@ -717,17 +744,17 @@ and immutable, generation identifies the durable physical version. A same-cut
 maintenance publication changes physical view identity even though its logical
 cut does not change.
 
-Ledger and admission-critical Tally state must be locally queryable before
-Ready. Their representation may use RAM, packed local files, persistent maps,
-or local NVMe after measurement. It is always reconstructed from S3 and never
-becomes authority. Annals remains mostly remote; the view keeps bounded range,
-table, filter, sparse-index, and overlay metadata sufficient to plan reads.
+Directory and Ledger state must be locally queryable before Ready. Their
+representation may use RAM, packed local files, persistent maps, or local NVMe
+after measurement. It is always reconstructed from S3 and never becomes
+authority. The exact Tally and Annals resident/read planning shapes remain
+deferred to their RFCs.
 
 The global post-W overlay is keyed by complete logical keys. It carries no
 physical range identity:
 
 ```text
-PublishedView = Seal trees + global WAL overlay above Seal.through
+PublishedView = Seal trees + global WAL overlay after Seal.replay
 ```
 
 That one choice lets same-cut compaction and range changes install without
@@ -740,7 +767,7 @@ retain only a small watch/version token while sleeping.
 
 ## one range-lsm mechanism
 
-All three projections use the same durable structure:
+All four projections use the same durable structure:
 
 ```rust
 struct TreeVersion {
@@ -759,15 +786,15 @@ struct SortedRun {
 
 struct TableRef {
     object: TableObjectId,
-    footer: AuthenticatedFooterRef,
+    object_bytes: NonZeroU64,
 }
 ```
 
-The comparator is fixed by `(SealFormat, store)` and is not repeated inside
-each `TreeVersion`. Key bounds, entry counts, object bytes, filter metadata,
-and block locations live in the authenticated SST footer and are not repeated
-in the Seal. A direct claimant loads and retains those bounded footer values
-before becoming Ready.
+The comparator is fixed by the store and is not repeated inside each
+`TreeVersion`. The first materialized slice reads complete bounded Directory
+and Ledger SST objects into resident state. Indexes, filters, block locations,
+and footer references remain deferred until a measured remote-read workload
+requires them.
 
 The complete inline Seal manifest obeys:
 
@@ -787,40 +814,40 @@ machine.
 
 ### sst format
 
-An SST contains:
+Directory and Ledger each use one concrete checked rkyv root containing the
+partition, fresh table identity, and complete ordered row collection. The
+concrete root supplies the store kind rather than archiving it twice:
 
-- canonical ordered values and tombstones;
-- independently checksummed bounded data blocks;
-- min/max keys and entry counts;
-- a sparse block index;
-- a store-specific whole-key or stream-prefix filter;
-- authenticated physical counts and byte bounds; and
-- one footer range authenticated by the `TableRef`.
+```text
+DirectorySstArchive -> [(DirectoryKey, DirectoryEntry)]
+LedgerSstArchive    -> [(StreamUid, LedgerCell)]
+```
 
-The checksummed Seal authenticates each `TableRef`, including its footer range.
-The footer authenticates every block, index, filter, and byte range used
-afterward. No range request is constructed from unauthenticated remote
-offsets.
+Their typed `TableKey` and decoder choose the expected root, so there is no
+shared container tag, header, row codec, footer, nested `StreamRecord` frame,
+or standalone `StreamRecord` codec.
 
-Ledger, Tally, and Annals share the container and merge machinery but use
-different row codecs, filters, block targets, run limits, and scheduling
-weights.
+Decode checks the complete object bound before archive access. It then makes a
+preflight pass over the checked archive to validate identity, non-emptiness,
+strict ordering, row semantics, and decoded resource bounds before reserving
+the owned result. A second pass reconstructs keys and values through their
+domain constructors. Tally and Annals remain canonically empty until their own
+RFCs define rows and access paths.
 
 
 ### point and range reads
 
-A point lookup binary-searches the range directory and then probes runs newest
-to oldest. The first value or tombstone wins. Filters avoid irrelevant GETs.
-
-A range scan walks adjacent ranges and merges their run iterators. This
-preserves natural path-prefix scans in Ledger and stream-offset scans in
-Annals without a fixed fanout across hash lanes.
+The current Directory and Ledger slice reads complete bounded SSTs during
+bootstrap and serves point and range operations from resident state. Remote
+point-read filters, indexes, and block addressing remain deferred until a
+measured workload requires them.
 
 ### flush
 
 For a checkpoint prefix `(P, W]`:
 
-- Ledger and Tally retain the final absolute value for each changed key;
+- Directory, Ledger, and Tally retain the final absolute value for each
+  changed key;
 - Annals retains ordered extents and exact point tombstones;
 - values are grouped using the candidate Seal's range boundaries; and
 - each touched range receives one newest run, split into whole bounded SSTs.
@@ -835,7 +862,7 @@ The newer input wins and the output replaces the interval at the same
 precedence position.
 
 A point tombstone may disappear only when the selected interval reaches the
-oldest run. Otherwise an older value could reappear. Ledger's permanent path
+oldest run. Otherwise an older value could reappear. Directory's permanent path
 tombstones remain logical values regardless of physical coverage. Tally and
 Annals deletion tombstones may be removed only after complete older coverage
 and their logical lifecycle rules permit absence.
@@ -875,13 +902,13 @@ not-yet-materialized RUN is dead.
 A decoded RUN at batch B may be deleted only when:
 
 ```text
-B <= H.through
+B <= H.replay.batch
 and every logical effect is represented by the complete Seal
 and every retained payload byte formerly sourced from B is in a reachable pack
 and exact-validator conditional deletion succeeds
 ```
 
-A RUN above `H.through` is never collectible. A FENCE is never deletable
+A RUN after `H.replay` is never collectible. A FENCE is never deletable
 or replaceable by collector policy. The typed delete constructor accepts a
 decoded eligible RUN and its exact GET validator; it cannot accept a FENCE or
 raw key. `404`, `409`, or `412` discards the proof and replans without an
@@ -890,7 +917,7 @@ unconditional fallback.
 
 ### sst
 
-Exact SST gc logic is deffered.  
+Exact SST gc logic is deffered.
 
 
 ## forks, retention, and lifecycle
@@ -929,17 +956,15 @@ inside adapters.
 Bootstrap performs the bounded Seal decode and structural capacity checks
 before competing for ownership. The same GET supplies the complete manifest;
 there is no second metadata fetch. Only a direct claimant pays to load and
-validate the resident Ledger/Tally bases, authenticated child footers, and
-Annals startup metadata. This avoids several contenders performing full cold
-bootstrap work.
+validate the complete resident Directory and Ledger SST archives. This avoids
+several contenders performing full cold bootstrap work.
 
 The partition does not accept traffic until:
 
 - the newest self-contained Seal is decoded;
-- its range structure, TableRefs, table footers, and bulk source bounds are
-  valid;
-- admission-resident Ledger/Tally state is built and cross-checked;
-- Annals planning metadata is available within its bound;
+- its range structure, TableRefs, exact object lengths, and bulk source bounds
+  are valid;
+- admission-resident Directory/Ledger state is built and cross-checked;
 - the claim was directly authored;
 - the first-hole FENCE was established;
 - strict replay reached that fence with the claimed owner;
@@ -1086,7 +1111,7 @@ The complete recovery equation is:
 ```text
 CurrentState
     = LogicalState(newest Seal's inline tree versions)
-      folded with every valid WAL RUN after Seal.through
+      folded with every valid WAL RUN after Seal.replay
       in coordinate and within-RUN order
 ```
 
@@ -1117,4 +1142,4 @@ the packs carry bytes
 GC removes only what the current composition can no longer name
 ```
 
-This design provides us with, a single round trip append, exact failover, atomic protocol facts, bounded incrimental compaction, ordered stream reads, payload seperation all while using only s3 as source of both durability and authority. 
+This design provides us with, a single round trip append, exact failover, atomic protocol facts, bounded incrimental compaction, ordered stream reads, payload seperation all while using only s3 as source of both durability and authority.

@@ -3,15 +3,18 @@
 use std::fmt;
 use std::str::FromStr;
 
-use serde::Serialize;
+use crate::archive::DecodeError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, rkyv::Archive, rkyv::Serialize,
+)]
 pub struct PartitionId([u8; 16]);
 
-impl PartitionId {
-    #[must_use]
-    pub(crate) const fn as_bytes(&self) -> &[u8; 16] {
-        &self.0
+impl TryFrom<&ArchivedPartitionId> for PartitionId {
+    type Error = DecodeError;
+
+    fn try_from(partition: &ArchivedPartitionId) -> Result<Self, Self::Error> {
+        Self::try_from(partition.0).map_err(|_domain_error| DecodeError::InvalidBody)
     }
 }
 
@@ -73,15 +76,6 @@ impl fmt::Display for PartitionId {
             write!(formatter, "{octet:02x}")?;
         }
         Ok(())
-    }
-}
-
-impl Serialize for PartitionId {
-    fn serialize<Serializer: serde::Serializer>(
-        &self,
-        serializer: Serializer,
-    ) -> Result<Serializer::Ok, Serializer::Error> {
-        self.0.serialize(serializer)
     }
 }
 

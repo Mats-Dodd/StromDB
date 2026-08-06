@@ -3,7 +3,7 @@
 //! This crate is the capability layer beneath the typed Seal, WAL, and
 //! content stores (`docs/architecture.md`, "storage capability contract").
 //! It moves opaque bounded bytes and normalizes conditional results into
-//! evidence; it never decodes envelopes, spells durable keys, or retries an
+//! evidence; it never interprets object bodies, spells durable keys, or retries an
 //! authority-bearing create.
 
 mod adapter;

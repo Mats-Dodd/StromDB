@@ -5,19 +5,16 @@ mod codec;
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 
-use serde::Serialize;
-
 use crate::bounds::{RUN_TABLES_MAX, SST_OBJECT_BYTES_MAX, TREE_RANGES_MAX_V2, TREE_RUNS_MAX};
 use crate::{CoordinateExhausted, OwnerToken, PartitionId, ZeroCoordinate};
 
 pub use codec::{decode_seal, encode_seal};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
 pub struct Seal {
     partition: PartitionId,
     generation: SealGeneration,
     replay: WalReplayPoint,
-    format: SealFormat,
     directory: TreeVersion,
     ledger: TreeVersion,
     tally: TreeVersion,
@@ -29,15 +26,10 @@ impl Seal {
     ///
     /// Returns [`SealError`] when a tree is not a canonical V2 manifest or a
     /// selected table contradicts the Seal generation or owning store.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the four peer trees are explicit fields in one atomic Seal"
-    )]
     pub fn new(
         partition: PartitionId,
         generation: SealGeneration,
         replay: WalReplayPoint,
-        format: SealFormat,
         directory: TreeVersion,
         ledger: TreeVersion,
         tally: TreeVersion,
@@ -62,7 +54,6 @@ impl Seal {
             partition,
             generation,
             replay,
-            format,
             directory,
             ledger,
             tally,
@@ -78,11 +69,6 @@ impl Seal {
     #[must_use]
     pub const fn replay(&self) -> WalReplayPoint {
         self.replay
-    }
-
-    #[must_use]
-    pub const fn format(&self) -> SealFormat {
-        self.format
     }
 
     #[must_use]
@@ -128,7 +114,7 @@ fn validate_tree(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SealIdentity {
     partition: PartitionId,
     generation: SealGeneration,
@@ -154,7 +140,9 @@ impl SealIdentity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, rkyv::Archive, rkyv::Serialize,
+)]
 pub struct SealGeneration(NonZeroU64);
 
 impl SealGeneration {
@@ -194,16 +182,13 @@ impl TryFrom<u64> for SealGeneration {
     }
 }
 
-impl Serialize for SealGeneration {
-    fn serialize<Serializer: serde::Serializer>(
-        &self,
-        serializer: Serializer,
-    ) -> Result<Serializer::Ok, Serializer::Error> {
-        serializer.serialize_u64(self.get())
+impl From<&ArchivedSealGeneration> for SealGeneration {
+    fn from(generation: &ArchivedSealGeneration) -> Self {
+        Self(generation.0.to_native())
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
 pub enum WalReplayPoint {
     Genesis,
     Through {
@@ -230,12 +215,7 @@ impl WalReplayPoint {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SealFormat {
-    V2,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
 pub struct TreeVersion {
     ranges: Vec<RangeVersion>,
 }
@@ -280,7 +260,7 @@ impl TreeVersion {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
 pub struct RangeVersion {
     start: KeyBound,
     end: KeyBound,
@@ -321,7 +301,7 @@ impl RangeVersion {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
 pub enum KeyBound {
     Minimum,
     Key(Box<[u8]>),
@@ -335,7 +315,7 @@ impl KeyBound {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
 pub struct SortedRun {
     tables: Vec<TableRef>,
 }
@@ -360,7 +340,7 @@ impl SortedRun {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
 pub struct TableRef {
     object: TableObjectId,
     object_bytes: NonZeroU64,
@@ -391,7 +371,9 @@ impl TableRef {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, rkyv::Archive, rkyv::Serialize,
+)]
 pub struct TableObjectId {
     fresh: FreshIdentity,
     store: StoreKind,
@@ -414,7 +396,20 @@ impl TableObjectId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+impl TryFrom<&ArchivedTableObjectId> for TableObjectId {
+    type Error = crate::archive::DecodeError;
+
+    fn try_from(object: &ArchivedTableObjectId) -> Result<Self, Self::Error> {
+        Ok(Self::new(
+            FreshIdentity::try_from(&object.fresh)?,
+            StoreKind::from(&object.store),
+        ))
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, rkyv::Archive, rkyv::Serialize,
+)]
 pub struct FreshIdentity {
     birth_generation: SealGeneration,
     attempt: AttemptId,
@@ -456,7 +451,22 @@ impl FreshIdentity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+impl TryFrom<&ArchivedFreshIdentity> for FreshIdentity {
+    type Error = crate::archive::DecodeError;
+
+    fn try_from(fresh: &ArchivedFreshIdentity) -> Result<Self, Self::Error> {
+        Self::new(
+            SealGeneration::from(&fresh.birth_generation),
+            AttemptId::from(&fresh.attempt),
+            fresh.ordinal.to_native(),
+        )
+        .map_err(|_domain_error| crate::archive::DecodeError::InvalidBody)
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, rkyv::Archive, rkyv::Serialize,
+)]
 pub struct AttemptId {
     owner_claim: SealGeneration,
     local_counter: u64,
@@ -482,12 +492,34 @@ impl AttemptId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+impl From<&ArchivedAttemptId> for AttemptId {
+    fn from(attempt: &ArchivedAttemptId) -> Self {
+        Self::new(
+            SealGeneration::from(&attempt.owner_claim),
+            attempt.local_counter.to_native(),
+        )
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, rkyv::Archive, rkyv::Serialize,
+)]
 pub enum StoreKind {
     Directory,
     Ledger,
     Tally,
     Annals,
+}
+
+impl From<&ArchivedStoreKind> for StoreKind {
+    fn from(store: &ArchivedStoreKind) -> Self {
+        match store {
+            ArchivedStoreKind::Directory => Self::Directory,
+            ArchivedStoreKind::Ledger => Self::Ledger,
+            ArchivedStoreKind::Tally => Self::Tally,
+            ArchivedStoreKind::Annals => Self::Annals,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

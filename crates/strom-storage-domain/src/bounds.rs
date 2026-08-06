@@ -1,9 +1,9 @@
 //! Named bounds for storage-domain parsing and encoding.
 
-/// Largest complete Seal frame accepted or produced.
+/// Largest complete Seal archive accepted or produced.
 pub const SEAL_ENCODED_BYTES_MAX: usize = 1024 * 1024;
 
-/// Largest complete WAL frame accepted or produced.
+/// Largest complete WAL archive accepted or produced.
 pub const WAL_ENCODED_BYTES_MAX: usize = 4 * 1024 * 1024;
 
 /// Most operation facts one WAL run may carry.
@@ -23,9 +23,6 @@ pub const SST_OBJECT_BYTES_MAX: u64 = 128 * 1024 * 1024;
 
 /// Largest canonical Directory key.
 pub const DIRECTORY_KEY_BYTES_MAX: usize = 512;
-
-/// Largest frameless stream record accepted or produced.
-pub const STREAM_RECORD_BYTES_MAX: usize = 1024;
 
 /// Most lifetime path occupancies in one V2 partition.
 pub const PARTITION_PATH_OCCUPANCIES_MAX_V2: u64 = 10_000_000;
@@ -54,15 +51,6 @@ pub const LEDGER_DELETE_ROW_LOGICAL_BYTES: u64 = 9;
 const _: () = assert!(
     DIRECTORY_KEY_BYTES_MAX == strom_domain::STREAM_ID_BYTES_MAX,
     "Directory keys and protocol stream identifiers share one path bound"
-);
-
-const _: () = assert!(
-    DIRECTORY_KEY_BYTES_MAX == 512
-        && STREAM_RECORD_BYTES_MAX == 1_024
-        && DIRECTORY_ROW_LOGICAL_BYTES_MAX == 13 + 512
-        && LEDGER_VALUE_ROW_LOGICAL_BYTES_MAX == 11 + 1_024
-        && LEDGER_DELETE_ROW_LOGICAL_BYTES == 9,
-    "the V1 worst-row account must track every configured field bound"
 );
 
 const _: () = assert!(

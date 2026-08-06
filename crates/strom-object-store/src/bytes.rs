@@ -54,8 +54,7 @@ impl TryFrom<Vec<u8>> for FrozenBytes {
 /// Why a raw body cannot become a durable object candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum FrozenBytesError {
-    /// Every durable object carries an envelope; an empty body is illegal in
-    /// every namespace.
+    /// Every typed durable object has a non-empty body.
     #[error("object body is empty")]
     Empty,
     #[error("object body is {bytes_actual} bytes; the bound is {PUT_BYTES_MAX}")]

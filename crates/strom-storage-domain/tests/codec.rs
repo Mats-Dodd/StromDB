@@ -1,13 +1,12 @@
 use std::num::NonZeroU64;
 
-use strom_domain::{ExpiryPolicy, StreamContentType, StreamId, StreamLifecycle, StreamTtl};
+use strom_domain::{ExpiryPolicy, StreamContentType, StreamId};
 use strom_storage_domain::{
     AttemptId, BatchId, BoundedNonEmptyVec, DecodeError, DirectoryKey, FreshIdentity,
-    OperationFact, OwnerToken, PartitionId, RangeVersion, SEAL_ENCODED_BYTES_MAX,
-    STREAM_RECORD_BYTES_MAX, Seal, SealFormat, SealGeneration, SealIdentity, SortedRun, StoreKind,
-    StreamRecord, StreamUid, TableObjectId, TableRef, TreeVersion, WAL_ENCODED_BYTES_MAX, WalFence,
-    WalIdentity, WalObject, WalReplayPoint, WalRun, decode_seal, decode_stream_record, decode_wal,
-    encode_seal, encode_stream_record, encode_wal,
+    OperationFact, OwnerToken, PartitionId, RangeVersion, SEAL_ENCODED_BYTES_MAX, Seal,
+    SealGeneration, SealIdentity, SortedRun, StoreKind, StreamUid, TableObjectId, TableRef,
+    TreeVersion, WAL_ENCODED_BYTES_MAX, WalFence, WalIdentity, WalObject, WalReplayPoint, WalRun,
+    decode_seal, decode_wal, encode_seal, encode_wal,
 };
 
 fn partition() -> Result<PartitionId, strom_storage_domain::PartitionIdError> {
@@ -28,7 +27,6 @@ fn genesis_seal() -> Result<Seal, Box<dyn std::error::Error>> {
         partition()?,
         SealGeneration::genesis(),
         WalReplayPoint::Genesis,
-        SealFormat::V2,
         TreeVersion::empty(),
         TreeVersion::empty(),
         TreeVersion::empty(),
@@ -36,51 +34,36 @@ fn genesis_seal() -> Result<Seal, Box<dyn std::error::Error>> {
     )?)
 }
 
-fn replay_seal() -> Result<Seal, Box<dyn std::error::Error>> {
-    let owner = OwnerToken::from(SealGeneration::try_from(2)?);
-    Ok(Seal::new(
-        partition()?,
-        SealGeneration::try_from(3)?,
-        WalReplayPoint::Through {
-            batch: BatchId::try_from(9)?,
-            owner,
-        },
-        SealFormat::V2,
-        TreeVersion::empty(),
-        TreeVersion::empty(),
-        TreeVersion::empty(),
-        TreeVersion::empty(),
-    )?)
+fn tree_with_table(
+    generation: SealGeneration,
+    store: StoreKind,
+    ordinal: u32,
+) -> Result<TreeVersion, Box<dyn std::error::Error>> {
+    let fresh = FreshIdentity::new(
+        generation,
+        AttemptId::new(SealGeneration::genesis(), 4),
+        ordinal,
+    )?;
+    let table = TableRef::new(
+        TableObjectId::new(fresh, store),
+        NonZeroU64::new(123).ok_or("table length is nonzero")?,
+    )?;
+    Ok(TreeVersion::try_from_ranges(vec![RangeVersion::full(
+        vec![SortedRun::try_from_tables(vec![table])?],
+    )?])?)
 }
 
-fn non_empty_seal() -> Result<Seal, Box<dyn std::error::Error>> {
-    let owner = SealGeneration::genesis();
-    let birth = SealGeneration::try_from(2)?;
-    let generation = SealGeneration::try_from(3)?;
-    let attempt = AttemptId::new(owner, 4);
-    let directory_table = TableRef::new(
-        TableObjectId::new(FreshIdentity::new(birth, attempt, 0)?, StoreKind::Directory),
-        NonZeroU64::new(100).ok_or("table length is nonzero")?,
-    )?;
-    let ledger_table = TableRef::new(
-        TableObjectId::new(FreshIdentity::new(birth, attempt, 1)?, StoreKind::Ledger),
-        NonZeroU64::new(200).ok_or("table length is nonzero")?,
-    )?;
-    let directory =
-        TreeVersion::try_from_ranges(vec![RangeVersion::full(vec![SortedRun::try_from_tables(
-            vec![directory_table],
-        )?])?])?;
-    let ledger =
-        TreeVersion::try_from_ranges(vec![RangeVersion::full(vec![SortedRun::try_from_tables(
-            vec![ledger_table],
-        )?])?])?;
+fn representative_seal() -> Result<Seal, Box<dyn std::error::Error>> {
+    let generation = SealGeneration::try_from(2)?;
     Ok(Seal::new(
         partition()?,
         generation,
-        WalReplayPoint::Genesis,
-        SealFormat::V2,
-        directory,
-        ledger,
+        WalReplayPoint::Through {
+            batch: BatchId::try_from(9)?,
+            owner: OwnerToken::from(SealGeneration::genesis()),
+        },
+        tree_with_table(generation, StoreKind::Directory, 0)?,
+        tree_with_table(generation, StoreKind::Ledger, 1)?,
         TreeVersion::empty(),
         TreeVersion::empty(),
     )?)
@@ -109,267 +92,197 @@ fn fence() -> Result<WalObject, Box<dyn std::error::Error>> {
     )))
 }
 
-fn live_record(expiry: ExpiryPolicy) -> Result<StreamRecord, Box<dyn std::error::Error>> {
-    Ok(StreamRecord::new(
-        "application/json; charset=utf-8".parse()?,
-        expiry,
-        StreamLifecycle::Closed,
-        BatchId::try_from(9)?,
-    ))
-}
-
 #[test]
-fn seal_v2_golden_vectors_anchor_empty_and_non_empty_manifests()
--> Result<(), Box<dyn std::error::Error>> {
-    let cases: [(Seal, &[u8]); 3] = [
-        (
-            genesis_seal()?,
-            &[
-                83, 84, 82, 77, 1, 2, 0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204,
-                221, 238, 255, 1, 0, 2, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 77, 227,
-                224, 170,
-            ],
-        ),
-        (
-            replay_seal()?,
-            &[
-                83, 84, 82, 77, 1, 2, 0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204,
-                221, 238, 255, 3, 1, 9, 2, 2, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 1, 1, 3, 0, 94,
-                194, 117, 144,
-            ],
-        ),
-        (
-            non_empty_seal()?,
-            &[
-                83, 84, 82, 77, 1, 2, 0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204,
-                221, 238, 255, 3, 0, 2, 1, 1, 3, 1, 1, 2, 1, 4, 0, 1, 100, 1, 1, 3, 1, 1, 2, 1, 4,
-                1, 2, 200, 1, 1, 1, 3, 0, 1, 1, 3, 0, 192, 145, 197, 15,
-            ],
-        ),
-    ];
-    for (seal, expected) in cases {
-        let encoded = encode_seal(&seal)?;
-        assert_eq!(encoded, expected, "Seal bytes are a durable format anchor");
-        assert_eq!(
-            decode_seal(&seal.identity(), expected)?,
-            seal,
-            "golden Seal bytes must decode independently of the encoder"
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn wal_v1_golden_vectors_prove_directory_key_rename_stability()
--> Result<(), Box<dyn std::error::Error>> {
-    let cases: [(WalObject, &[u8]); 2] = [
-        (
-            one_fact_run()?,
-            &[
-                83, 84, 82, 77, 2, 1, 0, 0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204,
-                221, 238, 255, 9, 2, 1, 0, 10, 101, 118, 101, 110, 116, 115, 47, 97, 98, 99, 7, 31,
-                97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 106, 115, 111, 110, 59, 32,
-                99, 104, 97, 114, 115, 101, 116, 61, 117, 116, 102, 45, 56, 0, 17, 113, 50, 74,
-            ],
-        ),
-        (
-            fence()?,
-            &[
-                83, 84, 82, 77, 2, 1, 1, 0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204,
-                221, 238, 255, 10, 4, 255, 58, 236, 218,
-            ],
-        ),
-    ];
-    for (object, expected) in cases {
-        let encoded = encode_wal(&object)?;
-        assert_eq!(encoded, expected, "WAL bytes are a durable format anchor");
-        assert_eq!(
-            decode_wal(&object.identity(), expected)?,
-            object,
-            "golden WAL bytes must decode independently of the encoder"
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn stream_record_golden_vectors_anchor_every_expiry() -> Result<(), Box<dyn std::error::Error>> {
-    let ttl = StreamTtl::from(NonZeroU64::new(3600).ok_or("3600 is nonzero")?);
-    let cases: [(StreamRecord, &[u8]); 3] = [
-        (
-            live_record(ExpiryPolicy::None)?,
-            &[
-                31, 97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 106, 115, 111, 110, 59,
-                32, 99, 104, 97, 114, 115, 101, 116, 61, 117, 116, 102, 45, 56, 0, 1, 9,
-            ],
-        ),
-        (
-            live_record(ExpiryPolicy::SlidingTtl(ttl))?,
-            &[
-                31, 97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 106, 115, 111, 110, 59,
-                32, 99, 104, 97, 114, 115, 101, 116, 61, 117, 116, 102, 45, 56, 1, 144, 28, 1, 9,
-            ],
-        ),
-        (
-            live_record(ExpiryPolicy::AbsoluteExpiry(
-                "2030-01-01T00:00:00Z".parse()?,
-            ))?,
-            &[
-                31, 97, 112, 112, 108, 105, 99, 97, 116, 105, 111, 110, 47, 106, 115, 111, 110, 59,
-                32, 99, 104, 97, 114, 115, 101, 116, 61, 117, 116, 102, 45, 56, 2, 128, 128, 168,
-                221, 230, 140, 244, 198, 52, 1, 9,
-            ],
-        ),
-    ];
-    for (record, expected) in cases {
-        let encoded = encode_stream_record(&record)?;
-        assert_eq!(
-            encoded, expected,
-            "StreamRecord bytes are a durable format anchor"
-        );
-        assert_eq!(
-            decode_stream_record(expected)?,
-            record,
-            "golden StreamRecord bytes must decode independently of the encoder"
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn envelope_gates_run_in_the_normative_order() -> Result<(), Box<dyn std::error::Error>> {
+fn seal_archive_fixture_anchors_the_root() -> Result<(), Box<dyn std::error::Error>> {
     let seal = genesis_seal()?;
-    let identity = seal.identity();
-    let valid = encode_seal(&seal)?;
-
-    let oversized = vec![0u8; SEAL_ENCODED_BYTES_MAX.saturating_add(1)];
+    let expected = &[
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 238, 255, 255, 255, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 238, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 238, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 238, 255, 255, 255, 0, 0, 0, 0, 0, 17, 34, 51, 68, 85,
+        102, 119, 136, 153, 170, 187, 204, 221, 238, 255, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 111, 255, 255, 255, 1, 0, 0, 0, 129, 255, 255, 255, 1, 0,
+        0, 0, 147, 255, 255, 255, 1, 0, 0, 0, 165, 255, 255, 255, 1, 0, 0, 0,
+    ];
+    let encoded = encode_seal(&seal)?;
+    let first_difference =
+        encoded
+            .iter()
+            .zip(expected)
+            .enumerate()
+            .find_map(|(index, (actual, expected))| {
+                (actual != expected).then_some((index, *actual, *expected))
+            });
     assert_eq!(
-        decode_seal(&identity, &oversized),
+        encoded.len(),
+        expected.len(),
+        "Seal fixture length changed; first difference: {first_difference:?}"
+    );
+    assert_eq!(
+        first_difference, None,
+        "Seal bytes are a durable format anchor"
+    );
+    assert_eq!(
+        decode_seal(&seal.identity(), expected)?,
+        seal,
+        "fixture bytes decode independently of the encoder"
+    );
+    Ok(())
+}
+
+#[test]
+fn wal_archive_fixture_anchors_the_root() -> Result<(), Box<dyn std::error::Error>> {
+    let object = one_fact_run()?;
+    let expected = &[
+        101, 118, 101, 110, 116, 115, 47, 97, 98, 99, 97, 112, 112, 108, 105, 99, 97, 116, 105,
+        111, 110, 47, 106, 115, 111, 110, 59, 32, 99, 104, 97, 114, 115, 101, 116, 61, 117, 116,
+        102, 45, 56, 0, 214, 255, 255, 255, 10, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 159, 0, 0, 0, 208,
+        255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 17, 34, 51, 68, 85,
+        102, 119, 136, 153, 170, 187, 204, 221, 238, 255, 9, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0,
+        0, 0, 181, 255, 255, 255, 1, 0, 0, 0,
+    ];
+    let encoded = encode_wal(&object)?;
+    assert_eq!(encoded.len(), expected.len(), "WAL fixture length changed");
+    assert_eq!(encoded, expected, "WAL bytes are a durable format anchor");
+    assert_eq!(
+        decode_wal(&object.identity(), expected)?,
+        object,
+        "fixture bytes decode independently of the encoder"
+    );
+    Ok(())
+}
+
+#[test]
+fn nonempty_seal_manifest_roundtrips() -> Result<(), Box<dyn std::error::Error>> {
+    let seal = representative_seal()?;
+    assert_eq!(decode_seal(&seal.identity(), &encode_seal(&seal)?)?, seal);
+    Ok(())
+}
+
+#[test]
+fn every_wal_fact_variant_roundtrips() -> Result<(), Box<dyn std::error::Error>> {
+    let path = directory_key("events/abc")?;
+    let uid = uid(7)?;
+    let object = WalObject::Run(WalRun::new(
+        partition()?,
+        BatchId::try_from(9)?,
+        OwnerToken::from(SealGeneration::try_from(2)?),
+        BoundedNonEmptyVec::try_from(vec![
+            OperationFact::StreamCreated {
+                path: path.clone(),
+                uid,
+                content_type: "application/json".parse()?,
+                expiry: ExpiryPolicy::None,
+            },
+            OperationFact::StreamClosed {
+                path: path.clone(),
+                uid,
+            },
+            OperationFact::StreamDeleted { path, uid },
+        ])?,
+    ));
+    assert_eq!(
+        decode_wal(&object.identity(), &encode_wal(&object)?)?,
+        object
+    );
+    Ok(())
+}
+
+#[test]
+fn wal_checked_archive_enforces_structure_alignment_bound_and_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let object = fence()?;
+    let encoded = encode_wal(&object)?;
+
+    let mut misaligned = Vec::with_capacity(encoded.len().saturating_add(1));
+    misaligned.push(0);
+    misaligned.extend_from_slice(&encoded);
+    let misaligned = misaligned
+        .get(1..)
+        .ok_or("the prefixed WAL archive contains its payload")?;
+    assert_eq!(
+        decode_wal(&object.identity(), misaligned),
+        Ok(object.clone()),
+        "object-store slices do not promise archive alignment"
+    );
+
+    let truncated = encoded
+        .get(..encoded.len().saturating_sub(1))
+        .ok_or("a WAL archive is non-empty")?;
+    assert_eq!(
+        decode_wal(&object.identity(), truncated),
+        Err(DecodeError::MalformedArchive),
+        "checked access rejects a truncated archive"
+    );
+
+    let wrong_identity = WalIdentity::new(partition()?, BatchId::try_from(11)?);
+    assert_eq!(
+        decode_wal(&wrong_identity, &encoded),
+        Err(DecodeError::IdentityMismatch),
+        "the durable location and archived identity are one decoder input"
+    );
+
+    let oversized = vec![0; WAL_ENCODED_BYTES_MAX.saturating_add(1)];
+    assert_eq!(
+        decode_wal(&object.identity(), &oversized),
         Err(DecodeError::EncodedBytesOverMax {
-            bytes_max: SEAL_ENCODED_BYTES_MAX,
+            bytes_max: WAL_ENCODED_BYTES_MAX,
             bytes_actual: oversized.len(),
         }),
-        "length bounds all work before frame parsing"
-    );
-    assert_eq!(
-        decode_seal(&identity, b"STRM"),
-        Err(DecodeError::FrameTooShort {
-            bytes_min: 10,
-            bytes_actual: 4,
-        }),
-        "a partial header fails the length gate"
-    );
-
-    let mut bad_magic = valid.clone();
-    *bad_magic.first_mut().ok_or("frame has magic")? = b'X';
-    assert!(
-        matches!(
-            decode_seal(&identity, &bad_magic),
-            Err(DecodeError::MagicMismatch { .. })
-        ),
-        "magic is observed before the now-invalid checksum"
-    );
-
-    let mut bad_kind_and_checksum = valid.clone();
-    *bad_kind_and_checksum.get_mut(4).ok_or("frame has kind")? = 99;
-    assert!(
-        matches!(
-            decode_seal(&identity, &bad_kind_and_checksum),
-            Err(DecodeError::ChecksumMismatch { .. })
-        ),
-        "checksum is observed before an unknown kind"
-    );
-
-    let bad_kind = rewrite_frame_byte(&valid, 4, 99)?;
-    assert_eq!(
-        decode_seal(&identity, &bad_kind),
-        Err(DecodeError::ObjectKindMismatch {
-            expected: 1,
-            observed: 99,
-        }),
-        "unknown kinds and real objects in the wrong location share one gate"
-    );
-    let reserved_version = rewrite_frame_byte(&valid, 5, 0)?;
-    assert_eq!(
-        decode_seal(&identity, &reserved_version),
-        Err(DecodeError::UnsupportedVersion { observed: 0 }),
-        "reserved version zero reaches the upgrade-path gate"
+        "the complete byte bound runs before structural access"
     );
     Ok(())
 }
 
 #[test]
-fn decoders_reject_trailing_bytes_and_location_identity_mismatches()
+fn seal_checked_archive_enforces_structure_alignment_bound_and_identity()
 -> Result<(), Box<dyn std::error::Error>> {
     let seal = genesis_seal()?;
     let encoded = encode_seal(&seal)?;
-    let trailing = insert_body_byte(&encoded, 0)?;
+
+    let mut misaligned = Vec::with_capacity(encoded.len().saturating_add(1));
+    misaligned.push(0);
+    misaligned.extend_from_slice(&encoded);
+    let misaligned = misaligned
+        .get(1..)
+        .ok_or("the prefixed Seal archive contains its payload")?;
     assert_eq!(
-        decode_seal(&seal.identity(), &trailing),
-        Err(DecodeError::TrailingBytes { bytes_actual: 1 }),
-        "a checksummed but noncanonical body cannot drift silently"
+        decode_seal(&seal.identity(), misaligned),
+        Ok(seal.clone()),
+        "object-store slices do not promise archive alignment"
+    );
+
+    let truncated = encoded
+        .get(..encoded.len().saturating_sub(1))
+        .ok_or("a Seal archive is non-empty")?;
+    assert_eq!(
+        decode_seal(&seal.identity(), truncated),
+        Err(DecodeError::MalformedArchive),
+        "checked access rejects a truncated archive"
     );
 
     let wrong_identity = SealIdentity::new(partition()?, SealGeneration::try_from(2)?);
     assert_eq!(
-        decode_seal(&wrong_identity, &trailing),
-        Err(DecodeError::TrailingBytes { bytes_actual: 1 }),
-        "body canonicality is established before the location identity cross-check"
-    );
-    assert_eq!(
         decode_seal(&wrong_identity, &encoded),
         Err(DecodeError::IdentityMismatch),
-        "the durable location and body identity are inseparable decoder inputs"
+        "the durable location and archived identity are one decoder input"
     );
 
-    let fence = fence()?;
-    let wrong_wal_identity = WalIdentity::new(partition()?, BatchId::try_from(11)?);
+    let oversized = vec![0; SEAL_ENCODED_BYTES_MAX.saturating_add(1)];
     assert_eq!(
-        decode_wal(&wrong_wal_identity, &encode_wal(&fence)?),
-        Err(DecodeError::IdentityMismatch),
-        "WAL coordinates receive the same key/body cross-check"
-    );
-
-    let record = live_record(ExpiryPolicy::None)?;
-    let mut row = encode_stream_record(&record)?;
-    row.push(0);
-    assert_eq!(
-        decode_stream_record(&row),
-        Err(DecodeError::TrailingBytes { bytes_actual: 1 }),
-        "frameless rows are canonical postcard values too"
+        decode_seal(&seal.identity(), &oversized),
+        Err(DecodeError::EncodedBytesOverMax {
+            bytes_max: SEAL_ENCODED_BYTES_MAX,
+            bytes_actual: oversized.len(),
+        }),
+        "the complete byte bound runs before structural access"
     );
     Ok(())
 }
 
 #[test]
-fn every_decoder_rejects_over_bound_input_before_parsing() -> Result<(), Box<dyn std::error::Error>>
+fn canonical_content_type_boundary_roundtrips_through_wal() -> Result<(), Box<dyn std::error::Error>>
 {
-    let seal_identity = genesis_seal()?.identity();
-    let wal_identity = WalIdentity::new(partition()?, BatchId::try_from(1)?);
-    assert!(matches!(
-        decode_seal(
-            &seal_identity,
-            &vec![0; SEAL_ENCODED_BYTES_MAX.saturating_add(1)]
-        ),
-        Err(DecodeError::EncodedBytesOverMax { .. })
-    ));
-    assert!(matches!(
-        decode_wal(
-            &wal_identity,
-            &vec![0; WAL_ENCODED_BYTES_MAX.saturating_add(1)]
-        ),
-        Err(DecodeError::EncodedBytesOverMax { .. })
-    ));
-    assert!(matches!(
-        decode_stream_record(&vec![0; STREAM_RECORD_BYTES_MAX.saturating_add(1)]),
-        Err(DecodeError::EncodedBytesOverMax { .. })
-    ));
-    Ok(())
-}
-
-#[test]
-fn canonical_content_type_boundary_roundtrips_through_storage()
--> Result<(), Box<dyn std::error::Error>> {
     let subtype = "b".repeat(243);
     let content_type: StreamContentType = format!("a/{subtype};charset=x").parse()?;
     assert_eq!(
@@ -377,53 +290,53 @@ fn canonical_content_type_boundary_roundtrips_through_storage()
         strom_domain::CONTENT_TYPE_BYTES_MAX,
         "the accepted boundary value has an in-bound canonical spelling"
     );
-    let record = StreamRecord::new(
-        content_type,
-        ExpiryPolicy::None,
-        StreamLifecycle::Open,
+    let object = WalObject::Run(WalRun::new(
+        partition()?,
         BatchId::try_from(1)?,
-    );
-    let encoded = encode_stream_record(&record)?;
+        OwnerToken::from(SealGeneration::genesis()),
+        BoundedNonEmptyVec::try_from(vec![OperationFact::StreamCreated {
+            path: directory_key("events/abc")?,
+            uid: uid(1)?,
+            content_type,
+            expiry: ExpiryPolicy::None,
+        }])?,
+    ));
+    let encoded = encode_wal(&object)?;
     assert_eq!(
-        decode_stream_record(&encoded)?,
-        record,
-        "every accepted content type must remain parseable after durable canonicalization"
+        decode_wal(&object.identity(), &encoded)?,
+        object,
+        "every accepted content type remains parseable after durable canonicalization"
     );
     Ok(())
 }
 
-#[expect(
-    clippy::big_endian_bytes,
-    reason = "RFC 0002 fixes the trailing CRC-32C spelling as big-endian"
-)]
-fn rewrite_frame_byte(
-    frame: &[u8],
-    offset: usize,
-    value: u8,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let covered_bytes = frame.len().checked_sub(4).ok_or("frame has checksum")?;
-    let mut rewritten = frame
-        .get(..covered_bytes)
-        .ok_or("frame has coverage")?
-        .to_vec();
-    *rewritten.get_mut(offset).ok_or("offset lies in frame")? = value;
-    let checksum = crc32c::crc32c(&rewritten);
-    rewritten.extend_from_slice(&checksum.to_be_bytes());
-    Ok(rewritten)
+#[test]
+fn durable_content_types_must_use_the_canonical_spelling() -> Result<(), Box<dyn std::error::Error>>
+{
+    let object = one_fact_run()?;
+    let mut encoded = encode_wal(&object)?;
+    let content_type = encoded
+        .windows(b"application/json".len())
+        .position(|window| window == b"application/json")
+        .ok_or("the archived content type exists")?;
+    *encoded
+        .get_mut(content_type)
+        .ok_or("the first content-type byte exists")? = b'A';
+    assert_eq!(
+        decode_wal(&object.identity(), &encoded),
+        Err(DecodeError::InvalidBody)
+    );
+    Ok(())
 }
 
-#[expect(
-    clippy::big_endian_bytes,
-    reason = "RFC 0002 fixes the trailing CRC-32C spelling as big-endian"
-)]
-fn insert_body_byte(frame: &[u8], value: u8) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let covered_bytes = frame.len().checked_sub(4).ok_or("frame has checksum")?;
-    let mut rewritten = frame
-        .get(..covered_bytes)
-        .ok_or("frame has coverage")?
-        .to_vec();
-    rewritten.push(value);
-    let checksum = crc32c::crc32c(&rewritten);
-    rewritten.extend_from_slice(&checksum.to_be_bytes());
-    Ok(rewritten)
+#[test]
+fn unreachable_leading_bytes_are_tolerated_but_never_emitted()
+-> Result<(), Box<dyn std::error::Error>> {
+    let object = fence()?;
+    let encoded = encode_wal(&object)?;
+    let mut prefixed = vec![0xaa, 0xbb, 0xcc];
+    prefixed.extend_from_slice(&encoded);
+    assert_eq!(decode_wal(&object.identity(), &prefixed)?, object);
+    assert_ne!(encode_wal(&object)?, prefixed);
+    Ok(())
 }

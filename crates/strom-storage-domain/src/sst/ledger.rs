@@ -1,101 +1,163 @@
-//! Sequential Ledger SST rows.
+//! Ledger SST archive root.
+
+use rkyv::rancor::Failure;
 
 use super::{
-    Cursor, RowCodec, RowField, SstDecodeError, SstEncodeError, begin_table,
-    decode_expected_header, finish_table,
+    SST_OBJECT_BYTES_MAX_USIZE, SstDecodeError, SstEncodeError, check_decode_bound,
+    check_encode_rows,
 };
-use crate::bounds::STREAM_RECORD_BYTES_MAX;
-use crate::{LedgerCell, StreamUid, TableKey, decode_stream_record, encode_stream_record};
+use crate::archive;
+use crate::bounds::{
+    LEDGER_DELETE_ROW_LOGICAL_BYTES, LEDGER_VALUE_ROW_LOGICAL_BYTES_MAX,
+    PARTITION_PATH_OCCUPANCIES_MAX_V2, PARTITION_RESIDENT_LOGICAL_BYTES_MAX_V2,
+};
+use crate::{FreshIdentity, LedgerCell, PartitionId, StoreKind, StreamUid, TableKey};
+
+#[derive(Debug, rkyv::Archive, rkyv::Serialize)]
+#[rkyv(bytecheck(bounds(__C: rkyv::validation::ArchiveContext)))]
+// This encoding-only root borrows rows only for one synchronous archive call.
+// ast-grep-ignore: types-own-their-data
+struct LedgerSstArchive<'rows> {
+    partition: PartitionId,
+    fresh: FreshIdentity,
+    #[rkyv(with = rkyv::with::InlineAsBox)]
+    rows: &'rows [(StreamUid, LedgerCell)],
+}
 
 /// Encodes one non-empty, strictly UID-ordered Ledger table.
 ///
 /// # Errors
 ///
-/// Returns [`SstEncodeError`] when the object store is not Ledger, rows are
-/// empty or not strictly ordered, a record cannot be encoded, a count
-/// overflows, or the object is over-bound.
+/// Returns [`SstEncodeError`] when the key names another store, the row set is
+/// empty or unordered, serialization fails, or the complete object is over-bound.
 pub fn encode_ledger_sst(
     expected: &TableKey,
     rows: &[(StreamUid, LedgerCell)],
 ) -> Result<Vec<u8>, SstEncodeError> {
-    if rows.is_empty() {
-        return Err(SstEncodeError::EmptyTable);
+    if expected.object().store() != StoreKind::Ledger {
+        return Err(SstEncodeError::StoreMismatch);
     }
-    let mut bytes = begin_table(expected, RowCodec::LedgerV1)?;
+    check_encode_rows::<(StreamUid, LedgerCell)>(rows.len())?;
     let mut previous = None;
-    let mut row_count = 0usize;
-    for (uid, cell) in rows {
+    for (uid, _cell) in rows {
         if previous.is_some_and(|previous_uid| *uid <= previous_uid) {
             return Err(SstEncodeError::RowsNotStrictlyOrdered);
         }
-        bytes.extend_from_slice(&uid.encoded().to_be_bytes());
-        match cell {
-            LedgerCell::Value(record) => {
-                bytes.push(1);
-                let value = encode_stream_record(record).map_err(SstEncodeError::StreamRecord)?;
-                let value_length = u16::try_from(value.len())
-                    .map_err(|_detail| SstEncodeError::RowLengthOverflow)?;
-                bytes.extend_from_slice(&value_length.to_be_bytes());
-                bytes.extend_from_slice(&value);
-            }
-            LedgerCell::Delete => bytes.push(2),
-        }
         previous = Some(*uid);
-        row_count = row_count
-            .checked_add(1)
-            .ok_or(SstEncodeError::RowCountOverflow)?;
     }
-    finish_table(bytes)
+    if rows.is_empty() {
+        return Err(SstEncodeError::EmptyTable);
+    }
+
+    let root = LedgerSstArchive {
+        partition: expected.partition(),
+        fresh: expected.object().fresh(),
+        rows,
+    };
+    archive::encode(&root, SST_OBJECT_BYTES_MAX_USIZE).map_err(SstEncodeError::from)
 }
 
 /// Decodes a complete Ledger SST into an all-or-nothing owned row set.
 ///
 /// # Errors
 ///
-/// Returns [`SstDecodeError`] when any header or row gate fails. No decoded
-/// prefix is returned when a later row is malformed.
+/// Returns [`SstDecodeError`] when the byte, structure, identity, resource, or
+/// row-domain gates fail.
 pub fn decode_ledger_sst(
     expected: &TableKey,
     bytes: &[u8],
 ) -> Result<Vec<(StreamUid, LedgerCell)>, SstDecodeError> {
-    let body = decode_expected_header(expected, RowCodec::LedgerV1, bytes)?;
-    let mut cursor = Cursor::new();
-    let mut rows = Vec::new();
-    let mut previous = None;
-    let mut row_count = 0usize;
-    while !cursor.is_empty(body) {
-        let uid = cursor.u64(body, RowField::LedgerUid)?;
-        let tag = cursor.u8(body, RowField::LedgerCellTag)?;
-        let uid = StreamUid::try_from(uid).map_err(|_detail| SstDecodeError::ZeroUid)?;
-        if previous.is_some_and(|previous_uid| uid <= previous_uid) {
-            return Err(SstDecodeError::RowsNotStrictlyOrdered);
-        }
-        let cell = match tag {
-            1 => {
-                let value_length = usize::from(cursor.u16(body, RowField::LedgerValueLength)?);
-                if value_length == 0 || value_length > STREAM_RECORD_BYTES_MAX {
-                    return Err(SstDecodeError::LedgerValueLength);
-                }
-                let value = cursor.take(body, value_length, RowField::LedgerValue)?;
-                let record = decode_stream_record(value).map_err(SstDecodeError::StreamRecord)?;
-                let canonical = encode_stream_record(&record)
-                    .map_err(|_detail| SstDecodeError::NonCanonicalStreamRecord)?;
-                if canonical != value {
-                    return Err(SstDecodeError::NonCanonicalStreamRecord);
-                }
-                LedgerCell::Value(record)
-            }
-            2 => LedgerCell::Delete,
-            observed => return Err(SstDecodeError::UnknownLedgerTag { observed }),
-        };
-        rows.push((uid, cell));
-        previous = Some(uid);
-        row_count = row_count
-            .checked_add(1)
-            .ok_or(SstDecodeError::RowCountOverflow)?;
+    check_decode_bound(bytes)?;
+    if expected.object().store() != StoreKind::Ledger {
+        return Err(SstDecodeError::StoreMismatch);
     }
-    if rows.len() != row_count {
-        return Err(SstDecodeError::RowCountOverflow);
+    let root = rkyv::access::<ArchivedLedgerSstArchive<'_>, Failure>(bytes)
+        .map_err(|_archive_error| SstDecodeError::MalformedArchive)?;
+    let partition = PartitionId::try_from(&root.partition)
+        .map_err(|_domain_error| SstDecodeError::InvalidBody)?;
+    let fresh = FreshIdentity::try_from(&root.fresh)
+        .map_err(|_domain_error| SstDecodeError::InvalidBody)?;
+    if partition != expected.partition() || fresh != expected.object().fresh() {
+        return Err(SstDecodeError::IdentityMismatch);
+    }
+    if root.rows.is_empty() {
+        return Err(SstDecodeError::InvalidBody);
+    }
+    if u64::try_from(root.rows.len()).unwrap_or(u64::MAX) > PARTITION_PATH_OCCUPANCIES_MAX_V2 {
+        return Err(SstDecodeError::ResourceBound);
+    }
+
+    let mut previous = None;
+    let mut resident_bytes = 0u64;
+    for row in root.rows.iter() {
+        let uid = StreamUid::from(&row.0);
+        if previous.is_some_and(|previous_uid| uid <= previous_uid) {
+            return Err(SstDecodeError::InvalidBody);
+        }
+        row.1
+            .validated()
+            .map_err(|_domain_error| SstDecodeError::InvalidBody)?;
+        let row_bytes = if row.1.is_value() {
+            LEDGER_VALUE_ROW_LOGICAL_BYTES_MAX
+        } else {
+            LEDGER_DELETE_ROW_LOGICAL_BYTES
+        };
+        resident_bytes = resident_bytes
+            .checked_add(row_bytes)
+            .ok_or(SstDecodeError::ResourceBound)?;
+        if resident_bytes > PARTITION_RESIDENT_LOGICAL_BYTES_MAX_V2 {
+            return Err(SstDecodeError::ResourceBound);
+        }
+        previous = Some(uid);
+    }
+
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(root.rows.len())
+        .map_err(|_allocation_error| SstDecodeError::ResourceBound)?;
+    for row in root.rows.iter() {
+        rows.push((
+            StreamUid::from(&row.0),
+            LedgerCell::try_from(&row.1).map_err(|_domain_error| SstDecodeError::InvalidBody)?,
+        ));
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AttemptId, SealGeneration, TableObjectId};
+
+    #[test]
+    fn decoder_rejects_a_structurally_valid_descending_uid()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let expected = table_key()?;
+        let rows = [
+            (StreamUid::try_from(2)?, LedgerCell::Delete),
+            (StreamUid::try_from(1)?, LedgerCell::Delete),
+        ];
+        let root = LedgerSstArchive {
+            partition: expected.partition(),
+            fresh: expected.object().fresh(),
+            rows: &rows,
+        };
+        let bytes = archive::encode(&root, SST_OBJECT_BYTES_MAX_USIZE)?;
+        assert_eq!(
+            decode_ledger_sst(&expected, &bytes),
+            Err(SstDecodeError::InvalidBody)
+        );
+        Ok(())
+    }
+
+    fn table_key() -> Result<TableKey, Box<dyn std::error::Error>> {
+        let fresh = FreshIdentity::new(
+            SealGeneration::try_from(2)?,
+            AttemptId::new(SealGeneration::genesis(), 4),
+            0,
+        )?;
+        Ok(TableKey::new(
+            "00112233-4455-6677-8899-aabbccddeeff".parse()?,
+            TableObjectId::new(fresh, StoreKind::Ledger),
+        ))
+    }
 }

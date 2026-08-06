@@ -5,15 +5,13 @@ mod fact;
 
 use std::num::NonZeroU64;
 
-use serde::Serialize;
-
 use crate::bounds::WAL_RUN_FACTS_MAX;
 use crate::{CoordinateExhausted, OwnerToken, PartitionId, ZeroCoordinate};
 
 pub use codec::{decode_wal, encode_wal};
 pub use fact::OperationFact;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
 pub enum WalObject {
     Run(WalRun),
     Fence(WalFence),
@@ -29,7 +27,7 @@ impl WalObject {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
 pub struct WalRun {
     partition: PartitionId,
     batch: BatchId,
@@ -69,7 +67,7 @@ impl WalRun {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
 pub struct WalFence {
     partition: PartitionId,
     batch: BatchId,
@@ -97,7 +95,7 @@ impl WalFence {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WalIdentity {
     partition: PartitionId,
     batch: BatchId,
@@ -120,7 +118,9 @@ impl WalIdentity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, rkyv::Archive, rkyv::Serialize,
+)]
 pub struct BatchId(NonZeroU64);
 
 impl BatchId {
@@ -141,6 +141,12 @@ impl BatchId {
     }
 }
 
+impl From<&ArchivedBatchId> for BatchId {
+    fn from(batch: &ArchivedBatchId) -> Self {
+        Self(batch.0.to_native())
+    }
+}
+
 impl From<NonZeroU64> for BatchId {
     fn from(batch: NonZeroU64) -> Self {
         Self(batch)
@@ -155,17 +161,7 @@ impl TryFrom<u64> for BatchId {
     }
 }
 
-impl Serialize for BatchId {
-    fn serialize<Serializer: serde::Serializer>(
-        &self,
-        serializer: Serializer,
-    ) -> Result<Serializer::Ok, Serializer::Error> {
-        serializer.serialize_u64(self.get())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
 pub struct BoundedNonEmptyVec<Value> {
     values: Vec<Value>,
 }
