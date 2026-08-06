@@ -120,164 +120,85 @@ struct Observation {
     records: BTreeMap<StreamUid, Option<StreamRecord>>,
 }
 
-fn observe(forest: &Forest, paths: &[DirectoryKey], uids: &[StreamUid]) -> Observation {
-    Observation {
-        path_count: forest.path_count(),
-        resolves: paths
-            .iter()
-            .map(|path| (path.clone(), forest.resolve(path)))
-            .collect(),
-        records: uids
-            .iter()
-            .map(|uid| (*uid, forest.record(*uid).cloned()))
-            .collect(),
-    }
+#[derive(Debug, Clone)]
+enum PlannedStep {
+    CreateFresh {
+        path: DirectoryKey,
+        content_type: StreamContentType,
+        expiry: ExpiryPolicy,
+    },
+    CloseLive {
+        index: u32,
+    },
+    DeleteLive {
+        index: u32,
+    },
 }
 
-fn assert_matches_model(forest: &Forest, model: &ReferenceForest, batch: BatchId) {
-    assert_eq!(
-        forest.path_count(),
-        model.path_count(),
-        "after batch {}: path_count equals Directory occupancy",
-        batch.get()
-    );
-    for (path, entry) in &model.directory {
-        assert_eq!(
-            forest.resolve(path),
-            Some(*entry),
-            "after batch {}: Directory resolve must match the reference model",
-            batch.get()
-        );
-        match entry {
-            DirectoryEntry::Live(uid) => {
-                assert_eq!(
-                    forest.record(*uid),
-                    model.record(*uid),
-                    "after batch {}: every Live uid has exactly one Ledger record",
-                    batch.get()
-                );
-            }
-            DirectoryEntry::Tombstone(uid) => {
-                assert_eq!(
-                    forest.record(*uid),
-                    None,
-                    "after batch {}: every Tombstone uid has no Ledger record",
-                    batch.get()
-                );
-            }
+proptest! {
+    #[test]
+    fn dense_histories_match_the_pure_two_map_reference_model(
+        history in valid_dense_history(),
+    ) {
+        let mut forest = Forest::empty();
+        let mut model = ReferenceForest::empty();
+        for (batch, fact) in &history {
+            prop_assert_eq!(
+                model.fold(*batch, fact),
+                Ok(()),
+                "the constructive history must stay inside the fact-effects table"
+            );
+            prop_assert_eq!(
+                forest.strict_fold(*batch, fact),
+                Ok(Applied),
+                "Forest must accept every fact the reference model accepts"
+            );
+            assert_matches_model(&forest, &model, *batch);
         }
     }
-    for (uid, record) in &model.ledger {
-        assert_eq!(
-            forest.record(*uid),
-            Some(record),
-            "after batch {}: every Ledger record is reachable by its uid",
-            batch.get()
-        );
-        assert!(
-            model
-                .directory
-                .values()
-                .any(|entry| matches!(entry, DirectoryEntry::Live(live) if *live == *uid)),
-            "after batch {}: every Ledger value has exactly one Directory Live entry",
-            batch.get()
-        );
-    }
-    let mut seen = BTreeSet::new();
-    for entry in model.directory.values() {
-        let uid = match entry {
-            DirectoryEntry::Live(uid) | DirectoryEntry::Tombstone(uid) => *uid,
-        };
-        assert!(
-            seen.insert(uid),
-            "after batch {}: every Directory uid is unique",
-            batch.get()
-        );
-    }
-    for raw in 1..=model.path_count() {
-        let uid = StreamUid::try_from(raw).expect("uids from 1 through path_count are nonzero");
-        assert!(
-            seen.contains(&uid),
-            "after batch {}: every uid from 1 through maximum has exactly one Directory row",
-            batch.get()
-        );
-    }
-}
 
-fn stream_uid(raw: u64) -> Result<StreamUid, Box<dyn std::error::Error>> {
-    Ok(StreamUid::try_from(raw)?)
-}
+    #[test]
+    fn invalid_tail_fact_is_rejected_and_leaves_forest_unchanged(
+        (history, bad) in history_and_invalid_tail(),
+    ) {
+        let mut forest = Forest::empty();
+        let mut model = ReferenceForest::empty();
+        for (batch, fact) in &history {
+            prop_assert_eq!(model.fold(*batch, fact), Ok(()));
+            prop_assert_eq!(forest.strict_fold(*batch, fact), Ok(Applied));
+        }
 
-fn batch_id(raw: u64) -> Result<BatchId, Box<dyn std::error::Error>> {
-    Ok(BatchId::try_from(raw)?)
-}
-
-fn directory_key(raw: &str) -> Result<DirectoryKey, Box<dyn std::error::Error>> {
-    Ok(DirectoryKey::from(&raw.parse::<StreamId>()?))
-}
-
-const fn create_fact(
-    path: DirectoryKey,
-    uid: StreamUid,
-    content_type: StreamContentType,
-    expiry: ExpiryPolicy,
-) -> OperationFact {
-    OperationFact::StreamCreated {
-        path,
-        uid,
-        content_type,
-        expiry,
-    }
-}
-
-fn fixture_forest(
-    path_a: &DirectoryKey,
-    path_b: &DirectoryKey,
-    uid_1: StreamUid,
-    uid_2: StreamUid,
-    content: &StreamContentType,
-    expiry: ExpiryPolicy,
-) -> Result<Forest, Box<dyn std::error::Error>> {
-    let mut forest = Forest::empty();
-    assert_eq!(
-        forest.strict_fold(
-            batch_id(1)?,
-            &create_fact(path_a.clone(), uid_1, content.clone(), expiry)
-        )?,
-        Applied,
-        "fixture create for path a applies"
-    );
-    assert_eq!(
-        forest.strict_fold(
-            batch_id(2)?,
-            &create_fact(path_b.clone(), uid_2, content.clone(), expiry)
-        )?,
-        Applied,
-        "fixture create for path b applies"
-    );
-    assert_eq!(
-        forest.strict_fold(
-            batch_id(3)?,
-            &OperationFact::StreamDeleted {
-                path: path_b.clone(),
-                uid: uid_2,
+        let mut paths: Vec<DirectoryKey> = model.directory.keys().cloned().collect();
+        if let Ok(extra) = "zz/invalid-tail".parse::<StreamId>() {
+            let key = DirectoryKey::from(&extra);
+            if !paths.iter().any(|path| path == &key) {
+                paths.push(key);
             }
-        )?,
-        Applied,
-        "fixture delete for path b applies and leaves a tombstone"
-    );
-    assert_eq!(
-        forest.strict_fold(
-            batch_id(4)?,
-            &OperationFact::StreamClosed {
-                path: path_a.clone(),
-                uid: uid_1,
-            }
-        )?,
-        Applied,
-        "fixture close for path a applies"
-    );
-    Ok(forest)
+        }
+        let mut uids = Vec::new();
+        for raw in 1..=model.path_count() {
+            uids.push(StreamUid::try_from(raw).expect("allocated uids are nonzero"));
+        }
+        let before = observe(&forest, &paths, &uids);
+        let batch = next_batch_after(&history);
+
+        let mut probe = model.clone();
+        let model_verdict = probe.fold(batch, &bad);
+        prop_assert!(
+            model_verdict.is_err(),
+            "the generated tail must contradict the reference model"
+        );
+        prop_assert_eq!(
+            forest.strict_fold(batch, &bad),
+            model_verdict.map(|()| Applied),
+            "Forest must reject the invalid tail with the model's exact contradiction"
+        );
+        prop_assert_eq!(
+            observe(&forest, &paths, &uids),
+            before,
+            "a rejected invalid tail must leave the forest observably unchanged"
+        );
+    }
 }
 
 #[test]
@@ -296,19 +217,19 @@ fn create_close_delete_scenario_matches_fact_effects_table() -> TestResult {
     let batch_4 = batch_id(4)?;
 
     let mut forest = Forest::empty();
-    assert_eq!(forest.path_count(), 0, "genesis has no path occupancies");
+    assert_eq!(0, forest.path_count(), "genesis has no path occupancies");
     assert_eq!(
-        forest.resolve(&path_a),
         None,
+        forest.resolve(&path_a),
         "an unseen path is absent from Directory"
     );
 
     assert_eq!(
+        Applied,
         forest.strict_fold(
             batch_1,
             &create_fact(path_a.clone(), uid_a, content_a.clone(), expiry_a)
         )?,
-        Applied,
         "the first dense create applies"
     );
     assert_eq!(
@@ -326,14 +247,14 @@ fn create_close_delete_scenario_matches_fact_effects_table() -> TestResult {
         )),
         "create installs an open Ledger record whose created_at is the fold batch"
     );
-    assert_eq!(forest.path_count(), 1, "create consumes one path occupancy");
+    assert_eq!(1, forest.path_count(), "create consumes one path occupancy");
 
     assert_eq!(
+        Applied,
         forest.strict_fold(
             batch_2,
             &create_fact(path_b.clone(), uid_b, content_b.clone(), expiry_b)
         )?,
-        Applied,
         "the second dense create applies"
     );
     assert_eq!(
@@ -356,9 +277,10 @@ fn create_close_delete_scenario_matches_fact_effects_table() -> TestResult {
         Some(DirectoryEntry::Live(uid_a)),
         "an earlier Live path is unchanged by a later create"
     );
-    assert_eq!(forest.path_count(), 2, "each create advances path_count");
+    assert_eq!(2, forest.path_count(), "each create advances path_count");
 
     assert_eq!(
+        Applied,
         forest.strict_fold(
             batch_3,
             &OperationFact::StreamClosed {
@@ -366,7 +288,6 @@ fn create_close_delete_scenario_matches_fact_effects_table() -> TestResult {
                 uid: uid_a,
             }
         )?,
-        Applied,
         "close of a live open stream applies"
     );
     assert_eq!(
@@ -400,12 +321,13 @@ fn create_close_delete_scenario_matches_fact_effects_table() -> TestResult {
         "close leaves the other Ledger record open"
     );
     assert_eq!(
-        forest.path_count(),
         2,
+        forest.path_count(),
         "close does not change path occupancy"
     );
 
     assert_eq!(
+        Applied,
         forest.strict_fold(
             batch_4,
             &OperationFact::StreamDeleted {
@@ -413,7 +335,6 @@ fn create_close_delete_scenario_matches_fact_effects_table() -> TestResult {
                 uid: uid_b,
             }
         )?,
-        Applied,
         "delete of a live stream applies"
     );
     assert_eq!(
@@ -422,8 +343,8 @@ fn create_close_delete_scenario_matches_fact_effects_table() -> TestResult {
         "delete installs a permanent Directory tombstone"
     );
     assert_eq!(
-        forest.record(uid_b),
         None,
+        forest.record(uid_b),
         "delete removes the Ledger record"
     );
     assert_eq!(
@@ -432,12 +353,13 @@ fn create_close_delete_scenario_matches_fact_effects_table() -> TestResult {
         "delete leaves the closed Live path untouched"
     );
     assert_eq!(
-        forest.path_count(),
         2,
+        forest.path_count(),
         "delete does not reclaim path occupancy"
     );
 
     assert_eq!(
+        Applied,
         forest.strict_fold(
             batch_id(5)?,
             &OperationFact::StreamDeleted {
@@ -445,7 +367,6 @@ fn create_close_delete_scenario_matches_fact_effects_table() -> TestResult {
                 uid: uid_a,
             }
         )?,
-        Applied,
         "hard delete of a closed live stream applies"
     );
     assert_eq!(
@@ -454,13 +375,13 @@ fn create_close_delete_scenario_matches_fact_effects_table() -> TestResult {
         "delete after close tombstones the path"
     );
     assert_eq!(
-        forest.record(uid_a),
         None,
+        forest.record(uid_a),
         "delete after close removes the Ledger record"
     );
     assert_eq!(
-        forest.path_count(),
         2,
+        forest.path_count(),
         "delete after close retains the path occupancy"
     );
     Ok(())
@@ -575,11 +496,11 @@ fn rejected_folds_enumerate_every_fact_effect_contradiction_and_leave_state_unch
     let mut empty = Forest::empty();
     let empty_before = observe(&empty, &paths, &uids);
     assert_eq!(
+        Err(FoldContradiction::UidNotDenseSuccessor),
         empty.strict_fold(
             batch_id(1)?,
             &create_fact(path_a.clone(), uid_2, content.clone(), expiry)
         ),
-        Err(FoldContradiction::UidNotDenseSuccessor),
         "create uid 2 into an empty forest is not the dense successor"
     );
     assert_eq!(
@@ -590,20 +511,20 @@ fn rejected_folds_enumerate_every_fact_effect_contradiction_and_leave_state_unch
 
     let mut reuse = Forest::empty();
     assert_eq!(
+        Applied,
         reuse.strict_fold(
             batch_id(1)?,
             &create_fact(path_a.clone(), uid_1, content.clone(), expiry)
         )?,
-        Applied,
         "first create with uid 1 applies"
     );
     let reuse_before = observe(&reuse, &paths, &uids);
     assert_eq!(
+        Err(FoldContradiction::UidNotDenseSuccessor),
         reuse.strict_fold(
             batch_id(2)?,
             &create_fact(path_c.clone(), uid_1, content.clone(), expiry)
         ),
-        Err(FoldContradiction::UidNotDenseSuccessor),
         "a second create that reuses uid 1 is not the dense successor"
     );
     assert_eq!(
@@ -615,152 +536,88 @@ fn rejected_folds_enumerate_every_fact_effect_contradiction_and_leave_state_unch
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-enum PlannedStep {
-    CreateFresh {
-        path: DirectoryKey,
-        content_type: StreamContentType,
-        expiry: ExpiryPolicy,
-    },
-    CloseLive {
-        index: u32,
-    },
-    DeleteLive {
-        index: u32,
-    },
+fn directory_key(raw: &str) -> Result<DirectoryKey, Box<dyn std::error::Error>> {
+    Ok(DirectoryKey::from(&raw.parse::<StreamId>()?))
 }
 
-fn planned_step() -> impl Strategy<Value = PlannedStep> {
-    prop_oneof![
-        (
-            strom_domain::strategy::stream_id().prop_map(|id| DirectoryKey::from(&id)),
-            strom_domain::strategy::stream_content_type(),
-            strom_domain::strategy::expiry_policy(),
-        )
-            .prop_map(|(path, content_type, expiry)| PlannedStep::CreateFresh {
-                path,
-                content_type,
-                expiry,
-            }),
-        any::<u32>().prop_map(|index| PlannedStep::CloseLive { index }),
-        any::<u32>().prop_map(|index| PlannedStep::DeleteLive { index }),
-    ]
+fn stream_uid(raw: u64) -> Result<StreamUid, Box<dyn std::error::Error>> {
+    Ok(StreamUid::try_from(raw)?)
 }
 
-/// Materialize a valid dense history. Duplicate-path creates and close/delete
-/// steps with an empty candidate set are skipped so every emitted fact applies.
-fn materialize_valid_history(steps: Vec<PlannedStep>) -> Vec<(BatchId, OperationFact)> {
-    let mut occupied = BTreeSet::new();
-    let mut live_open: Vec<(DirectoryKey, StreamUid)> = Vec::new();
-    let mut live: Vec<(DirectoryKey, StreamUid)> = Vec::new();
-    let mut next_uid = 1u64;
-    let mut history = Vec::new();
-    let mut step_index = 1u64;
+fn fixture_forest(
+    path_a: &DirectoryKey,
+    path_b: &DirectoryKey,
+    uid_1: StreamUid,
+    uid_2: StreamUid,
+    content: &StreamContentType,
+    expiry: ExpiryPolicy,
+) -> Result<Forest, Box<dyn std::error::Error>> {
+    let mut forest = Forest::empty();
+    assert_eq!(
+        Applied,
+        forest.strict_fold(
+            batch_id(1)?,
+            &create_fact(path_a.clone(), uid_1, content.clone(), expiry)
+        )?,
+        "fixture create for path a applies"
+    );
+    assert_eq!(
+        Applied,
+        forest.strict_fold(
+            batch_id(2)?,
+            &create_fact(path_b.clone(), uid_2, content.clone(), expiry)
+        )?,
+        "fixture create for path b applies"
+    );
+    assert_eq!(
+        Applied,
+        forest.strict_fold(
+            batch_id(3)?,
+            &OperationFact::StreamDeleted {
+                path: path_b.clone(),
+                uid: uid_2,
+            }
+        )?,
+        "fixture delete for path b applies and leaves a tombstone"
+    );
+    assert_eq!(
+        Applied,
+        forest.strict_fold(
+            batch_id(4)?,
+            &OperationFact::StreamClosed {
+                path: path_a.clone(),
+                uid: uid_1,
+            }
+        )?,
+        "fixture close for path a applies"
+    );
+    Ok(forest)
+}
 
-    for step in steps {
-        match step {
-            PlannedStep::CreateFresh {
-                path,
-                content_type,
-                expiry,
-            } => {
-                if !occupied.insert(path.clone()) {
-                    continue;
-                }
-                let uid = StreamUid::try_from(next_uid)
-                    .expect("dense create uids start at one and stay nonzero");
-                next_uid = next_uid
-                    .checked_add(1)
-                    .expect("test-scale histories stay below u64::MAX uids");
-                let batch =
-                    BatchId::try_from(step_index).expect("monotonic batch ids start at one");
-                step_index = step_index
-                    .checked_add(1)
-                    .expect("test-scale histories stay below u64::MAX batches");
-                history.push((
-                    batch,
-                    OperationFact::StreamCreated {
-                        path: path.clone(),
-                        uid,
-                        content_type,
-                        expiry,
-                    },
-                ));
-                live_open.push((path.clone(), uid));
-                live.push((path, uid));
-            }
-            PlannedStep::CloseLive { index } => {
-                if live_open.is_empty() {
-                    continue;
-                }
-                let choice = usize::try_from(index)
-                    .ok()
-                    .and_then(|raw| raw.checked_rem(live_open.len()))
-                    .expect("a nonempty live_open set has a remainder index");
-                let (path, uid) = live_open.remove(choice);
-                let batch =
-                    BatchId::try_from(step_index).expect("monotonic batch ids start at one");
-                step_index = step_index
-                    .checked_add(1)
-                    .expect("test-scale histories stay below u64::MAX batches");
-                history.push((batch, OperationFact::StreamClosed { path, uid }));
-            }
-            PlannedStep::DeleteLive { index } => {
-                if live.is_empty() {
-                    continue;
-                }
-                let choice = usize::try_from(index)
-                    .ok()
-                    .and_then(|raw| raw.checked_rem(live.len()))
-                    .expect("a nonempty live set has a remainder index");
-                let (path, uid) = live.remove(choice);
-                live_open.retain(|(open_path, _)| open_path != &path);
-                let batch =
-                    BatchId::try_from(step_index).expect("monotonic batch ids start at one");
-                step_index = step_index
-                    .checked_add(1)
-                    .expect("test-scale histories stay below u64::MAX batches");
-                history.push((batch, OperationFact::StreamDeleted { path, uid }));
-            }
-        }
+fn observe(forest: &Forest, paths: &[DirectoryKey], uids: &[StreamUid]) -> Observation {
+    Observation {
+        path_count: forest.path_count(),
+        resolves: paths
+            .iter()
+            .map(|path| (path.clone(), forest.resolve(path)))
+            .collect(),
+        records: uids
+            .iter()
+            .map(|uid| (*uid, forest.record(*uid).cloned()))
+            .collect(),
     }
-    history
+}
+
+fn history_and_invalid_tail()
+-> impl Strategy<Value = (Vec<(BatchId, OperationFact)>, OperationFact)> {
+    valid_dense_history().prop_flat_map(|history| {
+        let model = fold_history(&history);
+        invalid_fact_for(model).prop_map(move |bad| (history.clone(), bad))
+    })
 }
 
 fn valid_dense_history() -> impl Strategy<Value = Vec<(BatchId, OperationFact)>> {
     proptest::collection::vec(planned_step(), 0..=24).prop_map(materialize_valid_history)
-}
-
-fn fold_history(history: &[(BatchId, OperationFact)]) -> ReferenceForest {
-    let mut model = ReferenceForest::empty();
-    for (batch, fact) in history {
-        model
-            .fold(*batch, fact)
-            .expect("a constructively valid history applies in the reference model");
-    }
-    model
-}
-
-fn next_batch_after(history: &[(BatchId, OperationFact)]) -> BatchId {
-    let raw = u64::try_from(history.len())
-        .ok()
-        .and_then(|len| len.checked_add(1))
-        .expect("history length plus one fits in u64");
-    BatchId::try_from(raw).expect("batch ids start at one")
-}
-
-fn wrong_uid_for(uid: StreamUid) -> StreamUid {
-    let one = StreamUid::try_from(1).expect("uid one is nonzero");
-    let two = StreamUid::try_from(2).expect("uid two is nonzero");
-    if uid == one { two } else { one }
-}
-
-fn gap_uid_for(path_count: u64) -> StreamUid {
-    let raw = path_count
-        .checked_add(2)
-        .expect("gap uid stays in u64")
-        .max(2);
-    StreamUid::try_from(raw).expect("gap uid is nonzero")
 }
 
 fn invalid_fact_for(model: ReferenceForest) -> BoxedStrategy<OperationFact> {
@@ -920,76 +777,219 @@ fn invalid_fact_for(model: ReferenceForest) -> BoxedStrategy<OperationFact> {
     proptest::strategy::Union::new(arms).boxed()
 }
 
-fn history_and_invalid_tail()
--> impl Strategy<Value = (Vec<(BatchId, OperationFact)>, OperationFact)> {
-    valid_dense_history().prop_flat_map(|history| {
-        let model = fold_history(&history);
-        invalid_fact_for(model).prop_map(move |bad| (history.clone(), bad))
-    })
-}
-
-proptest! {
-    #[test]
-    fn dense_histories_match_the_pure_two_map_reference_model(
-        history in valid_dense_history(),
-    ) {
-        let mut forest = Forest::empty();
-        let mut model = ReferenceForest::empty();
-        for (batch, fact) in &history {
-            prop_assert_eq!(
-                model.fold(*batch, fact),
-                Ok(()),
-                "the constructive history must stay inside the fact-effects table"
-            );
-            prop_assert_eq!(
-                forest.strict_fold(*batch, fact),
-                Ok(Applied),
-                "Forest must accept every fact the reference model accepts"
-            );
-            assert_matches_model(&forest, &model, *batch);
-        }
-    }
-
-    #[test]
-    fn invalid_tail_fact_is_rejected_and_leaves_forest_unchanged(
-        (history, bad) in history_and_invalid_tail(),
-    ) {
-        let mut forest = Forest::empty();
-        let mut model = ReferenceForest::empty();
-        for (batch, fact) in &history {
-            prop_assert_eq!(model.fold(*batch, fact), Ok(()));
-            prop_assert_eq!(forest.strict_fold(*batch, fact), Ok(Applied));
-        }
-
-        let mut paths: Vec<DirectoryKey> = model.directory.keys().cloned().collect();
-        if let Ok(extra) = "zz/invalid-tail".parse::<StreamId>() {
-            let key = DirectoryKey::from(&extra);
-            if !paths.iter().any(|path| path == &key) {
-                paths.push(key);
+fn assert_matches_model(forest: &Forest, model: &ReferenceForest, batch: BatchId) {
+    assert_eq!(
+        forest.path_count(),
+        model.path_count(),
+        "after batch {}: path_count equals Directory occupancy",
+        batch.get()
+    );
+    for (path, entry) in &model.directory {
+        assert_eq!(
+            forest.resolve(path),
+            Some(*entry),
+            "after batch {}: Directory resolve must match the reference model",
+            batch.get()
+        );
+        match entry {
+            DirectoryEntry::Live(uid) => {
+                assert_eq!(
+                    forest.record(*uid),
+                    model.record(*uid),
+                    "after batch {}: every Live uid has exactly one Ledger record",
+                    batch.get()
+                );
+            }
+            DirectoryEntry::Tombstone(uid) => {
+                assert_eq!(
+                    None,
+                    forest.record(*uid),
+                    "after batch {}: every Tombstone uid has no Ledger record",
+                    batch.get()
+                );
             }
         }
-        let mut uids = Vec::new();
-        for raw in 1..=model.path_count() {
-            uids.push(StreamUid::try_from(raw).expect("allocated uids are nonzero"));
-        }
-        let before = observe(&forest, &paths, &uids);
-        let batch = next_batch_after(&history);
+    }
+    for (uid, record) in &model.ledger {
+        assert_eq!(
+            forest.record(*uid),
+            Some(record),
+            "after batch {}: every Ledger record is reachable by its uid",
+            batch.get()
+        );
+        assert!(
+            model
+                .directory
+                .values()
+                .any(|entry| matches!(entry, DirectoryEntry::Live(live) if *live == *uid)),
+            "after batch {}: every Ledger value has exactly one Directory Live entry",
+            batch.get()
+        );
+    }
+    let mut seen = BTreeSet::new();
+    for entry in model.directory.values() {
+        let uid = match entry {
+            DirectoryEntry::Live(uid) | DirectoryEntry::Tombstone(uid) => *uid,
+        };
+        assert!(
+            seen.insert(uid),
+            "after batch {}: every Directory uid is unique",
+            batch.get()
+        );
+    }
+    for raw in 1..=model.path_count() {
+        let uid = StreamUid::try_from(raw).expect("uids from 1 through path_count are nonzero");
+        assert!(
+            seen.contains(&uid),
+            "after batch {}: every uid from 1 through maximum has exactly one Directory row",
+            batch.get()
+        );
+    }
+}
 
-        let mut probe = model.clone();
-        let model_verdict = probe.fold(batch, &bad);
-        prop_assert!(
-            model_verdict.is_err(),
-            "the generated tail must contradict the reference model"
-        );
-        prop_assert_eq!(
-            forest.strict_fold(batch, &bad),
-            model_verdict.map(|()| Applied),
-            "Forest must reject the invalid tail with the model's exact contradiction"
-        );
-        prop_assert_eq!(
-            observe(&forest, &paths, &uids),
-            before,
-            "a rejected invalid tail must leave the forest observably unchanged"
-        );
+fn fold_history(history: &[(BatchId, OperationFact)]) -> ReferenceForest {
+    let mut model = ReferenceForest::empty();
+    for (batch, fact) in history {
+        model
+            .fold(*batch, fact)
+            .expect("a constructively valid history applies in the reference model");
+    }
+    model
+}
+
+fn next_batch_after(history: &[(BatchId, OperationFact)]) -> BatchId {
+    let raw = u64::try_from(history.len())
+        .ok()
+        .and_then(|len| len.checked_add(1))
+        .expect("history length plus one fits in u64");
+    BatchId::try_from(raw).expect("batch ids start at one")
+}
+
+/// Materialize a valid dense history. Duplicate-path creates and close/delete
+/// steps with an empty candidate set are skipped so every emitted fact applies.
+fn materialize_valid_history(steps: Vec<PlannedStep>) -> Vec<(BatchId, OperationFact)> {
+    let mut occupied = BTreeSet::new();
+    let mut live_open: Vec<(DirectoryKey, StreamUid)> = Vec::new();
+    let mut live: Vec<(DirectoryKey, StreamUid)> = Vec::new();
+    let mut next_uid = 1u64;
+    let mut history = Vec::new();
+    let mut step_index = 1u64;
+
+    for step in steps {
+        match step {
+            PlannedStep::CreateFresh {
+                path,
+                content_type,
+                expiry,
+            } => {
+                if !occupied.insert(path.clone()) {
+                    continue;
+                }
+                let uid = StreamUid::try_from(next_uid)
+                    .expect("dense create uids start at one and stay nonzero");
+                next_uid = next_uid
+                    .checked_add(1)
+                    .expect("test-scale histories stay below u64::MAX uids");
+                let batch =
+                    BatchId::try_from(step_index).expect("monotonic batch ids start at one");
+                step_index = step_index
+                    .checked_add(1)
+                    .expect("test-scale histories stay below u64::MAX batches");
+                history.push((
+                    batch,
+                    OperationFact::StreamCreated {
+                        path: path.clone(),
+                        uid,
+                        content_type,
+                        expiry,
+                    },
+                ));
+                live_open.push((path.clone(), uid));
+                live.push((path, uid));
+            }
+            PlannedStep::CloseLive { index } => {
+                if live_open.is_empty() {
+                    continue;
+                }
+                let choice = usize::try_from(index)
+                    .ok()
+                    .and_then(|raw| raw.checked_rem(live_open.len()))
+                    .expect("a nonempty live_open set has a remainder index");
+                let (path, uid) = live_open.remove(choice);
+                let batch =
+                    BatchId::try_from(step_index).expect("monotonic batch ids start at one");
+                step_index = step_index
+                    .checked_add(1)
+                    .expect("test-scale histories stay below u64::MAX batches");
+                history.push((batch, OperationFact::StreamClosed { path, uid }));
+            }
+            PlannedStep::DeleteLive { index } => {
+                if live.is_empty() {
+                    continue;
+                }
+                let choice = usize::try_from(index)
+                    .ok()
+                    .and_then(|raw| raw.checked_rem(live.len()))
+                    .expect("a nonempty live set has a remainder index");
+                let (path, uid) = live.remove(choice);
+                live_open.retain(|(open_path, _)| open_path != &path);
+                let batch =
+                    BatchId::try_from(step_index).expect("monotonic batch ids start at one");
+                step_index = step_index
+                    .checked_add(1)
+                    .expect("test-scale histories stay below u64::MAX batches");
+                history.push((batch, OperationFact::StreamDeleted { path, uid }));
+            }
+        }
+    }
+    history
+}
+
+fn planned_step() -> impl Strategy<Value = PlannedStep> {
+    prop_oneof![
+        (
+            strom_domain::strategy::stream_id().prop_map(|id| DirectoryKey::from(&id)),
+            strom_domain::strategy::stream_content_type(),
+            strom_domain::strategy::expiry_policy(),
+        )
+            .prop_map(|(path, content_type, expiry)| PlannedStep::CreateFresh {
+                path,
+                content_type,
+                expiry,
+            }),
+        any::<u32>().prop_map(|index| PlannedStep::CloseLive { index }),
+        any::<u32>().prop_map(|index| PlannedStep::DeleteLive { index }),
+    ]
+}
+
+fn gap_uid_for(path_count: u64) -> StreamUid {
+    let raw = path_count
+        .checked_add(2)
+        .expect("gap uid stays in u64")
+        .max(2);
+    StreamUid::try_from(raw).expect("gap uid is nonzero")
+}
+
+fn wrong_uid_for(uid: StreamUid) -> StreamUid {
+    let one = StreamUid::try_from(1).expect("uid one is nonzero");
+    let two = StreamUid::try_from(2).expect("uid two is nonzero");
+    if uid == one { two } else { one }
+}
+
+fn batch_id(raw: u64) -> Result<BatchId, Box<dyn std::error::Error>> {
+    Ok(BatchId::try_from(raw)?)
+}
+
+const fn create_fact(
+    path: DirectoryKey,
+    uid: StreamUid,
+    content_type: StreamContentType,
+    expiry: ExpiryPolicy,
+) -> OperationFact {
+    OperationFact::StreamCreated {
+        path,
+        uid,
+        content_type,
+        expiry,
     }
 }

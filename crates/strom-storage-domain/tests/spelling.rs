@@ -15,18 +15,18 @@ fn partition_id_accepts_every_non_nil_uuid_bit_pattern_and_canonicalizes_spellin
 -> Result<(), Box<dyn std::error::Error>> {
     let partition: PartitionId = "00112233-4455-6677-8899-aabbccddeeff".parse()?;
     assert_eq!(
-        partition.to_string(),
         "00112233-4455-6677-8899-aabbccddeeff",
+        partition.to_string(),
         "the durable spelling is lowercase and hyphenated"
     );
     assert_eq!(
-        "00112233-4455-6677-8899-AABBCCDDEEFF".parse::<PartitionId>(),
         Err(PartitionIdError::Malformed),
+        "00112233-4455-6677-8899-AABBCCDDEEFF".parse::<PartitionId>(),
         "uppercase aliases are noncanonical"
     );
     assert_eq!(
-        "00000000-0000-0000-0000-000000000000".parse::<PartitionId>(),
         Err(PartitionIdError::Nil),
+        "00000000-0000-0000-0000-000000000000".parse::<PartitionId>(),
         "nil is the only rejected UUID bit pattern"
     );
     Ok(())
@@ -35,19 +35,19 @@ fn partition_id_accepts_every_non_nil_uuid_bit_pattern_and_canonicalizes_spellin
 #[test]
 fn nonzero_coordinates_have_checked_successors() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(
-        SealGeneration::genesis().get(),
         1,
+        SealGeneration::genesis().get(),
         "generation one is canonical genesis"
     );
     assert_eq!(
-        SealGeneration::genesis().successor()?.get(),
         2,
+        SealGeneration::genesis().successor()?.get(),
         "ordinary generations advance by exactly one"
     );
     let exhausted = SealGeneration::from(NonZeroU64::MAX);
     assert_eq!(
-        exhausted.successor(),
         Err(CoordinateExhausted),
+        exhausted.successor(),
         "successor arithmetic never wraps into reserved zero"
     );
     assert!(
@@ -64,8 +64,8 @@ fn wal_facts_crosses_both_count_boundaries() -> Result<(), Box<dyn std::error::E
     let deleted = OperationFact::StreamDeleted { path, uid };
 
     assert_eq!(
-        WalFacts::try_from(Vec::new()),
         Err(WalFactsError::Empty),
+        WalFacts::try_from(Vec::new()),
         "a WAL run cannot represent no mutation"
     );
     assert!(
@@ -73,10 +73,10 @@ fn wal_facts_crosses_both_count_boundaries() -> Result<(), Box<dyn std::error::E
         "the published fact-count bound itself is accepted"
     );
     assert_eq!(
-        WalFacts::try_from(vec![deleted; WAL_RUN_FACTS_MAX.saturating_add(1)]),
         Err(WalFactsError::OverMax {
             facts_actual: WAL_RUN_FACTS_MAX.saturating_add(1),
         }),
+        WalFacts::try_from(vec![deleted; WAL_RUN_FACTS_MAX.saturating_add(1)]),
         "the first over-bound count is rejected"
     );
     Ok(())
@@ -92,13 +92,13 @@ fn seal_and_wal_namespace_prefixes_have_independent_golden_vectors()
     let seal_namespace = SealNamespace::from(partition);
     let wal_namespace = WalNamespace::from(partition);
     assert_eq!(
-        seal_namespace.to_string().as_bytes(),
         SEAL_NAMESPACE,
+        seal_namespace.to_string().as_bytes(),
         "Seal namespace spelling is the published LIST prefix"
     );
     assert_eq!(
-        wal_namespace.to_string().as_bytes(),
         WAL_NAMESPACE,
+        wal_namespace.to_string().as_bytes(),
         "WAL namespace spelling is the published LIST prefix"
     );
 
@@ -138,18 +138,18 @@ fn durable_key_golden_spellings_select_newest_coordinates_first()
         SealGeneration::genesis().successor()?,
     ));
     assert_eq!(
-        generation_one.to_string(),
         "partition/00112233-4455-6677-8899-aabbccddeeff/seal/v1/18446744073709551614",
+        generation_one.to_string(),
         "generation one anchors the reverse-coordinate spelling"
     );
     assert_eq!(
-        generation_two.to_string(),
         "partition/00112233-4455-6677-8899-aabbccddeeff/seal/v1/18446744073709551613",
+        generation_two.to_string(),
         "generation two decrements the storage ordinal"
     );
     assert_eq!(
-        generation_two.to_string().cmp(&generation_one.to_string()),
         Ordering::Less,
+        generation_two.to_string().cmp(&generation_one.to_string()),
         "ascending listing puts the newer generation first"
     );
     assert_eq!(
@@ -160,8 +160,8 @@ fn durable_key_golden_spellings_select_newest_coordinates_first()
 
     let wal_key = WalKey::from(WalIdentity::new(partition, BatchId::try_from(42)?));
     assert_eq!(
-        wal_key.to_string(),
         "partition/00112233-4455-6677-8899-aabbccddeeff/wal/v1/18446744073709551573",
+        wal_key.to_string(),
         "WAL keys use the independent batch coordinate in the same namespace scheme"
     );
     assert_eq!(wal_key.to_string().parse::<WalKey>()?, wal_key);
@@ -198,8 +198,8 @@ fn malformed_durable_key_spellings_fail_closed() {
     ];
     for (raw, expected) in cases {
         assert_eq!(
-            raw.parse::<SealKey>(),
             Err(expected),
+            raw.parse::<SealKey>(),
             "noncanonical durable key must be rejected: {raw}"
         );
     }
@@ -234,13 +234,13 @@ fn table_key_golden_spellings_anchor_every_store() -> Result<(), Box<dyn std::er
     for (store, expected) in cases {
         let key = TableKey::new(partition, TableObjectId::new(fresh, store));
         assert_eq!(
-            key.to_string(),
             expected,
+            key.to_string(),
             "each store has one lowercase spelling"
         );
         assert_eq!(
-            expected.parse::<TableKey>()?,
             key,
+            expected.parse::<TableKey>()?,
             "the golden key roundtrips"
         );
     }

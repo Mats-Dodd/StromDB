@@ -315,36 +315,6 @@ mod tests {
 
     use super::*;
 
-    fn partition() -> PartitionId {
-        "00112233-4455-6677-8899-aabbccddeeff"
-            .parse()
-            .expect("test partition is canonical")
-    }
-
-    fn owner() -> OwnerToken {
-        OwnerToken::from(SealGeneration::genesis())
-    }
-
-    fn batch(raw: u64) -> BatchId {
-        BatchId::try_from(raw).expect("test batch is nonzero")
-    }
-
-    fn deleted_fact() -> OperationFact {
-        let path = DirectoryKey::try_from(Box::<[u8]>::from(b"events/abc".as_slice()))
-            .expect("test stream path is canonical");
-        let uid = StreamUid::try_from(1).expect("test uid is nonzero");
-        OperationFact::StreamDeleted { path, uid }
-    }
-
-    fn run_at(batch_id: BatchId) -> WalObject {
-        let facts = WalFacts::try_from(vec![deleted_fact()]).expect("one fact is a legal run");
-        WalObject::new(partition(), batch_id, owner(), WalBody::Run(facts))
-    }
-
-    fn fence_at(batch_id: BatchId) -> WalObject {
-        WalObject::new(partition(), batch_id, owner(), WalBody::Fence)
-    }
-
     #[tokio::test]
     async fn created_wal_reads_back_equal_with_a_stable_validator() {
         let store = WalStore::new(ObjectStoreAdapter::in_memory());
@@ -352,8 +322,8 @@ mod tests {
         let candidate = EncodedWal::new(&object).expect("run encodes");
         let evidence = store.create_wal(&candidate).await.expect("create runs");
         assert_eq!(
-            evidence,
             CreateEvidence::Direct,
+            evidence,
             "an unoccupied WAL coordinate grants Direct"
         );
 
@@ -416,8 +386,8 @@ mod tests {
             .await
             .expect("second create runs");
         assert_eq!(
-            same,
             CreateEvidence::DurableMatch,
+            same,
             "identical bytes prove existence, never authorship"
         );
 
@@ -434,8 +404,8 @@ mod tests {
             .await
             .expect("contested create runs");
         assert_eq!(
-            different,
             CreateEvidence::NotOurs,
+            different,
             "a different occupant fences the caller"
         );
     }
@@ -617,5 +587,35 @@ mod tests {
             matches!(outcome, Err(WalStoreError::Contradiction { .. })),
             "IdentityMismatch at the read identity is Contradiction, got {outcome:?}"
         );
+    }
+
+    fn run_at(batch_id: BatchId) -> WalObject {
+        let facts = WalFacts::try_from(vec![deleted_fact()]).expect("one fact is a legal run");
+        WalObject::new(partition(), batch_id, owner(), WalBody::Run(facts))
+    }
+
+    fn fence_at(batch_id: BatchId) -> WalObject {
+        WalObject::new(partition(), batch_id, owner(), WalBody::Fence)
+    }
+
+    fn deleted_fact() -> OperationFact {
+        let path = DirectoryKey::try_from(Box::<[u8]>::from(b"events/abc".as_slice()))
+            .expect("test stream path is canonical");
+        let uid = StreamUid::try_from(1).expect("test uid is nonzero");
+        OperationFact::StreamDeleted { path, uid }
+    }
+
+    fn batch(raw: u64) -> BatchId {
+        BatchId::try_from(raw).expect("test batch is nonzero")
+    }
+
+    fn partition() -> PartitionId {
+        "00112233-4455-6677-8899-aabbccddeeff"
+            .parse()
+            .expect("test partition is canonical")
+    }
+
+    fn owner() -> OwnerToken {
+        OwnerToken::from(SealGeneration::genesis())
     }
 }

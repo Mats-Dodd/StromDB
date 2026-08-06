@@ -81,8 +81,8 @@ mod tests {
     #[test]
     fn impossible_row_counts_fail_before_input_iteration() {
         assert_eq!(
-            check_encode_rows::<u64>(usize::MAX),
-            Err(SstEncodeError::ResourceBound)
+            Err(SstEncodeError::ResourceBound),
+            check_encode_rows::<u64>(usize::MAX)
         );
     }
 }

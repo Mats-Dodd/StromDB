@@ -191,23 +191,6 @@ mod tests {
     use strom_object_store::ObjectKey;
     use strom_storage_domain::{TreeVersion, WalReplayPoint};
 
-    fn partition() -> PartitionId {
-        "00112233-4455-6677-8899-aabbccddeeff"
-            .parse()
-            .expect("test partition is canonical")
-    }
-
-    fn seal_at(generation: SealGeneration) -> Seal {
-        Seal::new(
-            partition(),
-            generation,
-            WalReplayPoint::Genesis,
-            TreeVersion::empty(),
-            TreeVersion::empty(),
-        )
-        .expect("empty genesis trees are valid")
-    }
-
     #[tokio::test]
     async fn created_seal_reads_back_equal_at_its_exact_identity() {
         let store = SealStore::new(ObjectStoreAdapter::in_memory());
@@ -215,8 +198,8 @@ mod tests {
         let candidate = EncodedSeal::new(&seal).expect("genesis seal encodes");
         let evidence = store.create_seal(&candidate).await.expect("create runs");
         assert_eq!(
-            evidence,
             CreateEvidence::Direct,
+            evidence,
             "an unoccupied Seal coordinate grants Direct"
         );
 
@@ -274,8 +257,8 @@ mod tests {
             .await
             .expect("second create runs");
         assert_eq!(
-            same,
             CreateEvidence::DurableMatch,
+            same,
             "identical bytes prove existence, never authorship"
         );
 
@@ -292,8 +275,8 @@ mod tests {
             .await
             .expect("contested create runs");
         assert_eq!(
-            different,
             CreateEvidence::NotOurs,
+            different,
             "a different occupant fences the caller"
         );
     }
@@ -377,5 +360,22 @@ mod tests {
             matches!(outcome, Err(SealStoreError::Contradiction { .. })),
             "IdentityMismatch at the read identity is Contradiction, got {outcome:?}"
         );
+    }
+
+    fn seal_at(generation: SealGeneration) -> Seal {
+        Seal::new(
+            partition(),
+            generation,
+            WalReplayPoint::Genesis,
+            TreeVersion::empty(),
+            TreeVersion::empty(),
+        )
+        .expect("empty genesis trees are valid")
+    }
+
+    fn partition() -> PartitionId {
+        "00112233-4455-6677-8899-aabbccddeeff"
+            .parse()
+            .expect("test partition is canonical")
     }
 }

@@ -35,6 +35,17 @@ pub fn decode_wal(identity: &WalIdentity, bytes: &[u8]) -> Result<WalObject, Dec
     Ok(WalObject::new(partition, batch, owner, body))
 }
 
+fn check_identity(
+    expected: &WalIdentity,
+    partition: PartitionId,
+    batch: BatchId,
+) -> Result<(), DecodeError> {
+    if WalIdentity::new(partition, batch) != *expected {
+        return Err(DecodeError::IdentityMismatch);
+    }
+    Ok(())
+}
+
 fn decode_body(body: &ArchivedWalBody) -> Result<WalBody, DecodeError> {
     match body {
         ArchivedWalBody::Run(facts) => {
@@ -80,17 +91,6 @@ fn decode_fact(fact: &ArchivedOperationFact) -> Result<OperationFact, DecodeErro
     }
 }
 
-fn check_identity(
-    expected: &WalIdentity,
-    partition: PartitionId,
-    batch: BatchId,
-) -> Result<(), DecodeError> {
-    if WalIdentity::new(partition, batch) != *expected {
-        return Err(DecodeError::IdentityMismatch);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,8 +110,8 @@ mod tests {
             WalBody::Run(WalFacts { facts: Vec::new() }),
         );
         assert_eq!(
-            decode_wal(&identity, &encode(&empty, WAL_ENCODED_BYTES_MAX)?),
             Err(DecodeError::InvalidBody),
+            decode_wal(&identity, &encode(&empty, WAL_ENCODED_BYTES_MAX)?),
             "a structurally valid archive cannot manufacture an empty run"
         );
 
@@ -120,7 +120,7 @@ mod tests {
         let WalBody::Run(decoded_facts) = decoded.body() else {
             return Err("a run archive must decode as a run".into());
         };
-        assert_eq!(decoded_facts.as_slice().len(), WAL_RUN_FACTS_MAX);
+        assert_eq!(WAL_RUN_FACTS_MAX, decoded_facts.as_slice().len());
 
         let over_max = run_with_deleted_facts(
             partition,
@@ -129,11 +129,15 @@ mod tests {
             WAL_RUN_FACTS_MAX.saturating_add(1),
         )?;
         assert_eq!(
-            decode_wal(&identity, &encode(&over_max, WAL_ENCODED_BYTES_MAX)?,),
             Err(DecodeError::InvalidBody),
+            decode_wal(&identity, &encode(&over_max, WAL_ENCODED_BYTES_MAX)?,),
             "an archived count above the named limit is rejected before result allocation"
         );
         Ok(())
+    }
+
+    fn partition() -> Result<PartitionId, crate::PartitionIdError> {
+        "00112233-4455-6677-8899-aabbccddeeff".parse()
     }
 
     fn run_with_deleted_facts(
@@ -156,9 +160,5 @@ mod tests {
             owner,
             WalBody::Run(WalFacts { facts }),
         ))
-    }
-
-    fn partition() -> Result<PartitionId, crate::PartitionIdError> {
-        "00112233-4455-6677-8899-aabbccddeeff".parse()
     }
 }

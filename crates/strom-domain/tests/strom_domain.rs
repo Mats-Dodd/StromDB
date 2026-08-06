@@ -9,14 +9,14 @@ use strom_domain::{
 fn stream_id_accepts_protocol_example_paths() -> Result<(), StreamIdError> {
     let events: StreamId = "events/abc".parse()?;
     assert_eq!(
-        events.as_str(),
         "events/abc",
+        events.as_str(),
         "parsing must preserve the exact path"
     );
     let wake: StreamId = "wake/pool".parse()?;
     assert_eq!(
-        wake.as_str(),
         "wake/pool",
+        wake.as_str(),
         "parsing must preserve the exact path"
     );
     Ok(())
@@ -25,23 +25,23 @@ fn stream_id_accepts_protocol_example_paths() -> Result<(), StreamIdError> {
 #[test]
 fn stream_id_reserves_ds_root_but_not_lookalikes() {
     assert_eq!(
-        "__ds".parse::<StreamId>().err(),
         Some(StreamIdError::ReservedRootSegment),
+        "__ds".parse::<StreamId>().err(),
         "§6: the bare control root is reserved"
     );
     assert_eq!(
-        "__ds/subscriptions/sub-1".parse::<StreamId>().err(),
         Some(StreamIdError::ReservedRootSegment),
+        "__ds/subscriptions/sub-1".parse::<StreamId>().err(),
         "§6: control paths must not be stream ids"
     );
     assert_eq!(
-        "__dsx/foo".parse::<StreamId>().err(),
         None,
+        "__dsx/foo".parse::<StreamId>().err(),
         "one character past the reserved segment is an ordinary stream"
     );
     assert_eq!(
-        "events/__ds".parse::<StreamId>().err(),
         None,
+        "events/__ds".parse::<StreamId>().err(),
         "§6 reserves the first segment only"
     );
 }
@@ -61,8 +61,8 @@ fn stream_id_rejects_structural_hazards() {
     ];
     for (input, expected) in hazards {
         assert_eq!(
-            input.parse::<StreamId>().err(),
             Some(expected),
+            input.parse::<StreamId>().err(),
             "structural hazard must be rejected: {input:?}"
         );
     }
@@ -72,14 +72,14 @@ fn stream_id_rejects_structural_hazards() {
 fn stream_id_length_boundary_is_exact() {
     let at_max = "a".repeat(STREAM_ID_BYTES_MAX);
     assert_eq!(
-        at_max.parse::<StreamId>().err(),
         None,
+        at_max.parse::<StreamId>().err(),
         "an id at the bound is valid"
     );
     let over_max = "a".repeat(STREAM_ID_BYTES_MAX.saturating_add(1));
     assert_eq!(
-        over_max.parse::<StreamId>().err(),
         Some(StreamIdError::OverMaxBytes),
+        over_max.parse::<StreamId>().err(),
         "one byte over the bound is rejected"
     );
 }
@@ -179,16 +179,16 @@ fn content_type_rejects_malformed_and_unknown_parameters() {
     ];
     for input in malformed {
         assert_eq!(
-            input.parse::<StreamContentType>().err(),
             Some(ContentTypeError::Malformed),
+            input.parse::<StreamContentType>().err(),
             "not `type/subtype [; charset=token]`: {input:?}"
         );
     }
     assert_eq!(
+        Some(ContentTypeError::UnsupportedParameter),
         "multipart/form-data; boundary=x"
             .parse::<StreamContentType>()
             .err(),
-        Some(ContentTypeError::UnsupportedParameter),
         "only the charset parameter is understood in version 1"
     );
 }
@@ -198,8 +198,8 @@ fn content_type_length_boundary_is_exact() {
     let subtype_length = CONTENT_TYPE_BYTES_MAX.saturating_sub("application/".len());
     let at_max = format!("application/{}", "a".repeat(subtype_length));
     assert_eq!(
-        at_max.parse::<StreamContentType>().err(),
         None,
+        at_max.parse::<StreamContentType>().err(),
         "a value at the bound is valid"
     );
     let over_max = format!(
@@ -207,8 +207,8 @@ fn content_type_length_boundary_is_exact() {
         "a".repeat(subtype_length.saturating_add(1))
     );
     assert_eq!(
-        over_max.parse::<StreamContentType>().err(),
         Some(ContentTypeError::OverMaxBytes),
+        over_max.parse::<StreamContentType>().err(),
         "one byte over the bound is rejected"
     );
 }
@@ -217,13 +217,13 @@ fn content_type_length_boundary_is_exact() {
 fn content_type_bound_covers_its_canonical_spelling() {
     let source = format!("a/{};charset=x", "b".repeat(244));
     assert_eq!(
-        source.len(),
         CONTENT_TYPE_BYTES_MAX,
+        source.len(),
         "the regression input reaches the request bound exactly"
     );
     assert_eq!(
-        source.parse::<StreamContentType>(),
         Err(ContentTypeError::OverMaxBytes),
+        source.parse::<StreamContentType>(),
         "normalizing parameter whitespace must not manufacture an over-bound domain value"
     );
 }
@@ -257,14 +257,14 @@ proptest! {
 #[test]
 fn ttl_spec_anchors_from_section_5_1() {
     assert_eq!(
-        "3600".parse::<StreamTtl>().map(|ttl| ttl.seconds().get()),
         Ok(3600),
+        "3600".parse::<StreamTtl>().map(|ttl| ttl.seconds().get()),
         "§5.1: `3600` is the valid example"
     );
     for invalid in ["+3600", "03600", "3600.0", "3.6e3"] {
         assert_eq!(
-            invalid.parse::<StreamTtl>(),
             Err(StreamTtlError::Malformed),
+            invalid.parse::<StreamTtl>(),
             "§5.1 lists {invalid:?} as invalid"
         );
     }
@@ -273,26 +273,26 @@ fn ttl_spec_anchors_from_section_5_1() {
 #[test]
 fn ttl_value_boundaries_are_exact() {
     assert_eq!(
-        "0".parse::<StreamTtl>(),
         Err(StreamTtlError::Zero),
+        "0".parse::<StreamTtl>(),
         "a zero idle window is dead on arrival and always a client bug"
     );
     assert_eq!(
-        "1".parse::<StreamTtl>().map(|ttl| ttl.seconds().get()),
         Ok(1),
+        "1".parse::<StreamTtl>().map(|ttl| ttl.seconds().get()),
         "one second is the smallest window"
     );
     assert_eq!(
+        Ok(u64::MAX),
         u64::MAX
             .to_string()
             .parse::<StreamTtl>()
             .map(|ttl| ttl.seconds().get()),
-        Ok(u64::MAX),
         "the representable maximum parses"
     );
     assert_eq!(
-        "18446744073709551616".parse::<StreamTtl>(),
         Err(StreamTtlError::OverMax),
+        "18446744073709551616".parse::<StreamTtl>(),
         "one past u64::MAX is rejected, never wrapped"
     );
 }
@@ -353,8 +353,8 @@ fn expires_at_rejects_non_instants() {
     ];
     for input in non_instants {
         assert_eq!(
-            input.parse::<ExpiresAt>(),
             Err(ExpiresAtError),
+            input.parse::<ExpiresAt>(),
             "not an RFC 3339 instant: {input:?}"
         );
     }
@@ -369,13 +369,13 @@ fn expires_at_nanosecond_range_is_exact() -> Result<(), Box<dyn std::error::Erro
         "nanosecond zero names the Unix epoch instant"
     );
     assert_eq!(
-        ExpiresAt::try_from(i128::MAX),
         Err(ExpiresAtRangeError),
+        ExpiresAt::try_from(i128::MAX),
         "a count above the instant range is rejected"
     );
     assert_eq!(
-        ExpiresAt::try_from(i128::MIN),
         Err(ExpiresAtRangeError),
+        ExpiresAt::try_from(i128::MIN),
         "a count below the instant range is rejected"
     );
     Ok(())
@@ -417,23 +417,23 @@ fn expiry_policy_enumerates_header_combinations() -> Result<(), Box<dyn std::err
     let ttl: StreamTtl = "60".parse()?;
     let expires_at: ExpiresAt = "2030-01-01T00:00:00Z".parse()?;
     assert_eq!(
-        ExpiryPolicy::try_from((None::<StreamTtl>, None::<ExpiresAt>)),
         Ok(ExpiryPolicy::None),
+        ExpiryPolicy::try_from((None::<StreamTtl>, None::<ExpiresAt>)),
         "no expiry headers means the stream never expires"
     );
     assert_eq!(
-        ExpiryPolicy::try_from((Some(ttl), None)),
         Ok(ExpiryPolicy::SlidingTtl(ttl)),
+        ExpiryPolicy::try_from((Some(ttl), None)),
         "Stream-TTL alone selects the sliding window"
     );
     assert_eq!(
-        ExpiryPolicy::try_from((None, Some(expires_at))),
         Ok(ExpiryPolicy::AbsoluteExpiry(expires_at)),
+        ExpiryPolicy::try_from((None, Some(expires_at))),
         "Stream-Expires-At alone selects the absolute deadline"
     );
     assert_eq!(
-        ExpiryPolicy::try_from((Some(ttl), Some(expires_at))),
         Err(ExpiryPolicyConflict),
+        ExpiryPolicy::try_from((Some(ttl), Some(expires_at))),
         "§5.1: both headers together are rejected"
     );
     Ok(())
@@ -442,13 +442,13 @@ fn expiry_policy_enumerates_header_combinations() -> Result<(), Box<dyn std::err
 #[test]
 fn lifecycle_close_is_monotonic_and_idempotent() {
     assert_eq!(
-        StreamLifecycle::Open.close(),
         StreamLifecycle::Closed,
+        StreamLifecycle::Open.close(),
         "closing an open stream closes it"
     );
     assert_eq!(
-        StreamLifecycle::Closed.close(),
         StreamLifecycle::Closed,
+        StreamLifecycle::Closed.close(),
         "§4.1: closing a closed stream is idempotent success"
     );
     assert!(

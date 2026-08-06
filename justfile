@@ -56,4 +56,4 @@ feature-matrix:
 supply-chain: deny unused-deps feature-matrix
 
 
-ci: check test-ci doctest docs supply-chain
+ci: check test-ci doctest docs supply-chain dylint

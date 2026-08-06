@@ -219,6 +219,141 @@ mod tests {
 
     use super::*;
 
+    const DEADLINE_NANOS: u64 = 100;
+    const SHORT_OF_DEADLINE_NANOS: u64 = 99;
+    const PASSED_DEADLINE_NANOS: u64 = 10;
+    const REACHED_DEADLINE_NANOS: u64 = 20;
+    const BEYOND_DEADLINE_NANOS: u64 = 30;
+    const START_NANOS: u128 = 10;
+    const ADVANCE_NANOS: u64 = 5;
+    const AFTER_ADVANCE_NANOS: u128 = 15;
+
+    #[test]
+    fn manual_sleep_completes_only_when_advance_reaches_the_deadline() {
+        let clock = ManualClock::new(Timestamp::UNIX_EPOCH);
+        let mut sleep = clock.sleep(Duration::from_nanos(DEADLINE_NANOS));
+        let recorder = RecordingWake::new();
+
+        assert!(
+            poll_with(&mut sleep, &recorder).is_pending(),
+            "a sleep must be pending before its deadline"
+        );
+
+        clock.advance(Duration::from_nanos(SHORT_OF_DEADLINE_NANOS));
+        assert!(
+            !recorder.was_woken(),
+            "an advance short of the deadline must not wake the sleeper"
+        );
+        assert!(
+            poll_with(&mut sleep, &recorder).is_pending(),
+            "a sleep must stay pending short of its deadline"
+        );
+
+        clock.advance(Duration::from_nanos(1));
+        assert!(
+            recorder.was_woken(),
+            "an advance onto the deadline must wake the sleeper"
+        );
+        assert!(
+            poll_with(&mut sleep, &recorder).is_ready(),
+            "a sleep must complete once its deadline is reached"
+        );
+    }
+
+    #[test]
+    fn manual_sleep_with_zero_duration_is_immediately_ready() {
+        let clock = ManualClock::new(Timestamp::UNIX_EPOCH);
+        let mut sleep = clock.sleep(Duration::ZERO);
+        let recorder = RecordingWake::new();
+
+        assert!(
+            poll_with(&mut sleep, &recorder).is_ready(),
+            "a zero-duration sleep must complete on the first poll"
+        );
+    }
+
+    #[test]
+    fn one_advance_wakes_exactly_the_sleepers_it_reaches() {
+        let clock = ManualClock::new(Timestamp::UNIX_EPOCH);
+        let passed = RecordingWake::new();
+        let reached = RecordingWake::new();
+        let beyond = RecordingWake::new();
+        let mut sleep_passed = clock.sleep(Duration::from_nanos(PASSED_DEADLINE_NANOS));
+        let mut sleep_reached = clock.sleep(Duration::from_nanos(REACHED_DEADLINE_NANOS));
+        let mut sleep_beyond = clock.sleep(Duration::from_nanos(BEYOND_DEADLINE_NANOS));
+        for (sleep, recorder) in [
+            (&mut sleep_passed, &passed),
+            (&mut sleep_reached, &reached),
+            (&mut sleep_beyond, &beyond),
+        ] {
+            assert!(
+                poll_with(sleep, recorder).is_pending(),
+                "every sleep must be pending before the clock advances"
+            );
+        }
+
+        clock.advance(Duration::from_nanos(REACHED_DEADLINE_NANOS));
+
+        assert!(
+            passed.was_woken(),
+            "a deadline the advance stepped past must wake"
+        );
+        assert!(
+            reached.was_woken(),
+            "a deadline the advance landed on must wake"
+        );
+        assert!(
+            !beyond.was_woken(),
+            "a deadline beyond the advance must not wake"
+        );
+        assert_eq!(
+            1,
+            sleeper_count(&clock),
+            "advance must deregister every sleeper it woke and keep the rest"
+        );
+    }
+
+    #[test]
+    fn a_sleep_dropped_before_its_deadline_leaves_no_registration() {
+        let clock = ManualClock::new(Timestamp::UNIX_EPOCH);
+        let sleep = clock.sleep(Duration::from_nanos(DEADLINE_NANOS));
+        assert_eq!(
+            1,
+            sleeper_count(&clock),
+            "an outstanding sleep holds one registration"
+        );
+
+        drop(sleep);
+
+        assert_eq!(
+            0,
+            sleeper_count(&clock),
+            "an abandoned sleep must release its registration, or a long run \
+             accumulates sleepers no advance will ever reach"
+        );
+    }
+
+    #[test]
+    fn manual_advance_moves_the_reported_time() {
+        let clock = ManualClock::new(Timestamp::from_unix_nanos(START_NANOS));
+        clock.advance(Duration::from_nanos(ADVANCE_NANOS));
+        assert_eq!(
+            Timestamp::from_unix_nanos(AFTER_ADVANCE_NANOS),
+            clock.now(),
+            "advance must move the reported time by exactly the given duration"
+        );
+    }
+
+    #[test]
+    fn timestamp_add_saturates_at_the_upper_bound() {
+        let upper_bound = Timestamp::from_unix_nanos(u128::MAX);
+        assert_eq!(
+            upper_bound,
+            upper_bound.saturating_add(Duration::from_nanos(1)),
+            "adding past the representable range must saturate, not wrap"
+        );
+    }
+
     #[expect(
         clippy::disallowed_types,
         reason = "test-only wake flag; the woken test thread is the single writer"
@@ -261,131 +396,5 @@ mod tests {
             .expect("manual clock lock poisoned")
             .sleepers
             .len()
-    }
-
-    #[test]
-    fn manual_sleep_completes_only_when_advance_reaches_the_deadline() {
-        let clock = ManualClock::new(Timestamp::UNIX_EPOCH);
-        let mut sleep = clock.sleep(Duration::from_nanos(100));
-        let recorder = RecordingWake::new();
-
-        assert!(
-            poll_with(&mut sleep, &recorder).is_pending(),
-            "a sleep must be pending before its deadline"
-        );
-
-        clock.advance(Duration::from_nanos(99));
-        assert!(
-            !recorder.was_woken(),
-            "an advance short of the deadline must not wake the sleeper"
-        );
-        assert!(
-            poll_with(&mut sleep, &recorder).is_pending(),
-            "a sleep must stay pending short of its deadline"
-        );
-
-        clock.advance(Duration::from_nanos(1));
-        assert!(
-            recorder.was_woken(),
-            "an advance onto the deadline must wake the sleeper"
-        );
-        assert!(
-            poll_with(&mut sleep, &recorder).is_ready(),
-            "a sleep must complete once its deadline is reached"
-        );
-    }
-
-    #[test]
-    fn manual_sleep_with_zero_duration_is_immediately_ready() {
-        let clock = ManualClock::new(Timestamp::UNIX_EPOCH);
-        let mut sleep = clock.sleep(Duration::ZERO);
-        let recorder = RecordingWake::new();
-
-        assert!(
-            poll_with(&mut sleep, &recorder).is_ready(),
-            "a zero-duration sleep must complete on the first poll"
-        );
-    }
-
-    #[test]
-    fn one_advance_wakes_exactly_the_sleepers_it_reaches() {
-        let clock = ManualClock::new(Timestamp::UNIX_EPOCH);
-        let passed = RecordingWake::new();
-        let reached = RecordingWake::new();
-        let beyond = RecordingWake::new();
-        let mut sleep_passed = clock.sleep(Duration::from_nanos(10));
-        let mut sleep_reached = clock.sleep(Duration::from_nanos(20));
-        let mut sleep_beyond = clock.sleep(Duration::from_nanos(30));
-        for (sleep, recorder) in [
-            (&mut sleep_passed, &passed),
-            (&mut sleep_reached, &reached),
-            (&mut sleep_beyond, &beyond),
-        ] {
-            assert!(
-                poll_with(sleep, recorder).is_pending(),
-                "every sleep must be pending before the clock advances"
-            );
-        }
-
-        clock.advance(Duration::from_nanos(20));
-
-        assert!(
-            passed.was_woken(),
-            "a deadline the advance stepped past must wake"
-        );
-        assert!(
-            reached.was_woken(),
-            "a deadline the advance landed on must wake"
-        );
-        assert!(
-            !beyond.was_woken(),
-            "a deadline beyond the advance must not wake"
-        );
-        assert_eq!(
-            sleeper_count(&clock),
-            1,
-            "advance must deregister every sleeper it woke and keep the rest"
-        );
-    }
-
-    #[test]
-    fn a_sleep_dropped_before_its_deadline_leaves_no_registration() {
-        let clock = ManualClock::new(Timestamp::UNIX_EPOCH);
-        let sleep = clock.sleep(Duration::from_nanos(100));
-        assert_eq!(
-            sleeper_count(&clock),
-            1,
-            "an outstanding sleep holds one registration"
-        );
-
-        drop(sleep);
-
-        assert_eq!(
-            sleeper_count(&clock),
-            0,
-            "an abandoned sleep must release its registration, or a long run \
-             accumulates sleepers no advance will ever reach"
-        );
-    }
-
-    #[test]
-    fn manual_advance_moves_the_reported_time() {
-        let clock = ManualClock::new(Timestamp::from_unix_nanos(10));
-        clock.advance(Duration::from_nanos(5));
-        assert_eq!(
-            clock.now(),
-            Timestamp::from_unix_nanos(15),
-            "advance must move the reported time by exactly the given duration"
-        );
-    }
-
-    #[test]
-    fn timestamp_add_saturates_at_the_upper_bound() {
-        let upper_bound = Timestamp::from_unix_nanos(u128::MAX);
-        assert_eq!(
-            upper_bound.saturating_add(Duration::from_nanos(1)),
-            upper_bound,
-            "adding past the representable range must saturate, not wrap"
-        );
     }
 }

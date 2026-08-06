@@ -108,10 +108,19 @@ mod tests {
 
     use super::*;
 
+    /// Shared fixture seed for the deterministic stream tests below.
+    const FIXTURE_SEED: u64 = 42;
+
+    /// First two draws of the root stream for [`FIXTURE_SEED`].
+    const FIXTURE_ROOT_DRAWS: [u64; 2] = [9_713_269_763_989_775_522, 10_011_513_049_433_592_189];
+
+    /// First draw of the `wal` child of [`FIXTURE_SEED`].
+    const FIXTURE_WAL_CHILD_DRAW: u64 = 10_677_131_651_932_318_252;
+
     #[test]
     fn equal_seeds_produce_identical_streams() {
-        let mut source_a = Entropy::from_seed(Seed::new(42));
-        let mut source_b = Entropy::from_seed(Seed::new(42));
+        let mut source_a = Entropy::from_seed(Seed::new(FIXTURE_SEED));
+        let mut source_b = Entropy::from_seed(Seed::new(FIXTURE_SEED));
         for _ in 0u8..4u8 {
             assert_eq!(
                 source_a.rng().next_u64(),
@@ -123,7 +132,7 @@ mod tests {
 
     #[test]
     fn distinct_fork_labels_produce_distinct_streams() {
-        let mut root = Entropy::from_seed(Seed::new(42));
+        let mut root = Entropy::from_seed(Seed::new(FIXTURE_SEED));
         let mut wal_stream = root.fork("wal");
         let mut id_stream = root.fork("ids");
         assert_ne!(
@@ -135,8 +144,8 @@ mod tests {
 
     #[test]
     fn forks_do_not_depend_on_draws_made_before_the_fork() {
-        let mut drained_root = Entropy::from_seed(Seed::new(42));
-        let mut fresh_root = Entropy::from_seed(Seed::new(42));
+        let mut drained_root = Entropy::from_seed(Seed::new(FIXTURE_SEED));
+        let mut fresh_root = Entropy::from_seed(Seed::new(FIXTURE_SEED));
         let _skipped = drained_root.rng().next_u64();
 
         let mut child_of_drained = drained_root.fork("wal");
@@ -153,19 +162,19 @@ mod tests {
     /// these numbers may change only when the recorded seeds are also retired.
     #[test]
     fn a_recorded_seed_replays_the_same_draws() {
-        let mut root = Entropy::from_seed(Seed::new(42));
+        let mut root = Entropy::from_seed(Seed::new(FIXTURE_SEED));
         let first = root.rng().next_u64();
         let second = root.rng().next_u64();
         assert_eq!(
+            FIXTURE_ROOT_DRAWS,
             [first, second],
-            [9_713_269_763_989_775_522, 10_011_513_049_433_592_189],
             "the root stream for seed 42 must not move between builds"
         );
 
         let mut child = root.fork("wal");
         assert_eq!(
+            FIXTURE_WAL_CHILD_DRAW,
             child.rng().next_u64(),
-            10_677_131_651_932_318_252,
             "the `wal` child stream of seed 42 must not move between builds"
         );
     }
@@ -173,7 +182,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "fork label reused")]
     fn reusing_a_fork_label_panics() {
-        let mut root = Entropy::from_seed(Seed::new(42));
+        let mut root = Entropy::from_seed(Seed::new(FIXTURE_SEED));
         drop(root.fork("wal"));
         drop(root.fork("wal"));
     }

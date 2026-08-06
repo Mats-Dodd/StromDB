@@ -11,44 +11,73 @@ use crate::{
     WalReplayPoint,
 };
 
+pub fn ledger_rows() -> impl Strategy<Value = Vec<(StreamUid, LedgerCell)>> {
+    proptest::collection::vec((stream_uid(), ledger_cell()), 1..=16).prop_map(|rows| {
+        rows.into_iter()
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .collect()
+    })
+}
+
+pub fn directory_rows() -> impl Strategy<Value = Vec<(DirectoryKey, DirectoryEntry)>> {
+    proptest::collection::vec((directory_key(), directory_entry()), 1..=16).prop_map(|rows| {
+        rows.into_iter()
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .collect()
+    })
+}
+
+/// # Panics
+///
+/// Panics if a generated fact vector within `1..=16` violates the published
+/// WAL fact-count bound.
+pub fn wal_object() -> impl Strategy<Value = WalObject> {
+    (
+        partition_id(),
+        proptest::collection::vec(operation_fact(), 1..=16),
+        batch_id(),
+        owner_token(),
+    )
+        .prop_flat_map(|(partition, facts, batch, owner)| {
+            let facts = WalFacts::try_from(facts)
+                .expect("the generated fact count is inside the WAL bound");
+            prop_oneof![
+                Just(WalObject::new(partition, batch, owner, WalBody::Run(facts))),
+                Just(WalObject::new(partition, batch, owner, WalBody::Fence)),
+            ]
+        })
+}
+
+pub fn seal() -> impl Strategy<Value = Seal> {
+    (
+        partition_id(),
+        proptest::option::of((batch_id(), owner_token())),
+        seal_generation(),
+    )
+        .prop_filter_map(
+            "canonical empty trees always form a V2 Seal",
+            |(partition, replay, generation)| {
+                let replay = match replay {
+                    Some((batch, owner)) => WalReplayPoint::Through { batch, owner },
+                    None => WalReplayPoint::Genesis,
+                };
+                Seal::new(
+                    partition,
+                    generation,
+                    replay,
+                    TreeVersion::empty(),
+                    TreeVersion::empty(),
+                )
+                .ok()
+            },
+        )
+}
+
 pub fn partition_id() -> impl Strategy<Value = PartitionId> {
     proptest::array::uniform16(proptest::num::u8::ANY)
         .prop_filter_map("nil is reserved", |bytes| PartitionId::try_from(bytes).ok())
-}
-
-/// # Panics
-///
-/// Panics if a value drawn from one upwards stops constructing a nonzero value.
-pub fn seal_generation() -> impl Strategy<Value = SealGeneration> {
-    (1u64..).prop_map(|raw| {
-        SealGeneration::from(NonZeroU64::new(raw).expect("the generation strategy starts at one"))
-    })
-}
-
-/// # Panics
-///
-/// Panics if a value drawn from one upwards stops constructing a nonzero value.
-pub fn batch_id() -> impl Strategy<Value = BatchId> {
-    (1u64..).prop_map(|raw| {
-        BatchId::from(NonZeroU64::new(raw).expect("the batch strategy starts at one"))
-    })
-}
-
-pub fn owner_token() -> impl Strategy<Value = OwnerToken> {
-    seal_generation().prop_map(OwnerToken::from)
-}
-
-/// # Panics
-///
-/// Panics if a value drawn from one upwards stops constructing a nonzero value.
-pub fn stream_uid() -> impl Strategy<Value = StreamUid> {
-    (1u64..).prop_map(|raw| {
-        StreamUid::from(NonZeroU64::new(raw).expect("the uid strategy starts at one"))
-    })
-}
-
-pub fn directory_key() -> impl Strategy<Value = DirectoryKey> {
-    strom_domain::strategy::stream_id().prop_map(|stream_id| DirectoryKey::from(&stream_id))
 }
 
 pub fn operation_fact() -> impl Strategy<Value = OperationFact> {
@@ -74,50 +103,28 @@ pub fn operation_fact() -> impl Strategy<Value = OperationFact> {
     ]
 }
 
-/// # Panics
-///
-/// Panics if a generated fact vector within `1..=16` violates the published
-/// WAL fact-count bound.
-pub fn wal_object() -> impl Strategy<Value = WalObject> {
-    (
-        partition_id(),
-        batch_id(),
-        owner_token(),
-        proptest::collection::vec(operation_fact(), 1..=16),
-    )
-        .prop_flat_map(|(partition, batch, owner, facts)| {
-            let facts = WalFacts::try_from(facts)
-                .expect("the generated fact count is inside the WAL bound");
-            prop_oneof![
-                Just(WalObject::new(partition, batch, owner, WalBody::Run(facts))),
-                Just(WalObject::new(partition, batch, owner, WalBody::Fence)),
-            ]
-        })
+pub fn directory_key() -> impl Strategy<Value = DirectoryKey> {
+    strom_domain::strategy::stream_id().prop_map(|stream_id| DirectoryKey::from(&stream_id))
 }
 
-pub fn seal() -> impl Strategy<Value = Seal> {
-    (
-        partition_id(),
-        seal_generation(),
-        proptest::option::of((batch_id(), owner_token())),
-    )
-        .prop_filter_map(
-            "canonical empty trees always form a V2 Seal",
-            |(partition, generation, replay)| {
-                let replay = match replay {
-                    Some((batch, owner)) => WalReplayPoint::Through { batch, owner },
-                    None => WalReplayPoint::Genesis,
-                };
-                Seal::new(
-                    partition,
-                    generation,
-                    replay,
-                    TreeVersion::empty(),
-                    TreeVersion::empty(),
-                )
-                .ok()
-            },
-        )
+pub fn directory_entry() -> impl Strategy<Value = DirectoryEntry> {
+    prop_oneof![
+        stream_uid().prop_map(DirectoryEntry::Live),
+        stream_uid().prop_map(DirectoryEntry::Tombstone),
+    ]
+}
+
+pub fn stream_uid() -> impl Strategy<Value = StreamUid> {
+    (1u64..).prop_map(|raw| {
+        StreamUid::from(NonZeroU64::new(raw).expect("the uid strategy starts at one"))
+    })
+}
+
+pub fn ledger_cell() -> impl Strategy<Value = LedgerCell> {
+    prop_oneof![
+        stream_record().prop_map(LedgerCell::Value),
+        Just(LedgerCell::Delete)
+    ]
 }
 
 pub fn stream_record() -> impl Strategy<Value = StreamRecord> {
@@ -132,34 +139,24 @@ pub fn stream_record() -> impl Strategy<Value = StreamRecord> {
         })
 }
 
-pub fn directory_entry() -> impl Strategy<Value = DirectoryEntry> {
-    prop_oneof![
-        stream_uid().prop_map(DirectoryEntry::Live),
-        stream_uid().prop_map(DirectoryEntry::Tombstone),
-    ]
-}
-
-pub fn ledger_cell() -> impl Strategy<Value = LedgerCell> {
-    prop_oneof![
-        stream_record().prop_map(LedgerCell::Value),
-        Just(LedgerCell::Delete)
-    ]
-}
-
-pub fn directory_rows() -> impl Strategy<Value = Vec<(DirectoryKey, DirectoryEntry)>> {
-    proptest::collection::vec((directory_key(), directory_entry()), 1..=16).prop_map(|rows| {
-        rows.into_iter()
-            .collect::<BTreeMap<_, _>>()
-            .into_iter()
-            .collect()
+/// # Panics
+///
+/// Panics if a value drawn from one upwards stops constructing a nonzero value.
+pub fn batch_id() -> impl Strategy<Value = BatchId> {
+    (1u64..).prop_map(|raw| {
+        BatchId::from(NonZeroU64::new(raw).expect("the batch strategy starts at one"))
     })
 }
 
-pub fn ledger_rows() -> impl Strategy<Value = Vec<(StreamUid, LedgerCell)>> {
-    proptest::collection::vec((stream_uid(), ledger_cell()), 1..=16).prop_map(|rows| {
-        rows.into_iter()
-            .collect::<BTreeMap<_, _>>()
-            .into_iter()
-            .collect()
+pub fn owner_token() -> impl Strategy<Value = OwnerToken> {
+    seal_generation().prop_map(OwnerToken::from)
+}
+
+/// # Panics
+///
+/// Panics if a value drawn from one upwards stops constructing a nonzero value.
+pub fn seal_generation() -> impl Strategy<Value = SealGeneration> {
+    (1u64..).prop_map(|raw| {
+        SealGeneration::from(NonZeroU64::new(raw).expect("the generation strategy starts at one"))
     })
 }

@@ -327,9 +327,9 @@ semantically invalid objects under a Courant-owned prefix are durable
 contradictions, not candidates to ignore. rkyv locates its root at the end of
 the supplied slice, so unreachable leading bytes are tolerated inside the
 complete-object bound but are never emitted. The exact rkyv release and
-format-control features are the current archive contract;
-[`rkyv.md`](rkyv.md) records the implemented boundary. The `v1` path segment
-remains a key-spelling namespace and is not an archive version.
+format-control features are the current archive contract.
+The `v1` path segment remains a key-spelling namespace and is not an archive
+version.
 
 ## permanent seals
 

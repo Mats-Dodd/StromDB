@@ -41,6 +41,14 @@ pub fn stream_content_type() -> impl Strategy<Value = StreamContentType> {
     })
 }
 
+pub fn expiry_policy() -> impl Strategy<Value = ExpiryPolicy> {
+    prop_oneof![
+        Just(ExpiryPolicy::None),
+        stream_ttl().prop_map(ExpiryPolicy::SlidingTtl),
+        expires_at().prop_map(ExpiryPolicy::AbsoluteExpiry),
+    ]
+}
+
 /// # Panics
 ///
 /// Panics if a second count drawn from one upwards stops being nonzero.
@@ -58,14 +66,6 @@ pub fn expires_at() -> impl Strategy<Value = ExpiresAt> {
         ExpiresAt::try_from(unix_nanoseconds)
             .expect("the range spans exactly the representable instants")
     })
-}
-
-pub fn expiry_policy() -> impl Strategy<Value = ExpiryPolicy> {
-    prop_oneof![
-        Just(ExpiryPolicy::None),
-        stream_ttl().prop_map(ExpiryPolicy::SlidingTtl),
-        expires_at().prop_map(ExpiryPolicy::AbsoluteExpiry),
-    ]
 }
 
 pub fn stream_lifecycle() -> impl Strategy<Value = StreamLifecycle> {

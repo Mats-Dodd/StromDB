@@ -135,8 +135,8 @@ mod tests {
         };
         let bytes = archive::encode(&root, SST_OBJECT_BYTES_MAX_USIZE)?;
         assert_eq!(
-            decode_ledger_sst(&expected, &bytes),
-            Err(SstDecodeError::InvalidBody)
+            Err(SstDecodeError::InvalidBody),
+            decode_ledger_sst(&expected, &bytes)
         );
         Ok(())
     }

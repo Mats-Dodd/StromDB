@@ -170,6 +170,8 @@ mod tests {
     use super::*;
     use crate::archive::encode;
 
+    const FIXTURE_EXPIRY_UNIX_NANOSECONDS: i128 = 1_725_000_000_123_456_789;
+
     #[derive(Archive, Serialize)]
     struct ProtocolFields {
         #[rkyv(with = ContentTypeAsString)]
@@ -187,7 +189,7 @@ mod tests {
                 .parse()
                 .expect("the fixture content type is canonical"),
             expiry: ExpiryPolicy::AbsoluteExpiry(
-                ExpiresAt::try_from(1_725_000_000_123_456_789i128)
+                ExpiresAt::try_from(FIXTURE_EXPIRY_UNIX_NANOSECONDS)
                     .expect("the fixture expiry is representable"),
             ),
             lifecycle: StreamLifecycle::Closed,
@@ -222,8 +224,8 @@ mod tests {
             .expect("zero is structurally valid as an archived u64");
 
         assert_eq!(
-            ExpiryPolicy::try_from(archived),
             Err(DecodeError::InvalidBody),
+            ExpiryPolicy::try_from(archived),
             "checked archive access does not replace protocol-domain validation"
         );
     }

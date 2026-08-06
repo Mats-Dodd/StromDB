@@ -105,11 +105,11 @@ mod tests {
         misaligned.extend_from_slice(&encoded);
 
         assert_eq!(
+            Ok(seal.clone()),
             decode_seal(
                 &seal.identity(),
                 misaligned.get(1..).ok_or("misaligned archive exists")?,
-            ),
-            Ok(seal)
+            )
         );
         Ok(())
     }
@@ -120,11 +120,11 @@ mod tests {
         let encoded = encode_seal(&seal)?;
         for length in 0..encoded.len() {
             assert_eq!(
+                Err(DecodeError::MalformedArchive),
                 decode_seal(
                     &seal.identity(),
                     encoded.get(..length).ok_or("truncated archive exists")?,
                 ),
-                Err(DecodeError::MalformedArchive),
                 "truncation at byte {length} must fail closed"
             );
         }
@@ -136,11 +136,11 @@ mod tests {
         let seal = valid_seal()?;
         let bytes = vec![0; SEAL_ENCODED_BYTES_MAX.saturating_add(1)];
         assert_eq!(
-            decode_seal(&seal.identity(), &bytes),
             Err(DecodeError::EncodedBytesOverMax {
                 bytes_max: SEAL_ENCODED_BYTES_MAX,
                 bytes_actual: bytes.len(),
-            })
+            }),
+            decode_seal(&seal.identity(), &bytes)
         );
         Ok(())
     }
@@ -152,8 +152,8 @@ mod tests {
         let wrong_identity =
             SealIdentity::new(seal.identity().partition(), SealGeneration::try_from(2)?);
         assert_eq!(
-            decode_seal(&wrong_identity, &encode_seal(&seal)?),
-            Err(DecodeError::IdentityMismatch)
+            Err(DecodeError::IdentityMismatch),
+            decode_seal(&wrong_identity, &encode_seal(&seal)?)
         );
         Ok(())
     }
@@ -172,8 +172,8 @@ mod tests {
         let bytes = encode_seal(&seal)?;
 
         assert_eq!(
-            decode_seal(&seal.identity(), &bytes),
-            Err(DecodeError::InvalidBody)
+            Err(DecodeError::InvalidBody),
+            decode_seal(&seal.identity(), &bytes)
         );
         Ok(())
     }

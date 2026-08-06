@@ -193,8 +193,8 @@ mod tests {
             "the final lifetime occupancy still allocates its dense successor"
         );
         assert_eq!(
-            decide_successor_uid(PARTITION_PATH_OCCUPANCIES_MAX_V2),
             Err(FoldContradiction::PathCapacityExhausted),
+            decide_successor_uid(PARTITION_PATH_OCCUPANCIES_MAX_V2),
             "a full partition refuses a new path before allocating a uid"
         );
         Ok(())
