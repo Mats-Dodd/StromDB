@@ -1,4 +1,4 @@
-//! Partition identity and canonical UUID spelling.
+//! Genesis-born partition identity and canonical UUID spelling.
 
 use std::fmt;
 use std::str::FromStr;

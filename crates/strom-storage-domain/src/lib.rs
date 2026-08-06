@@ -32,8 +32,7 @@ pub use ledger::{LedgerCell, StreamRecord};
 pub use owner::OwnerToken;
 pub use partition::{PartitionId, PartitionIdError};
 pub use seal::{
-    Seal, SealError, SealIdentity, SortedRun, TableRef, TreeVersion, WalReplayPoint, decode_seal,
-    encode_seal,
+    Seal, SealError, SortedRun, TableRef, TreeVersion, WalReplayPoint, decode_seal, encode_seal,
 };
 pub use spelling::{KeySpellingError, SealKey, SealNamespace, TableKey, WalKey, WalNamespace};
 pub use sst::{
@@ -41,6 +40,4 @@ pub use sst::{
     encode_ledger_sst,
 };
 pub use table::{AttemptId, FreshIdentity, StoreKind, TableIdentityError, TableObjectId};
-pub use wal::{
-    OperationFact, WalBody, WalFacts, WalFactsError, WalIdentity, WalObject, decode_wal, encode_wal,
-};
+pub use wal::{OperationFact, WalBody, WalFacts, WalFactsError, WalObject, decode_wal, encode_wal};

@@ -1,8 +1,9 @@
 //! Partition startup, immutable views, bounded commands, and graceful drain.
 
+use strom_common::Entropy;
 use strom_object_store::ObjectStoreAdapter;
 use strom_storage_domain::{
-    DirectoryEntry, DirectoryKey, PartitionId, SealIdentity, StreamRecord, StreamUid,
+    DirectoryEntry, DirectoryKey, PartitionId, SealGeneration, StreamRecord, StreamUid,
     WalReplayPoint,
 };
 use tokio::sync::{mpsc, oneshot, watch};
@@ -14,23 +15,27 @@ use crate::{AdmissionRefusal, BootstrapExit, Forest, StreamCommand, StreamReply,
 
 #[derive(Debug, Clone)]
 pub struct PublishedView {
-    seal: SealIdentity,
+    generation: SealGeneration,
     replay: WalReplayPoint,
     forest: Forest,
 }
 
 impl PublishedView {
-    pub(crate) const fn new(seal: SealIdentity, replay: WalReplayPoint, forest: Forest) -> Self {
+    pub(crate) const fn new(
+        generation: SealGeneration,
+        replay: WalReplayPoint,
+        forest: Forest,
+    ) -> Self {
         Self {
-            seal,
+            generation,
             replay,
             forest,
         }
     }
 
     #[must_use]
-    pub const fn seal(&self) -> SealIdentity {
-        self.seal
+    pub const fn generation(&self) -> SealGeneration {
+        self.generation
     }
 
     #[must_use]
@@ -61,18 +66,20 @@ impl Partition {
     /// internally consistent, directly claimed, fenced, replayed, and current.
     pub async fn start(
         adapter: ObjectStoreAdapter,
-        partition: PartitionId,
+        entropy: Entropy,
     ) -> Result<PartitionHandle, BootstrapExit> {
-        let ready = bootstrap(adapter.clone(), partition).await?;
+        let ready = bootstrap(adapter.clone(), entropy).await?;
+        let partition = ready.partition();
         let initial = PublishedView::new(
-            ready.claim().identity(),
+            ready.claim().generation(),
             ready.replay(),
             ready.forest().clone(),
         );
         let (view_sender, view) = watch::channel(initial);
         let (commands, ingress) = mpsc::channel(WRITER_INGRESS_COMMANDS_MAX);
-        let writer = spawn_writer(adapter, partition, ready, ingress, view_sender);
+        let writer = spawn_writer(adapter, ready, ingress, view_sender);
         Ok(PartitionHandle {
+            partition,
             commands,
             view,
             writer,
@@ -82,12 +89,18 @@ impl Partition {
 
 #[derive(Debug)]
 pub struct PartitionHandle {
+    partition: PartitionId,
     commands: mpsc::Sender<CommandEnvelope>,
     view: watch::Receiver<PublishedView>,
     writer: JoinHandle<WriterExit>,
 }
 
 impl PartitionHandle {
+    #[must_use]
+    pub const fn partition_id(&self) -> PartitionId {
+        self.partition
+    }
+
     /// Acquire an immutable view while this partition remains Ready.
     ///
     /// # Errors
@@ -135,6 +148,7 @@ impl PartitionHandle {
     /// in-process invariant.
     pub async fn shutdown(self) -> WriterExit {
         let Self {
+            partition: _,
             commands,
             view,
             writer,
@@ -170,9 +184,8 @@ mod tests {
     async fn success_is_visible_before_reply_and_survives_reopen()
     -> Result<(), Box<dyn std::error::Error>> {
         let adapter = ObjectStoreAdapter::in_memory();
-        let partition = partition();
         let path = directory_key("events/a")?;
-        let handle = Partition::start(adapter.clone(), partition).await?;
+        let handle = Partition::start(adapter.clone(), crate::test_entropy()).await?;
         let reply = handle
             .command(StreamCommand::Create {
                 path: path.clone(),
@@ -191,7 +204,7 @@ mod tests {
         );
         assert_eq!(WriterExit::Shutdown, handle.shutdown().await);
 
-        let reopened = Partition::start(adapter, partition).await?;
+        let reopened = Partition::start(adapter, crate::test_entropy()).await?;
         assert_eq!(
             Some(DirectoryEntry::Live(uid)),
             reopened.snapshot()?.resolve(&path),
@@ -205,9 +218,9 @@ mod tests {
     async fn duplicate_create_is_idempotent_and_consumes_no_second_wal_coordinate()
     -> Result<(), Box<dyn std::error::Error>> {
         let adapter = ObjectStoreAdapter::in_memory();
-        let partition = partition();
         let path = directory_key("events/dup")?;
-        let handle = Partition::start(adapter.clone(), partition).await?;
+        let handle = Partition::start(adapter.clone(), crate::test_entropy()).await?;
+        let partition_id = handle.partition_id();
         let first = handle
             .command(StreamCommand::Create {
                 path: path.clone(),
@@ -239,18 +252,13 @@ mod tests {
         let wal = WalStore::new(adapter);
         let first_run = BatchId::try_from(2)?;
         assert!(
-            wal.read_wal(strom_storage_domain::WalIdentity::new(partition, first_run))
-                .await?
-                .is_some(),
+            wal.read_wal(partition_id, first_run).await?.is_some(),
             "the original create occupies the first RUN coordinate"
         );
         assert!(
-            wal.read_wal(strom_storage_domain::WalIdentity::new(
-                partition,
-                first_run.successor()?
-            ))
-            .await?
-            .is_none(),
+            wal.read_wal(partition_id, first_run.successor()?)
+                .await?
+                .is_none(),
             "an idempotent create consumes no second WAL coordinate"
         );
         assert_eq!(WriterExit::Shutdown, handle.shutdown().await);
@@ -260,7 +268,8 @@ mod tests {
     #[tokio::test]
     async fn typed_refusal_does_not_change_the_published_view()
     -> Result<(), Box<dyn std::error::Error>> {
-        let handle = Partition::start(ObjectStoreAdapter::in_memory(), partition()).await?;
+        let handle =
+            Partition::start(ObjectStoreAdapter::in_memory(), crate::test_entropy()).await?;
         let missing = directory_key("events/missing")?;
         assert_eq!(
             Err(CommandError::Refused(AdmissionRefusal::PathNotLive)),
@@ -279,14 +288,14 @@ mod tests {
     async fn writer_exit_revokes_new_snapshot_acquisition() -> Result<(), Box<dyn std::error::Error>>
     {
         let adapter = ObjectStoreAdapter::in_memory();
-        let partition = partition();
-        let handle = Partition::start(adapter.clone(), partition).await?;
-        let seal = handle.snapshot()?.seal();
+        let handle = Partition::start(adapter.clone(), crate::test_entropy()).await?;
+        let partition_id = handle.partition_id();
+        let seal = handle.snapshot()?.generation();
         let batch = BatchId::try_from(2)?;
         let foreign = EncodedWal::new(&WalObject::new(
-            partition,
+            partition_id,
             batch,
-            OwnerToken::from(seal.generation().successor()?),
+            OwnerToken::from(seal.successor()?),
             WalBody::Fence,
         ))?;
         assert_eq!(
@@ -313,11 +322,5 @@ mod tests {
 
     fn directory_key(raw: &str) -> Result<DirectoryKey, Box<dyn std::error::Error>> {
         Ok(DirectoryKey::try_from(Box::<[u8]>::from(raw.as_bytes()))?)
-    }
-
-    fn partition() -> PartitionId {
-        "00112233-4455-6677-8899-aabbccddeeff"
-            .parse()
-            .expect("test partition is canonical")
     }
 }

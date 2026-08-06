@@ -34,8 +34,13 @@ impl WalObject {
     }
 
     #[must_use]
-    pub const fn identity(&self) -> WalIdentity {
-        WalIdentity::new(self.partition, self.batch)
+    pub const fn partition(&self) -> PartitionId {
+        self.partition
+    }
+
+    #[must_use]
+    pub const fn batch(&self) -> BatchId {
+        self.batch
     }
 
     #[must_use]
@@ -53,29 +58,6 @@ impl WalObject {
 pub enum WalBody {
     Run(WalFacts),
     Fence,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct WalIdentity {
-    partition: PartitionId,
-    batch: BatchId,
-}
-
-impl WalIdentity {
-    #[must_use]
-    pub const fn new(partition: PartitionId, batch: BatchId) -> Self {
-        Self { partition, batch }
-    }
-
-    #[must_use]
-    pub const fn partition(self) -> PartitionId {
-        self.partition
-    }
-
-    #[must_use]
-    pub const fn batch(self) -> BatchId {
-        self.batch
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]

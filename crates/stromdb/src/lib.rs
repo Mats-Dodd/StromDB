@@ -15,8 +15,7 @@
 //!
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! let store = Arc::new(stromdb::object_store::memory::InMemory::new());
-//! let partition: stromdb::PartitionId = "00112233-4455-6677-8899-aabbccddeeff".parse()?;
-//! let db = Db::open(store, partition).await?;
+//! let db = Db::open(store).await?;
 //!
 //! let id: stromdb::StreamId = "events/a".parse()?;
 //! assert_eq!(
@@ -47,6 +46,7 @@ pub use strom_storage_domain::PartitionId;
 use std::sync::Arc;
 
 use object_store::ObjectStore;
+use strom_common::{Entropy, Seed};
 use strom_object_store::ObjectStoreAdapter;
 use strom_storage_domain::{DirectoryEntry, DirectoryKey};
 use strom_storage_engine::{
@@ -71,15 +71,19 @@ impl Db {
     ///
     /// Returns [`OpenError`] unless the complete durable state is bounded,
     /// internally consistent, directly claimed, fenced, replayed, and current.
-    pub async fn open(
-        store: Arc<dyn ObjectStore>,
-        partition: PartitionId,
-    ) -> Result<Self, OpenError> {
+    pub async fn open(store: Arc<dyn ObjectStore>) -> Result<Self, OpenError> {
         let adapter = ObjectStoreAdapter::new(store);
-        match Partition::start(adapter, partition).await {
+        let entropy = Entropy::from_seed(Seed::from_os());
+        match Partition::start(adapter, entropy).await {
             Ok(handle) => Ok(Self { handle }),
             Err(exit) => Err(open_error(exit)),
         }
+    }
+
+    /// The genesis-born identity of the partition at this store root.
+    #[must_use]
+    pub const fn partition_id(&self) -> PartitionId {
+        self.handle.partition_id()
     }
 
     /// Create one stream at `id`, or confirm it already exists at the same configuration.

@@ -5,9 +5,9 @@ use proptest::prelude::*;
 use strom_domain::StreamId;
 use strom_storage_domain::{
     AttemptId, BatchId, CoordinateExhausted, DirectoryKey, FreshIdentity, KeySpellingError,
-    OperationFact, PartitionId, PartitionIdError, SealGeneration, SealIdentity, SealKey,
-    SealNamespace, StoreKind, StreamUid, TableKey, TableObjectId, WAL_RUN_FACTS_MAX, WalFacts,
-    WalFactsError, WalIdentity, WalKey, WalNamespace,
+    OperationFact, PartitionId, PartitionIdError, SealGeneration, SealKey, SealNamespace,
+    StoreKind, StreamUid, TableKey, TableObjectId, WAL_RUN_FACTS_MAX, WalFacts, WalFactsError,
+    WalKey, WalNamespace,
 };
 
 #[test]
@@ -85,12 +85,11 @@ fn wal_facts_crosses_both_count_boundaries() -> Result<(), Box<dyn std::error::E
 #[test]
 fn seal_and_wal_namespace_prefixes_have_independent_golden_vectors()
 -> Result<(), Box<dyn std::error::Error>> {
-    const SEAL_NAMESPACE: &[u8] = b"partition/00112233-4455-6677-8899-aabbccddeeff/seal/v1";
-    const WAL_NAMESPACE: &[u8] = b"partition/00112233-4455-6677-8899-aabbccddeeff/wal/v1";
+    const SEAL_NAMESPACE: &[u8] = b"seal/v1";
+    const WAL_NAMESPACE: &[u8] = b"wal/v1";
 
-    let partition: PartitionId = "00112233-4455-6677-8899-aabbccddeeff".parse()?;
-    let seal_namespace = SealNamespace::from(partition);
-    let wal_namespace = WalNamespace::from(partition);
+    let seal_namespace = SealNamespace;
+    let wal_namespace = WalNamespace;
     assert_eq!(
         SEAL_NAMESPACE,
         seal_namespace.to_string().as_bytes(),
@@ -102,9 +101,8 @@ fn seal_and_wal_namespace_prefixes_have_independent_golden_vectors()
         "WAL namespace spelling is the published LIST prefix"
     );
 
-    let seal_key =
-        SealKey::from(SealIdentity::new(partition, SealGeneration::genesis())).to_string();
-    let wal_key = WalKey::from(WalIdentity::new(partition, BatchId::try_from(1)?)).to_string();
+    let seal_key = SealKey::from(SealGeneration::genesis()).to_string();
+    let wal_key = WalKey::from(BatchId::try_from(1)?).to_string();
     assert!(
         seal_key.as_bytes().starts_with(SEAL_NAMESPACE)
             && seal_key.as_bytes().get(SEAL_NAMESPACE.len()) == Some(&b'/'),
@@ -131,19 +129,15 @@ fn seal_and_wal_namespace_prefixes_have_independent_golden_vectors()
 #[test]
 fn durable_key_golden_spellings_select_newest_coordinates_first()
 -> Result<(), Box<dyn std::error::Error>> {
-    let partition: PartitionId = "00112233-4455-6677-8899-aabbccddeeff".parse()?;
-    let generation_one = SealKey::from(SealIdentity::new(partition, SealGeneration::genesis()));
-    let generation_two = SealKey::from(SealIdentity::new(
-        partition,
-        SealGeneration::genesis().successor()?,
-    ));
+    let generation_one = SealKey::from(SealGeneration::genesis());
+    let generation_two = SealKey::from(SealGeneration::genesis().successor()?);
     assert_eq!(
-        "partition/00112233-4455-6677-8899-aabbccddeeff/seal/v1/18446744073709551614",
+        "seal/v1/18446744073709551614",
         generation_one.to_string(),
         "generation one anchors the reverse-coordinate spelling"
     );
     assert_eq!(
-        "partition/00112233-4455-6677-8899-aabbccddeeff/seal/v1/18446744073709551613",
+        "seal/v1/18446744073709551613",
         generation_two.to_string(),
         "generation two decrements the storage ordinal"
     );
@@ -158,9 +152,9 @@ fn durable_key_golden_spellings_select_newest_coordinates_first()
         "the canonical key parser recovers its typed identity"
     );
 
-    let wal_key = WalKey::from(WalIdentity::new(partition, BatchId::try_from(42)?));
+    let wal_key = WalKey::from(BatchId::try_from(42)?);
     assert_eq!(
-        "partition/00112233-4455-6677-8899-aabbccddeeff/wal/v1/18446744073709551573",
+        "wal/v1/18446744073709551573",
         wal_key.to_string(),
         "WAL keys use the independent batch coordinate in the same namespace scheme"
     );
@@ -172,27 +166,23 @@ fn durable_key_golden_spellings_select_newest_coordinates_first()
 fn malformed_durable_key_spellings_fail_closed() {
     let cases = [
         (
-            "partition/00112233-4455-6677-8899-aabbccddeeff/seal/v1/0000000000000000000",
+            "seal/v1/0000000000000000000",
             KeySpellingError::ReverseOrdinal,
         ),
         (
-            "partition/00112233-4455-6677-8899-aabbccddeeff/seal/v1/18446744073709551615",
+            "seal/v1/18446744073709551615",
             KeySpellingError::ZeroCoordinate,
         ),
         (
-            "partition/00112233-4455-6677-8899-AABBCCDDEEFF/seal/v1/18446744073709551614",
-            KeySpellingError::Partition(PartitionIdError::Malformed),
+            "partition/00112233-4455-6677-8899-aabbccddeeff/seal/v1/18446744073709551614",
+            KeySpellingError::Shape,
         ),
         (
-            "partition/00000000-0000-0000-0000-000000000000/seal/v1/18446744073709551614",
-            KeySpellingError::Partition(PartitionIdError::Nil),
-        ),
-        (
-            "partition/00112233-4455-6677-8899-aabbccddeeff/seal/v2/18446744073709551614",
+            "seal/v2/18446744073709551614",
             KeySpellingError::UnsupportedNamespace,
         ),
         (
-            "partition/00112233-4455-6677-8899-aabbccddeeff/seal/v1/99999999999999999999",
+            "seal/v1/99999999999999999999",
             KeySpellingError::ReverseOrdinal,
         ),
     ];
@@ -207,7 +197,6 @@ fn malformed_durable_key_spellings_fail_closed() {
 
 #[test]
 fn table_key_golden_spellings_anchor_every_store() -> Result<(), Box<dyn std::error::Error>> {
-    let partition: PartitionId = "00112233-4455-6677-8899-aabbccddeeff".parse()?;
     let fresh = FreshIdentity::new(
         SealGeneration::try_from(2)?,
         AttemptId::new(SealGeneration::genesis(), 4),
@@ -216,23 +205,23 @@ fn table_key_golden_spellings_anchor_every_store() -> Result<(), Box<dyn std::er
     let cases = [
         (
             StoreKind::Directory,
-            "partition/00112233-4455-6677-8899-aabbccddeeff/table/v1/directory/00000000000000000002/00000000000000000001-00000000000000000004/0000000007",
+            "table/v1/directory/00000000000000000002/00000000000000000001-00000000000000000004/0000000007",
         ),
         (
             StoreKind::Ledger,
-            "partition/00112233-4455-6677-8899-aabbccddeeff/table/v1/ledger/00000000000000000002/00000000000000000001-00000000000000000004/0000000007",
+            "table/v1/ledger/00000000000000000002/00000000000000000001-00000000000000000004/0000000007",
         ),
         (
             StoreKind::Tally,
-            "partition/00112233-4455-6677-8899-aabbccddeeff/table/v1/tally/00000000000000000002/00000000000000000001-00000000000000000004/0000000007",
+            "table/v1/tally/00000000000000000002/00000000000000000001-00000000000000000004/0000000007",
         ),
         (
             StoreKind::Annals,
-            "partition/00112233-4455-6677-8899-aabbccddeeff/table/v1/annals/00000000000000000002/00000000000000000001-00000000000000000004/0000000007",
+            "table/v1/annals/00000000000000000002/00000000000000000001-00000000000000000004/0000000007",
         ),
     ];
     for (store, expected) in cases {
-        let key = TableKey::new(partition, TableObjectId::new(fresh, store));
+        let key = TableKey::new(TableObjectId::new(fresh, store));
         assert_eq!(
             expected,
             key.to_string(),
@@ -249,7 +238,7 @@ fn table_key_golden_spellings_anchor_every_store() -> Result<(), Box<dyn std::er
 
 #[test]
 fn malformed_table_key_spellings_fail_closed() {
-    let valid = "partition/00112233-4455-6677-8899-aabbccddeeff/table/v1/directory/00000000000000000002/00000000000000000001-00000000000000000004/0000000007";
+    let valid = "table/v1/directory/00000000000000000002/00000000000000000001-00000000000000000004/0000000007";
     let cases = [
         valid.replace("directory", "Directory"),
         valid.replace("00000000000000000002", "0000000000000000002"),
@@ -291,17 +280,13 @@ proptest! {
         right in 1u64..,
     ) {
         prop_assume!(left != right);
-        let partition = PartitionId::try_from([1u8; 16]);
-        prop_assert!(partition.is_ok());
-        if let Ok(partition) = partition {
-            let left_generation = SealGeneration::try_from(left);
-            let right_generation = SealGeneration::try_from(right);
-            prop_assert!(left_generation.is_ok() && right_generation.is_ok());
-            if let (Ok(left_generation), Ok(right_generation)) = (left_generation, right_generation) {
-                let left_key = SealKey::from(SealIdentity::new(partition, left_generation)).to_string();
-                let right_key = SealKey::from(SealIdentity::new(partition, right_generation)).to_string();
-                prop_assert_eq!(left_key.cmp(&right_key), right.cmp(&left));
-            }
+        let left_generation = SealGeneration::try_from(left);
+        let right_generation = SealGeneration::try_from(right);
+        prop_assert!(left_generation.is_ok() && right_generation.is_ok());
+        if let (Ok(left_generation), Ok(right_generation)) = (left_generation, right_generation) {
+            let left_key = SealKey::from(left_generation).to_string();
+            let right_key = SealKey::from(right_generation).to_string();
+            prop_assert_eq!(left_key.cmp(&right_key), right.cmp(&left));
         }
     }
 }

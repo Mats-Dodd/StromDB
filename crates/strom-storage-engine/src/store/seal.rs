@@ -6,8 +6,8 @@ use strom_object_store::{
     ByteBound, CreateEvidence, FrozenBytes, ListPageRequest, ObjectStoreAdapter,
 };
 use strom_storage_domain::{
-    EncodeError, PartitionId, SEAL_ENCODED_BYTES_MAX, Seal, SealGeneration, SealIdentity, SealKey,
-    SealNamespace, decode_seal, encode_seal,
+    EncodeError, SEAL_ENCODED_BYTES_MAX, Seal, SealGeneration, SealKey, SealNamespace, decode_seal,
+    encode_seal,
 };
 
 use super::{StoreErrorClass, map_store_error, newest_keys_bound, object_key};
@@ -15,7 +15,7 @@ use super::{StoreErrorClass, map_store_error, newest_keys_bound, object_key};
 /// One Seal candidate, encoded exactly once. Key and body agree by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedSeal {
-    identity: SealIdentity,
+    generation: SealGeneration,
     bytes: FrozenBytes,
 }
 
@@ -28,21 +28,21 @@ impl EncodedSeal {
     /// [`SEAL_ENCODED_BYTES_MAX`].
     pub fn new(seal: &Seal) -> Result<Self, EncodeError> {
         let bytes = encode_seal(seal)?;
-        Ok(Self::from_encoded(seal.identity(), bytes))
+        Ok(Self::from_encoded(seal.generation(), bytes))
     }
 
-    fn from_encoded(identity: SealIdentity, bytes: Vec<u8>) -> Self {
+    fn from_encoded(generation: SealGeneration, bytes: Vec<u8>) -> Self {
         let frozen = FrozenBytes::try_from(bytes)
             .expect("encode_seal yields a non-empty body within PUT_BYTES_MAX");
         Self {
-            identity,
+            generation,
             bytes: frozen,
         }
     }
 
     #[must_use]
-    pub const fn identity(&self) -> SealIdentity {
-        self.identity
+    pub const fn generation(&self) -> SealGeneration {
+        self.generation
     }
 
     /// Exact frozen bytes of this candidate. After an ambiguous create, reconcile
@@ -111,7 +111,7 @@ impl SealStore {
         &self,
         candidate: &EncodedSeal,
     ) -> Result<CreateEvidence, SealStoreError> {
-        let key = object_key(SealKey::from(candidate.identity));
+        let key = object_key(SealKey::from(candidate.generation));
         self.adapter
             .create_if_absent(&key, candidate.bytes.clone())
             .await
@@ -124,14 +124,11 @@ impl SealStore {
     ///
     /// Returns [`SealStoreError`] on adapter failure. A listed key that does
     /// not parse as this partition's Seal key is a contradiction.
-    pub async fn newest_generation(
-        &self,
-        partition: PartitionId,
-    ) -> Result<Option<SealGeneration>, SealStoreError> {
+    pub async fn newest_generation(&self) -> Result<Option<SealGeneration>, SealStoreError> {
         let page = self
             .adapter
             .list_page(ListPageRequest {
-                prefix: object_key(SealNamespace::from(partition)),
+                prefix: object_key(SealNamespace),
                 start_exclusive: None,
                 keys_max: newest_keys_bound(),
             })
@@ -145,12 +142,7 @@ impl SealStore {
                 "listed key {listed} under the Seal namespace is not a Seal key: {source}"
             ))
         })?;
-        if key.identity().partition() != partition {
-            return Err(SealStoreError::contradiction(format!(
-                "listed Seal key {listed} belongs to a foreign partition"
-            )));
-        }
-        Ok(Some(key.identity().generation()))
+        Ok(Some(key.generation()))
     }
 
     /// Bounded read then checked decode against the exact identity.
@@ -159,8 +151,11 @@ impl SealStore {
     ///
     /// Returns [`SealStoreError`] on adapter failure. A present body that fails
     /// decode is a contradiction, never absence.
-    pub async fn read_seal(&self, identity: SealIdentity) -> Result<Option<Seal>, SealStoreError> {
-        let key = object_key(SealKey::from(identity));
+    pub async fn read_seal(
+        &self,
+        generation: SealGeneration,
+    ) -> Result<Option<Seal>, SealStoreError> {
+        let key = object_key(SealKey::from(generation));
         let bound = seal_read_bound();
         let Some(observed) = self
             .adapter
@@ -170,11 +165,11 @@ impl SealStore {
         else {
             return Ok(None);
         };
-        decode_seal(&identity, observed.body())
+        decode_seal(generation, observed.body())
             .map(Some)
             .map_err(|source| {
                 SealStoreError::contradiction(format!(
-                    "Seal body at {key} failed checked decode for {identity:?}: {source}"
+                    "Seal body at {key} failed checked decode for {generation:?}: {source}"
                 ))
             })
     }
@@ -189,7 +184,7 @@ fn seal_read_bound() -> ByteBound {
 mod tests {
     use super::*;
     use strom_object_store::ObjectKey;
-    use strom_storage_domain::{TreeVersion, WalReplayPoint};
+    use strom_storage_domain::{PartitionId, TreeVersion, WalReplayPoint};
 
     #[tokio::test]
     async fn created_seal_reads_back_equal_at_its_exact_identity() {
@@ -204,14 +199,14 @@ mod tests {
         );
 
         let observed = store
-            .read_seal(candidate.identity())
+            .read_seal(candidate.generation())
             .await
             .expect("read runs")
             .expect("created Seal is present");
         assert_eq!(observed, seal, "read-after-create recovers the Seal");
         assert_eq!(
-            observed.identity(),
-            candidate.identity(),
+            observed.generation(),
+            candidate.generation(),
             "decoded identity matches the durable location"
         );
     }
@@ -230,10 +225,7 @@ mod tests {
                 let candidate = EncodedSeal::new(&seal_at(generation)).expect("seal encodes");
                 store.create_seal(&candidate).await.expect("create runs");
             }
-            let newest = store
-                .newest_generation(partition())
-                .await
-                .expect("list runs");
+            let newest = store.newest_generation().await.expect("list runs");
             assert_eq!(
                 newest,
                 Some(generation_two),
@@ -264,7 +256,7 @@ mod tests {
 
         let adapter = ObjectStoreAdapter::in_memory();
         let contested = SealStore::new(adapter.clone());
-        let key = object_key(SealKey::from(seal.identity()));
+        let key = object_key(SealKey::from(seal.generation()));
         let foreign = FrozenBytes::try_from(b"not-a-seal".to_vec()).expect("foreign body freezes");
         adapter
             .create_if_absent(&key, foreign)
@@ -284,13 +276,10 @@ mod tests {
     #[tokio::test]
     async fn absence_is_none_for_read_and_newest_generation() {
         let store = SealStore::new(ObjectStoreAdapter::in_memory());
-        let identity = SealIdentity::new(partition(), SealGeneration::genesis());
+        let identity = SealGeneration::genesis();
         let read = store.read_seal(identity).await.expect("read runs");
         assert!(read.is_none(), "absence is Ok(None), not an error");
-        let newest = store
-            .newest_generation(partition())
-            .await
-            .expect("list runs");
+        let newest = store.newest_generation().await.expect("list runs");
         assert!(
             newest.is_none(),
             "an empty Seal namespace has no newest generation"
@@ -301,7 +290,7 @@ mod tests {
     async fn garbage_bytes_at_a_valid_seal_key_are_a_typed_contradiction() {
         let adapter = ObjectStoreAdapter::in_memory();
         let store = SealStore::new(adapter.clone());
-        let identity = SealIdentity::new(partition(), SealGeneration::genesis());
+        let identity = SealGeneration::genesis();
         let key = object_key(SealKey::from(identity));
         let garbage =
             FrozenBytes::try_from(b"garbage-seal-body".to_vec()).expect("garbage body freezes");
@@ -323,16 +312,15 @@ mod tests {
         let adapter = ObjectStoreAdapter::in_memory();
         let store = SealStore::new(adapter.clone());
         // `-` sorts before digits, so MaxKeys=1 surfaces this before any Seal key.
-        let garbage_key =
-            ObjectKey::try_from(format!("{}/-garbage", SealNamespace::from(partition())))
-                .expect("garbage key is a legal ObjectKey");
+        let garbage_key = ObjectKey::try_from(format!("{SealNamespace}/-garbage"))
+            .expect("garbage key is a legal ObjectKey");
         let body = FrozenBytes::try_from(b"foreign".to_vec()).expect("body freezes");
         adapter
             .create_if_absent(&garbage_key, body)
             .await
             .expect("plant runs");
 
-        let outcome = store.newest_generation(partition()).await;
+        let outcome = store.newest_generation().await;
         assert!(
             matches!(outcome, Err(SealStoreError::Contradiction { .. })),
             "a foreign key under the Seal namespace is Contradiction, got {outcome:?}"
@@ -347,7 +335,7 @@ mod tests {
         let generation_a = SealGeneration::genesis();
         let generation_b = generation_a.successor().expect("generation two exists");
         let candidate_a = EncodedSeal::new(&seal_at(generation_a)).expect("seal a encodes");
-        let identity_b = SealIdentity::new(partition(), generation_b);
+        let identity_b = generation_b;
         let planted = FrozenBytes::try_from(candidate_a.as_slice().to_vec())
             .expect("encoded seal body freezes");
         adapter

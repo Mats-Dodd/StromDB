@@ -3,76 +3,51 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::{
-    AttemptId, BatchId, FreshIdentity, PartitionId, PartitionIdError, SealGeneration, SealIdentity,
-    StoreKind, TableObjectId, WalIdentity,
-};
+use crate::{AttemptId, BatchId, FreshIdentity, SealGeneration, StoreKind, TableObjectId};
 
 const REVERSE_ORDINAL_DIGITS: usize = 20;
 const GENERATION_DIGITS: usize = 20;
 const TABLE_ORDINAL_DIGITS: usize = 10;
-const PARTITION_SEGMENT: &str = "partition";
 const SEAL_SEGMENT: &str = "seal";
 const TABLE_SEGMENT: &str = "table";
 const WAL_SEGMENT: &str = "wal";
 const NAMESPACE_VERSION: &str = "v1";
 
-/// Ascending LIST prefix for one partition's Seal namespace.
+/// Ascending LIST prefix for the Seal namespace.
 ///
 /// Keys embed reverse ordinals, so `MaxKeys=1` under this prefix surfaces the
 /// newest generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SealNamespace(PartitionId);
-
-impl SealNamespace {
-    #[must_use]
-    pub const fn new(partition: PartitionId) -> Self {
-        Self(partition)
-    }
-
-    #[must_use]
-    pub const fn partition(self) -> PartitionId {
-        self.0
-    }
-}
-
-impl From<PartitionId> for SealNamespace {
-    fn from(partition: PartitionId) -> Self {
-        Self(partition)
-    }
-}
+pub struct SealNamespace;
 
 impl FromStr for SealNamespace {
     type Err = KeySpellingError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        Ok(Self(parse_namespace(input, SEAL_SEGMENT)?))
+        parse_namespace(input, SEAL_SEGMENT)?;
+        Ok(Self)
     }
 }
 
 impl fmt::Display for SealNamespace {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{PARTITION_SEGMENT}/{}/{SEAL_SEGMENT}/{NAMESPACE_VERSION}",
-            self.0
-        )
+        write!(formatter, "{SEAL_SEGMENT}/{NAMESPACE_VERSION}")
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SealKey(SealIdentity);
+pub struct SealKey(SealGeneration);
 
 impl SealKey {
     #[must_use]
-    pub const fn identity(self) -> SealIdentity {
+    pub const fn generation(self) -> SealGeneration {
         self.0
     }
 }
 
-impl From<SealIdentity> for SealKey {
-    fn from(identity: SealIdentity) -> Self {
-        Self(identity)
+impl From<SealGeneration> for SealKey {
+    fn from(generation: SealGeneration) -> Self {
+        Self(generation)
     }
 }
 
@@ -80,10 +55,10 @@ impl FromStr for SealKey {
     type Err = KeySpellingError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let (partition, ordinal) = parse_key(input, SEAL_SEGMENT)?;
+        let ordinal = parse_key(input, SEAL_SEGMENT)?;
         let generation = SealGeneration::try_from(ordinal)
             .map_err(|_detail| KeySpellingError::ZeroCoordinate)?;
-        Ok(Self(SealIdentity::new(partition, generation)))
+        Ok(Self(generation))
     }
 }
 
@@ -91,69 +66,47 @@ impl fmt::Display for SealKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{PARTITION_SEGMENT}/{}/{SEAL_SEGMENT}/{NAMESPACE_VERSION}/{}",
-            self.0.partition(),
-            ReverseOrdinal(self.0.generation().get())
+            "{SEAL_SEGMENT}/{NAMESPACE_VERSION}/{}",
+            ReverseOrdinal(self.0.get())
         )
     }
 }
 
-/// Ascending LIST prefix for one partition's WAL namespace.
+/// Ascending LIST prefix for the WAL namespace.
 ///
 /// Keys embed reverse ordinals, so `MaxKeys=1` under this prefix surfaces the
 /// newest surviving batch coordinate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct WalNamespace(PartitionId);
-
-impl WalNamespace {
-    #[must_use]
-    pub const fn new(partition: PartitionId) -> Self {
-        Self(partition)
-    }
-
-    #[must_use]
-    pub const fn partition(self) -> PartitionId {
-        self.0
-    }
-}
-
-impl From<PartitionId> for WalNamespace {
-    fn from(partition: PartitionId) -> Self {
-        Self(partition)
-    }
-}
+pub struct WalNamespace;
 
 impl FromStr for WalNamespace {
     type Err = KeySpellingError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        Ok(Self(parse_namespace(input, WAL_SEGMENT)?))
+        parse_namespace(input, WAL_SEGMENT)?;
+        Ok(Self)
     }
 }
 
 impl fmt::Display for WalNamespace {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{PARTITION_SEGMENT}/{}/{WAL_SEGMENT}/{NAMESPACE_VERSION}",
-            self.0
-        )
+        write!(formatter, "{WAL_SEGMENT}/{NAMESPACE_VERSION}")
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct WalKey(WalIdentity);
+pub struct WalKey(BatchId);
 
 impl WalKey {
     #[must_use]
-    pub const fn identity(self) -> WalIdentity {
+    pub const fn batch(self) -> BatchId {
         self.0
     }
 }
 
-impl From<WalIdentity> for WalKey {
-    fn from(identity: WalIdentity) -> Self {
-        Self(identity)
+impl From<BatchId> for WalKey {
+    fn from(batch: BatchId) -> Self {
+        Self(batch)
     }
 }
 
@@ -161,10 +114,10 @@ impl FromStr for WalKey {
     type Err = KeySpellingError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let (partition, ordinal) = parse_key(input, WAL_SEGMENT)?;
+        let ordinal = parse_key(input, WAL_SEGMENT)?;
         let batch =
             BatchId::try_from(ordinal).map_err(|_detail| KeySpellingError::ZeroCoordinate)?;
-        Ok(Self(WalIdentity::new(partition, batch)))
+        Ok(Self(batch))
     }
 }
 
@@ -172,33 +125,24 @@ impl fmt::Display for WalKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{PARTITION_SEGMENT}/{}/{WAL_SEGMENT}/{NAMESPACE_VERSION}/{}",
-            self.0.partition(),
-            ReverseOrdinal(self.0.batch().get())
+            "{WAL_SEGMENT}/{NAMESPACE_VERSION}/{}",
+            ReverseOrdinal(self.0.get())
         )
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TableKey {
-    partition: PartitionId,
-    object: TableObjectId,
-}
+pub struct TableKey(TableObjectId);
 
 impl TableKey {
     #[must_use]
-    pub const fn new(partition: PartitionId, object: TableObjectId) -> Self {
-        Self { partition, object }
-    }
-
-    #[must_use]
-    pub const fn partition(self) -> PartitionId {
-        self.partition
+    pub const fn new(object: TableObjectId) -> Self {
+        Self(object)
     }
 
     #[must_use]
     pub const fn object(self) -> TableObjectId {
-        self.object
+        self.0
     }
 }
 
@@ -207,10 +151,6 @@ impl FromStr for TableKey {
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let mut segments = input.split('/');
-        if segments.next() != Some(PARTITION_SEGMENT) {
-            return Err(KeySpellingError::Shape);
-        }
-        let partition = segments.next().ok_or(KeySpellingError::Shape)?;
         if segments.next() != Some(TABLE_SEGMENT) {
             return Err(KeySpellingError::Shape);
         }
@@ -240,25 +180,23 @@ impl FromStr for TableKey {
             return Err(KeySpellingError::Shape);
         }
 
-        let partition = partition.parse().map_err(KeySpellingError::Partition)?;
         let birth =
             SealGeneration::try_from(birth).map_err(|_detail| KeySpellingError::ZeroCoordinate)?;
         let owner =
             SealGeneration::try_from(owner).map_err(|_detail| KeySpellingError::ZeroCoordinate)?;
         let fresh = FreshIdentity::new(birth, AttemptId::new(owner, counter), ordinal)
             .map_err(|_detail| KeySpellingError::InvalidTableIdentity)?;
-        Ok(Self::new(partition, TableObjectId::new(fresh, store)))
+        Ok(Self::new(TableObjectId::new(fresh, store)))
     }
 }
 
 impl fmt::Display for TableKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let fresh = self.object.fresh();
+        let fresh = self.0.fresh();
         write!(
             formatter,
-            "{PARTITION_SEGMENT}/{}/{TABLE_SEGMENT}/{NAMESPACE_VERSION}/{}/{:020}/{:020}-{:020}/{:010}",
-            self.partition,
-            store_name(self.object.store()),
+            "{TABLE_SEGMENT}/{NAMESPACE_VERSION}/{}/{:020}/{:020}-{:020}/{:010}",
+            store_name(self.0.store()),
             fresh.birth_generation().get(),
             fresh.attempt().owner_claim().get(),
             fresh.attempt().local_counter(),
@@ -278,12 +216,8 @@ impl fmt::Display for ReverseOrdinal {
     }
 }
 
-fn parse_namespace(input: &str, expected_kind: &str) -> Result<PartitionId, KeySpellingError> {
+fn parse_namespace(input: &str, expected_kind: &str) -> Result<(), KeySpellingError> {
     let mut segments = input.split('/');
-    if segments.next() != Some(PARTITION_SEGMENT) {
-        return Err(KeySpellingError::Shape);
-    }
-    let partition = segments.next().ok_or(KeySpellingError::Shape)?;
     if segments.next() != Some(expected_kind) {
         return Err(KeySpellingError::Shape);
     }
@@ -293,15 +227,11 @@ fn parse_namespace(input: &str, expected_kind: &str) -> Result<PartitionId, KeyS
     if segments.next().is_some() {
         return Err(KeySpellingError::Shape);
     }
-    partition.parse().map_err(KeySpellingError::Partition)
+    Ok(())
 }
 
-fn parse_key(input: &str, expected_kind: &str) -> Result<(PartitionId, u64), KeySpellingError> {
+fn parse_key(input: &str, expected_kind: &str) -> Result<u64, KeySpellingError> {
     let mut segments = input.split('/');
-    if segments.next() != Some(PARTITION_SEGMENT) {
-        return Err(KeySpellingError::Shape);
-    }
-    let partition = segments.next().ok_or(KeySpellingError::Shape)?;
     if segments.next() != Some(expected_kind) {
         return Err(KeySpellingError::Shape);
     }
@@ -312,12 +242,11 @@ fn parse_key(input: &str, expected_kind: &str) -> Result<(PartitionId, u64), Key
     if segments.next().is_some() {
         return Err(KeySpellingError::Shape);
     }
-    let partition = partition.parse().map_err(KeySpellingError::Partition)?;
     let reversed = parse_reverse_ordinal(reverse_ordinal)?;
     let ordinal = u64::MAX
         .checked_sub(reversed)
         .expect("a parsed u64 reverse ordinal cannot exceed u64::MAX");
-    Ok((partition, ordinal))
+    Ok(ordinal)
 }
 
 fn parse_reverse_ordinal(input: &str) -> Result<u64, KeySpellingError> {
@@ -363,8 +292,6 @@ pub enum KeySpellingError {
     Shape,
     #[error("durable key namespace version is unsupported")]
     UnsupportedNamespace,
-    #[error("durable key partition is invalid: {0}")]
-    Partition(#[source] PartitionIdError),
     #[error("durable key reverse ordinal is not a fixed-width 20-digit u64")]
     ReverseOrdinal,
     #[error("durable key spells reserved coordinate zero")]

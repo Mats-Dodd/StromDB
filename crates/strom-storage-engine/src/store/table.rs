@@ -57,7 +57,6 @@ pub(crate) enum CandidateTableEvidence {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AuthorizedTableDelete {
-    partition: PartitionId,
     object: TableObjectId,
 }
 
@@ -135,7 +134,7 @@ impl TableStore {
         &self,
         proof: AuthorizedTableDelete,
     ) -> Result<(), TableStoreError> {
-        let key = object_key(TableKey::new(proof.partition, proof.object));
+        let key = object_key(TableKey::new(proof.object));
         self.adapter
             .delete_idempotent(&key)
             .await
@@ -147,7 +146,7 @@ impl TableStore {
         partition: PartitionId,
         table: &TableRef,
     ) -> Result<TableRows, TableStoreError> {
-        let key = TableKey::new(partition, table.object());
+        let key = TableKey::new(table.object());
         let object_key = object_key(key);
         let bound = ByteBound::try_from(table.object_bytes().get())
             .expect("a TableRef carries a nonzero in-bound object length");
@@ -170,14 +169,14 @@ impl TableStore {
         }
 
         match table.object().store() {
-            StoreKind::Directory => decode_directory_sst(&key, observed.body())
+            StoreKind::Directory => decode_directory_sst(partition, &key, observed.body())
                 .map(TableRows::Directory)
                 .map_err(|source| {
                     TableStoreError::contradiction(format!(
                         "Directory table {key} failed checked decode: {source}"
                     ))
                 }),
-            StoreKind::Ledger => decode_ledger_sst(&key, observed.body())
+            StoreKind::Ledger => decode_ledger_sst(partition, &key, observed.body())
                 .map(TableRows::Ledger)
                 .map_err(|source| {
                     TableStoreError::contradiction(format!(
@@ -196,30 +195,26 @@ pub(crate) fn targeted_table_deletes(
     successor: &Seal,
 ) -> Vec<AuthorizedTableDelete> {
     assert_eq!(
-        source.identity().partition(),
-        successor.identity().partition(),
+        source.partition(),
+        successor.partition(),
         "one advance keeps the partition identity"
     );
     assert!(
-        source.identity().generation() < successor.identity().generation(),
+        source.generation() < successor.generation(),
         "targeted collection compares a source with its advancing successor"
     );
     assert_eq!(
         source
-            .identity()
             .generation()
             .successor()
             .expect("an observed successor proves the source generation is not exhausted"),
-        successor.identity().generation(),
+        successor.generation(),
         "targeted collection requires an exact Seal successor pair"
     );
     let successor_objects: BTreeSet<TableObjectId> = seal_tables(successor).collect();
     seal_tables(source)
         .filter(|object| !successor_objects.contains(object))
-        .map(|object| AuthorizedTableDelete {
-            partition: source.identity().partition(),
-            object,
-        })
+        .map(|object| AuthorizedTableDelete { object })
         .collect()
 }
 
@@ -253,7 +248,7 @@ mod tests {
             directory_key("events/a")?,
             DirectoryEntry::Live(StreamUid::try_from(1)?),
         )];
-        let bytes = encode_directory_sst(&key, &rows)?;
+        let bytes = encode_directory_sst(partition(), &key, &rows)?;
         let table = table_ref(key, bytes.len())?;
         plant(&adapter, key, bytes).await?;
 
@@ -279,7 +274,7 @@ mod tests {
                 strom_storage_domain::BatchId::try_from(1)?,
             )),
         )];
-        let bytes = encode_ledger_sst(&key, &rows)?;
+        let bytes = encode_ledger_sst(partition(), &key, &rows)?;
         let table = table_ref(key, bytes.len())?;
         plant(&adapter, key, bytes).await?;
 
@@ -296,7 +291,7 @@ mod tests {
         let directory_table_key = table_key_at(StoreKind::Directory, 0)?;
         let ledger_key = table_key_at(StoreKind::Ledger, 1)?;
         let ledger_rows = vec![(StreamUid::try_from(1)?, LedgerCell::Delete)];
-        let ledger_bytes = encode_ledger_sst(&ledger_key, &ledger_rows)?;
+        let ledger_bytes = encode_ledger_sst(partition(), &ledger_key, &ledger_rows)?;
         let wrong_store = ObjectStoreAdapter::in_memory();
         plant(&wrong_store, directory_table_key, ledger_bytes.clone()).await?;
         assert!(matches!(
@@ -315,7 +310,7 @@ mod tests {
             directory_key("events/a")?,
             DirectoryEntry::Live(StreamUid::try_from(1)?),
         )];
-        let wrong_identity_bytes = encode_directory_sst(&encoded_key, &rows)?;
+        let wrong_identity_bytes = encode_directory_sst(partition(), &encoded_key, &rows)?;
         let wrong_identity = ObjectStoreAdapter::in_memory();
         plant(&wrong_identity, planted_key, wrong_identity_bytes.clone()).await?;
         assert!(matches!(
@@ -349,7 +344,7 @@ mod tests {
             directory_key("events/a")?,
             DirectoryEntry::Live(StreamUid::try_from(1)?),
         )];
-        let bytes = encode_directory_sst(&key, &rows)?;
+        let bytes = encode_directory_sst(partition(), &key, &rows)?;
 
         let absent_store = TableStore::new(ObjectStoreAdapter::in_memory());
         let exact = table_ref(key, bytes.len())?;
@@ -422,7 +417,7 @@ mod tests {
         let owner = SealGeneration::genesis();
         let birth = owner.successor()?;
         let fresh = FreshIdentity::new(birth, AttemptId::new(owner, 7), ordinal)?;
-        Ok(TableKey::new(partition(), TableObjectId::new(fresh, store)))
+        Ok(TableKey::new(TableObjectId::new(fresh, store)))
     }
 
     fn directory_key(raw: &str) -> Result<DirectoryKey, Box<dyn std::error::Error>> {

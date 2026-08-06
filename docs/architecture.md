@@ -251,14 +251,14 @@ alone grants no authority.
 
 ## durable namespace and identities
 
-Keys are canonical, versioned, and derived from domain identities. The shape
-is conceptually:
+The selected store root is the partition address. Keys beneath it are
+canonical, versioned, and derived from object coordinates:
 
 ```text
-partition/<partition>/seal/v1/<reverse generation>
-partition/<partition>/wal/v1/<reverse batch>
-partition/<partition>/table/v1/<store>/<birth generation>/<attempt>/<ordinal>
-partition/<partition>/payload-pack/v1/<birth generation>/<attempt>/<ordinal>
+seal/v1/<reverse generation>
+wal/v1/<reverse batch>
+table/v1/<store>/<birth generation>/<attempt>/<ordinal>
+payload-pack/v1/<birth generation>/<attempt>/<ordinal>
 ```
 
 Reverse coordinates are fixed-width decimal encodings:
@@ -358,7 +358,8 @@ Every persisted field has one recovery obligation:
 
 | Field | Why it cannot be derived later |
 | --- | --- |
-| `partition`, `generation` | authenticate key/body identity and exact succession |
+| `partition` | genesis-born identity token checked across every body in the store root |
+| `generation` | authenticate the Seal coordinate and exact succession |
 | `replay` | separate the materialized prefix from the readable WAL suffix and retain the owner in force after folding |
 | four `TreeVersion`s | name the complete current physical serving state |
 
@@ -369,6 +370,12 @@ force after folding that coordinate.
 Genesis is generation 1 at `WalReplayPoint::Genesis` and one canonical empty
 `TreeVersion` for each store. Every later Seal is the exact successor of one
 observed permanent Seal. Seal keys are never overwritten, deleted, or reused:
+
+The engine mints `PartitionId` from its injected entropy when it creates
+genesis. Reopening discovers the id from the newest Seal, then requires every
+WAL and SST body to carry that same id. If two processes race an empty root,
+create-if-absent selects one genesis and the loser rediscovers and adopts the
+winner rather than treating the ordinary race as corruption.
 
 ```text
 1, 2, 3, ...
@@ -983,14 +990,12 @@ trait SealStore {
         candidate: EncodedSeal,
     ) -> Result<CreateEvidence, SealStoreError>;
 
-    async fn newest_generation(
-        &self,
-        partition: PartitionId,
-    ) -> Result<Option<SealGeneration>, SealStoreError>;
+    async fn newest_generation(&self)
+        -> Result<Option<SealGeneration>, SealStoreError>;
 
     async fn read_seal(
         &self,
-        identity: SealIdentity,
+        generation: SealGeneration,
     ) -> Result<Option<DecodedSeal>, SealStoreError>;
 }
 
@@ -1002,13 +1007,12 @@ trait WalStore {
 
     async fn read_wal(
         &self,
-        identity: WalIdentity,
+        partition: PartitionId,
+        batch: BatchId,
     ) -> Result<Option<ObservedWal>, WalStoreError>;
 
-    async fn newest_surviving_batch(
-        &self,
-        partition: PartitionId,
-    ) -> Result<Option<BatchId>, WalStoreError>;
+    async fn newest_surviving_batch(&self)
+        -> Result<Option<BatchId>, WalStoreError>;
 
     async fn delete_run(
         &self,

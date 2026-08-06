@@ -20,3 +20,9 @@ pub use store::{
 pub use strom_object_store::{CreateEvidence, Etag, ObjectStoreAdapter};
 pub use strom_storage_domain::EncodeError;
 pub use writer::WriterExit;
+
+#[cfg(test)]
+fn test_entropy() -> strom_common::Entropy {
+    const TEST_SEED: u64 = 42;
+    strom_common::Entropy::from_seed(strom_common::Seed::from(TEST_SEED))
+}

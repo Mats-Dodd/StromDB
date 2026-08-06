@@ -29,6 +29,7 @@ struct LedgerSstArchive<'rows> {
 /// Returns [`SstEncodeError`] when the key names another store, the row set is
 /// empty or unordered, serialization fails, or the complete object is over-bound.
 pub fn encode_ledger_sst(
+    partition: PartitionId,
     expected: &TableKey,
     rows: &[(StreamUid, LedgerCell)],
 ) -> Result<Vec<u8>, SstEncodeError> {
@@ -48,7 +49,7 @@ pub fn encode_ledger_sst(
     }
 
     let root = LedgerSstArchive {
-        partition: expected.partition(),
+        partition,
         fresh: expected.object().fresh(),
         rows,
     };
@@ -62,6 +63,7 @@ pub fn encode_ledger_sst(
 /// Returns [`SstDecodeError`] when the byte, structure, identity, resource, or
 /// row-domain gates fail.
 pub fn decode_ledger_sst(
+    expected_partition: PartitionId,
     expected: &TableKey,
     bytes: &[u8],
 ) -> Result<Vec<(StreamUid, LedgerCell)>, SstDecodeError> {
@@ -75,7 +77,7 @@ pub fn decode_ledger_sst(
         .map_err(|_domain_error| SstDecodeError::InvalidBody)?;
     let fresh = FreshIdentity::try_from(&root.fresh)
         .map_err(|_domain_error| SstDecodeError::InvalidBody)?;
-    if partition != expected.partition() || fresh != expected.object().fresh() {
+    if partition != expected_partition || fresh != expected.object().fresh() {
         return Err(SstDecodeError::IdentityMismatch);
     }
     if root.rows.is_empty() {
@@ -130,8 +132,9 @@ mod tests {
     fn encoded_ledger_bounds_dominate_maximum_identity_and_rows()
     -> Result<(), Box<dyn std::error::Error>> {
         let expected = table_key()?;
+        let partition = partition()?;
         let empty = LedgerSstArchive {
-            partition: expected.partition(),
+            partition,
             fresh: expected.object().fresh(),
             rows: &[],
         };
@@ -152,7 +155,7 @@ mod tests {
                 BatchId::try_from(u64::MAX)?,
             )),
         )];
-        let value_bytes = encode_ledger_sst(&expected, &value)?;
+        let value_bytes = encode_ledger_sst(partition, &expected, &value)?;
         assert!(
             u64::try_from(value_bytes.len())?
                 <= SST_ARCHIVE_FIXED_BYTES_MAX + LEDGER_VALUE_ROW_ENCODED_BYTES_MAX,
@@ -160,7 +163,7 @@ mod tests {
         );
 
         let delete = [(StreamUid::try_from(u64::MAX)?, LedgerCell::Delete)];
-        let delete_bytes = encode_ledger_sst(&expected, &delete)?;
+        let delete_bytes = encode_ledger_sst(partition, &expected, &delete)?;
         assert!(
             u64::try_from(delete_bytes.len())?
                 <= SST_ARCHIVE_FIXED_BYTES_MAX + LEDGER_DELETE_ROW_ENCODED_BYTES_MAX,
@@ -173,19 +176,20 @@ mod tests {
     fn decoder_rejects_a_structurally_valid_descending_uid()
     -> Result<(), Box<dyn std::error::Error>> {
         let expected = table_key()?;
+        let partition = partition()?;
         let rows = [
             (StreamUid::try_from(2)?, LedgerCell::Delete),
             (StreamUid::try_from(1)?, LedgerCell::Delete),
         ];
         let root = LedgerSstArchive {
-            partition: expected.partition(),
+            partition,
             fresh: expected.object().fresh(),
             rows: &rows,
         };
         let bytes = archive::encode(&root, SST_OBJECT_BYTES_MAX_USIZE)?;
         assert_eq!(
             Err(SstDecodeError::InvalidBody),
-            decode_ledger_sst(&expected, &bytes)
+            decode_ledger_sst(partition, &expected, &bytes)
         );
         Ok(())
     }
@@ -196,9 +200,10 @@ mod tests {
             AttemptId::new(SealGeneration::genesis(), 4),
             0,
         )?;
-        Ok(TableKey::new(
-            "00112233-4455-6677-8899-aabbccddeeff".parse()?,
-            TableObjectId::new(fresh, StoreKind::Ledger),
-        ))
+        Ok(TableKey::new(TableObjectId::new(fresh, StoreKind::Ledger)))
+    }
+
+    fn partition() -> Result<PartitionId, crate::PartitionIdError> {
+        "00112233-4455-6677-8899-aabbccddeeff".parse()
     }
 }

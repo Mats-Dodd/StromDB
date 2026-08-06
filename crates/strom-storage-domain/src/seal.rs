@@ -61,8 +61,13 @@ impl Seal {
     }
 
     #[must_use]
-    pub const fn identity(&self) -> SealIdentity {
-        SealIdentity::new(self.partition, self.generation)
+    pub const fn partition(&self) -> PartitionId {
+        self.partition
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> SealGeneration {
+        self.generation
     }
 
     #[must_use]
@@ -113,32 +118,6 @@ fn validate_tree(
         }
     }
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SealIdentity {
-    partition: PartitionId,
-    generation: SealGeneration,
-}
-
-impl SealIdentity {
-    #[must_use]
-    pub const fn new(partition: PartitionId, generation: SealGeneration) -> Self {
-        Self {
-            partition,
-            generation,
-        }
-    }
-
-    #[must_use]
-    pub const fn partition(self) -> PartitionId {
-        self.partition
-    }
-
-    #[must_use]
-    pub const fn generation(self) -> SealGeneration {
-        self.generation
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]

@@ -3212,6 +3212,8 @@ dependencies = [
  "futures",
  "imbl",
  "proptest",
+ "rand 0.9.5",
+ "strom-common",
  "strom-domain",
  "strom-object-store",
  "strom-storage-domain",
@@ -3224,6 +3226,7 @@ name = "stromdb"
 version = "0.1.0"
 dependencies = [
  "object_store",
+ "strom-common",
  "strom-domain",
  "strom-object-store",
  "strom-storage-domain",

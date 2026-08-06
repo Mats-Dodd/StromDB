@@ -22,43 +22,48 @@ const LEDGER_ONE_DELETE: &[u8] = &[
 
 #[test]
 fn directory_and_ledger_roots_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+    let partition = partition()?;
     let directory_key = table_key(StoreKind::Directory)?;
     let directory_rows = directory_rows()?;
-    let directory = encode_directory_sst(&directory_key, &directory_rows)?;
+    let directory = encode_directory_sst(partition, &directory_key, &directory_rows)?;
     assert_eq!(
         directory_rows,
-        decode_directory_sst(&directory_key, &directory)?
+        decode_directory_sst(partition, &directory_key, &directory)?
     );
 
     let ledger_key = table_key(StoreKind::Ledger)?;
     let ledger_rows = ledger_rows()?;
-    let ledger = encode_ledger_sst(&ledger_key, &ledger_rows)?;
-    assert_eq!(ledger_rows, decode_ledger_sst(&ledger_key, &ledger)?);
+    let ledger = encode_ledger_sst(partition, &ledger_key, &ledger_rows)?;
+    assert_eq!(
+        ledger_rows,
+        decode_ledger_sst(partition, &ledger_key, &ledger)?
+    );
     Ok(())
 }
 
 #[test]
 fn minimal_fixtures_anchor_each_concrete_archive_root() -> Result<(), Box<dyn std::error::Error>> {
+    let partition = partition()?;
     let directory_key = table_key(StoreKind::Directory)?;
     let directory_rows = vec![(key("events/a")?, DirectoryEntry::Live(uid(7)?))];
     assert_eq!(
         DIRECTORY_ONE_ROW,
-        encode_directory_sst(&directory_key, &directory_rows)?.as_slice()
+        encode_directory_sst(partition, &directory_key, &directory_rows)?.as_slice()
     );
     assert_eq!(
         directory_rows,
-        decode_directory_sst(&directory_key, DIRECTORY_ONE_ROW)?
+        decode_directory_sst(partition, &directory_key, DIRECTORY_ONE_ROW)?
     );
 
     let ledger_key = table_key(StoreKind::Ledger)?;
     let ledger_rows = vec![(uid(7)?, LedgerCell::Delete)];
     assert_eq!(
         LEDGER_ONE_DELETE,
-        encode_ledger_sst(&ledger_key, &ledger_rows)?.as_slice()
+        encode_ledger_sst(partition, &ledger_key, &ledger_rows)?.as_slice()
     );
     assert_eq!(
         ledger_rows,
-        decode_ledger_sst(&ledger_key, LEDGER_ONE_DELETE)?
+        decode_ledger_sst(partition, &ledger_key, LEDGER_ONE_DELETE)?
     );
     Ok(())
 }
@@ -66,61 +71,68 @@ fn minimal_fixtures_anchor_each_concrete_archive_root() -> Result<(), Box<dyn st
 #[test]
 fn encoders_reject_empty_unordered_and_wrong_store_inputs() -> Result<(), Box<dyn std::error::Error>>
 {
+    let partition = partition()?;
     let directory_key = table_key(StoreKind::Directory)?;
     assert_eq!(
         Err(SstEncodeError::EmptyTable),
-        encode_directory_sst(&directory_key, &[])
+        encode_directory_sst(partition, &directory_key, &[])
     );
     let mut directory_rows = directory_rows()?;
     directory_rows.swap(0, 1);
     assert_eq!(
         Err(SstEncodeError::RowsNotStrictlyOrdered),
-        encode_directory_sst(&directory_key, &directory_rows)
+        encode_directory_sst(partition, &directory_key, &directory_rows)
     );
     assert_eq!(
         Err(SstEncodeError::StoreMismatch),
-        encode_directory_sst(&table_key(StoreKind::Ledger)?, &directory_rows)
+        encode_directory_sst(partition, &table_key(StoreKind::Ledger)?, &directory_rows)
     );
     assert_eq!(
         Err(SstDecodeError::StoreMismatch),
-        decode_directory_sst(&table_key(StoreKind::Ledger)?, DIRECTORY_ONE_ROW)
+        decode_directory_sst(partition, &table_key(StoreKind::Ledger)?, DIRECTORY_ONE_ROW)
     );
 
     let ledger_key = table_key(StoreKind::Ledger)?;
     assert_eq!(
         Err(SstEncodeError::EmptyTable),
-        encode_ledger_sst(&ledger_key, &[])
+        encode_ledger_sst(partition, &ledger_key, &[])
     );
     let mut ledger_rows = ledger_rows()?;
     ledger_rows.swap(0, 1);
     assert_eq!(
         Err(SstEncodeError::RowsNotStrictlyOrdered),
-        encode_ledger_sst(&ledger_key, &ledger_rows)
+        encode_ledger_sst(partition, &ledger_key, &ledger_rows)
     );
     assert_eq!(
         Err(SstEncodeError::StoreMismatch),
-        encode_ledger_sst(&table_key(StoreKind::Directory)?, &ledger_rows)
+        encode_ledger_sst(partition, &table_key(StoreKind::Directory)?, &ledger_rows)
     );
     assert_eq!(
         Err(SstDecodeError::StoreMismatch),
-        decode_ledger_sst(&table_key(StoreKind::Directory)?, LEDGER_ONE_DELETE)
+        decode_ledger_sst(
+            partition,
+            &table_key(StoreKind::Directory)?,
+            LEDGER_ONE_DELETE
+        )
     );
     Ok(())
 }
 
 #[test]
 fn decoders_check_structure_before_location_identity() -> Result<(), Box<dyn std::error::Error>> {
+    let partition = partition()?;
     let directory_key = table_key(StoreKind::Directory)?;
-    let encoded = encode_directory_sst(&directory_key, &directory_rows()?)?;
+    let encoded = encode_directory_sst(partition, &directory_key, &directory_rows()?)?;
     let wrong_partition: PartitionId = "10112233-4455-6677-8899-aabbccddeeff".parse()?;
-    let wrong_location = TableKey::new(wrong_partition, directory_key.object());
+    let wrong_location = TableKey::new(directory_key.object());
     assert_eq!(
         Err(SstDecodeError::IdentityMismatch),
-        decode_directory_sst(&wrong_location, &encoded)
+        decode_directory_sst(wrong_partition, &wrong_location, &encoded)
     );
     assert_eq!(
         Err(SstDecodeError::MalformedArchive),
         decode_directory_sst(
+            partition,
             &wrong_location,
             encoded
                 .get(..encoded.len().saturating_sub(1))
@@ -129,15 +141,16 @@ fn decoders_check_structure_before_location_identity() -> Result<(), Box<dyn std
     );
 
     let ledger_key = table_key(StoreKind::Ledger)?;
-    let encoded = encode_ledger_sst(&ledger_key, &ledger_rows()?)?;
-    let wrong_location = TableKey::new(wrong_partition, ledger_key.object());
+    let encoded = encode_ledger_sst(partition, &ledger_key, &ledger_rows()?)?;
+    let wrong_location = TableKey::new(ledger_key.object());
     assert_eq!(
         Err(SstDecodeError::IdentityMismatch),
-        decode_ledger_sst(&wrong_location, &encoded)
+        decode_ledger_sst(wrong_partition, &wrong_location, &encoded)
     );
     assert_eq!(
         Err(SstDecodeError::MalformedArchive),
         decode_ledger_sst(
+            partition,
             &wrong_location,
             encoded
                 .get(..encoded.len().saturating_sub(1))
@@ -150,15 +163,17 @@ fn decoders_check_structure_before_location_identity() -> Result<(), Box<dyn std
 #[test]
 fn checked_access_accepts_misaligned_object_store_slices() -> Result<(), Box<dyn std::error::Error>>
 {
+    let partition = partition()?;
     let directory_key = table_key(StoreKind::Directory)?;
     let rows = directory_rows()?;
-    let encoded = encode_directory_sst(&directory_key, &rows)?;
+    let encoded = encode_directory_sst(partition, &directory_key, &rows)?;
     let mut storage = Vec::with_capacity(encoded.len().saturating_add(1));
     storage.push(0);
     storage.extend_from_slice(&encoded);
     assert_eq!(
         rows,
         decode_directory_sst(
+            partition,
             &directory_key,
             storage.get(1..).ok_or("misaligned archive exists")?,
         )?
@@ -169,8 +184,10 @@ fn checked_access_accepts_misaligned_object_store_slices() -> Result<(), Box<dyn
 #[test]
 fn structurally_valid_noncanonical_values_fail_domain_construction()
 -> Result<(), Box<dyn std::error::Error>> {
+    let partition = partition()?;
     let directory_key = table_key(StoreKind::Directory)?;
     let encoded = encode_directory_sst(
+        partition,
         &directory_key,
         &[(key("events/a")?, DirectoryEntry::Live(uid(7)?))],
     )?;
@@ -185,7 +202,7 @@ fn structurally_valid_noncanonical_values_fail_domain_construction()
     *damaged.get_mut(final_byte).ok_or("key byte exists")? = b'/';
     assert_eq!(
         Err(SstDecodeError::InvalidBody),
-        decode_directory_sst(&directory_key, &damaged)
+        decode_directory_sst(partition, &directory_key, &damaged)
     );
 
     let ledger_key = table_key(StoreKind::Ledger)?;
@@ -198,7 +215,7 @@ fn structurally_valid_noncanonical_values_fail_domain_construction()
             9,
         )?),
     )];
-    let mut damaged = encode_ledger_sst(&ledger_key, &ledger_rows)?;
+    let mut damaged = encode_ledger_sst(partition, &ledger_key, &ledger_rows)?;
     let separator = damaged
         .windows(b"application/json".len())
         .position(|window| window == b"application/json")
@@ -209,9 +226,13 @@ fn structurally_valid_noncanonical_values_fail_domain_construction()
         .ok_or("content type separator exists")? = b'?';
     assert_eq!(
         Err(SstDecodeError::InvalidBody),
-        decode_ledger_sst(&ledger_key, &damaged)
+        decode_ledger_sst(partition, &ledger_key, &damaged)
     );
     Ok(())
+}
+
+fn partition() -> Result<PartitionId, strom_storage_domain::PartitionIdError> {
+    "00112233-4455-6677-8899-aabbccddeeff".parse()
 }
 
 fn table_key(store: StoreKind) -> Result<TableKey, Box<dyn std::error::Error>> {
@@ -220,10 +241,7 @@ fn table_key(store: StoreKind) -> Result<TableKey, Box<dyn std::error::Error>> {
         AttemptId::new(SealGeneration::genesis(), 4),
         0,
     )?;
-    Ok(TableKey::new(
-        partition()?,
-        TableObjectId::new(fresh, store),
-    ))
+    Ok(TableKey::new(TableObjectId::new(fresh, store)))
 }
 
 fn directory_rows() -> Result<Vec<(DirectoryKey, DirectoryEntry)>, Box<dyn std::error::Error>> {
@@ -289,8 +307,4 @@ fn record(
         lifecycle,
         BatchId::try_from(created_at)?,
     ))
-}
-
-fn partition() -> Result<PartitionId, strom_storage_domain::PartitionIdError> {
-    "00112233-4455-6677-8899-aabbccddeeff".parse()
 }

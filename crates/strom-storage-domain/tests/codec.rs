@@ -3,9 +3,9 @@ use std::num::NonZeroU64;
 use strom_domain::{ExpiryPolicy, StreamContentType, StreamId};
 use strom_storage_domain::{
     AttemptId, BatchId, DecodeError, DirectoryKey, FreshIdentity, OperationFact, OwnerToken,
-    PartitionId, SEAL_ENCODED_BYTES_MAX, Seal, SealGeneration, SealIdentity, SortedRun, StoreKind,
-    StreamUid, TableObjectId, TableRef, TreeVersion, WAL_ENCODED_BYTES_MAX, WalBody, WalFacts,
-    WalIdentity, WalObject, WalReplayPoint, decode_seal, decode_wal, encode_seal, encode_wal,
+    PartitionId, SEAL_ENCODED_BYTES_MAX, Seal, SealGeneration, SortedRun, StoreKind, StreamUid,
+    TableObjectId, TableRef, TreeVersion, WAL_ENCODED_BYTES_MAX, WalBody, WalFacts, WalObject,
+    WalReplayPoint, decode_seal, decode_wal, encode_seal, encode_wal,
 };
 
 const SEAL_ARCHIVE_FIXTURE: &[u8] = &[
@@ -47,7 +47,7 @@ fn seal_archive_fixture_anchors_the_root() -> Result<(), Box<dyn std::error::Err
     );
     assert_eq!(
         seal,
-        decode_seal(&seal.identity(), SEAL_ARCHIVE_FIXTURE)?,
+        decode_seal(seal.generation(), SEAL_ARCHIVE_FIXTURE)?,
         "fixture bytes decode independently of the encoder"
     );
     Ok(())
@@ -69,7 +69,7 @@ fn wal_archive_fixture_anchors_the_root() -> Result<(), Box<dyn std::error::Erro
     );
     assert_eq!(
         object,
-        decode_wal(&object.identity(), WAL_ARCHIVE_FIXTURE)?,
+        decode_wal(object.partition(), object.batch(), WAL_ARCHIVE_FIXTURE)?,
         "fixture bytes decode independently of the encoder"
     );
     Ok(())
@@ -78,7 +78,7 @@ fn wal_archive_fixture_anchors_the_root() -> Result<(), Box<dyn std::error::Erro
 #[test]
 fn nonempty_seal_manifest_roundtrips() -> Result<(), Box<dyn std::error::Error>> {
     let seal = representative_seal()?;
-    assert_eq!(seal, decode_seal(&seal.identity(), &encode_seal(&seal)?)?);
+    assert_eq!(seal, decode_seal(seal.generation(), &encode_seal(&seal)?)?);
     Ok(())
 }
 
@@ -107,7 +107,7 @@ fn every_wal_fact_variant_roundtrips() -> Result<(), Box<dyn std::error::Error>>
     );
     assert_eq!(
         object,
-        decode_wal(&object.identity(), &encode_wal(&object)?)?
+        decode_wal(object.partition(), object.batch(), &encode_wal(&object)?)?
     );
     Ok(())
 }
@@ -126,7 +126,7 @@ fn wal_checked_archive_enforces_structure_alignment_bound_and_identity()
         .ok_or("the prefixed WAL archive contains its payload")?;
     assert_eq!(
         Ok(object.clone()),
-        decode_wal(&object.identity(), misaligned),
+        decode_wal(object.partition(), object.batch(), misaligned),
         "object-store slices do not promise archive alignment"
     );
 
@@ -135,14 +135,14 @@ fn wal_checked_archive_enforces_structure_alignment_bound_and_identity()
         .ok_or("a WAL archive is non-empty")?;
     assert_eq!(
         Err(DecodeError::MalformedArchive),
-        decode_wal(&object.identity(), truncated),
+        decode_wal(object.partition(), object.batch(), truncated),
         "checked access rejects a truncated archive"
     );
 
-    let wrong_identity = WalIdentity::new(partition()?, BatchId::try_from(11)?);
+    let wrong_batch = BatchId::try_from(11)?;
     assert_eq!(
         Err(DecodeError::IdentityMismatch),
-        decode_wal(&wrong_identity, &encoded),
+        decode_wal(object.partition(), wrong_batch, &encoded),
         "the durable location and archived identity are one decoder input"
     );
 
@@ -152,7 +152,7 @@ fn wal_checked_archive_enforces_structure_alignment_bound_and_identity()
             bytes_max: WAL_ENCODED_BYTES_MAX,
             bytes_actual: oversized.len(),
         }),
-        decode_wal(&object.identity(), &oversized),
+        decode_wal(object.partition(), object.batch(), &oversized),
         "the complete byte bound runs before structural access"
     );
     Ok(())
@@ -172,7 +172,7 @@ fn seal_checked_archive_enforces_structure_alignment_bound_and_identity()
         .ok_or("the prefixed Seal archive contains its payload")?;
     assert_eq!(
         Ok(seal.clone()),
-        decode_seal(&seal.identity(), misaligned),
+        decode_seal(seal.generation(), misaligned),
         "object-store slices do not promise archive alignment"
     );
 
@@ -181,14 +181,14 @@ fn seal_checked_archive_enforces_structure_alignment_bound_and_identity()
         .ok_or("a Seal archive is non-empty")?;
     assert_eq!(
         Err(DecodeError::MalformedArchive),
-        decode_seal(&seal.identity(), truncated),
+        decode_seal(seal.generation(), truncated),
         "checked access rejects a truncated archive"
     );
 
-    let wrong_identity = SealIdentity::new(partition()?, SealGeneration::try_from(2)?);
+    let wrong_generation = SealGeneration::try_from(2)?;
     assert_eq!(
         Err(DecodeError::IdentityMismatch),
-        decode_seal(&wrong_identity, &encoded),
+        decode_seal(wrong_generation, &encoded),
         "the durable location and archived identity are one decoder input"
     );
 
@@ -198,7 +198,7 @@ fn seal_checked_archive_enforces_structure_alignment_bound_and_identity()
             bytes_max: SEAL_ENCODED_BYTES_MAX,
             bytes_actual: oversized.len(),
         }),
-        decode_seal(&seal.identity(), &oversized),
+        decode_seal(seal.generation(), &oversized),
         "the complete byte bound runs before structural access"
     );
     Ok(())
@@ -229,7 +229,7 @@ fn canonical_content_type_boundary_roundtrips_through_wal() -> Result<(), Box<dy
     let encoded = encode_wal(&object)?;
     assert_eq!(
         object,
-        decode_wal(&object.identity(), &encoded)?,
+        decode_wal(object.partition(), object.batch(), &encoded)?,
         "every accepted content type remains parseable after durable canonicalization"
     );
     Ok(())
@@ -249,7 +249,7 @@ fn durable_content_types_must_use_the_canonical_spelling() -> Result<(), Box<dyn
         .ok_or("the first content-type byte exists")? = b'A';
     assert_eq!(
         Err(DecodeError::InvalidBody),
-        decode_wal(&object.identity(), &encoded)
+        decode_wal(object.partition(), object.batch(), &encoded)
     );
     Ok(())
 }
@@ -261,7 +261,10 @@ fn unreachable_leading_bytes_are_tolerated_but_never_emitted()
     let encoded = encode_wal(&object)?;
     let mut prefixed = vec![0xaa, 0xbb, 0xcc];
     prefixed.extend_from_slice(&encoded);
-    assert_eq!(object, decode_wal(&object.identity(), &prefixed)?);
+    assert_eq!(
+        object,
+        decode_wal(object.partition(), object.batch(), &prefixed)?
+    );
     assert_ne!(encode_wal(&object)?, prefixed);
     Ok(())
 }

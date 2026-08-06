@@ -7,8 +7,8 @@ use strom_object_store::{
     ByteBound, CreateEvidence, Etag, FrozenBytes, ListPageRequest, ObjectStoreAdapter,
 };
 use strom_storage_domain::{
-    BatchId, EncodeError, PartitionId, WAL_ENCODED_BYTES_MAX, WalBody, WalIdentity, WalKey,
-    WalNamespace, WalObject, decode_wal, encode_wal,
+    BatchId, EncodeError, PartitionId, WAL_ENCODED_BYTES_MAX, WalBody, WalKey, WalNamespace,
+    WalObject, decode_wal, encode_wal,
 };
 
 use super::{StoreErrorClass, map_store_error, newest_keys_bound, object_key};
@@ -16,7 +16,7 @@ use super::{StoreErrorClass, map_store_error, newest_keys_bound, object_key};
 /// One WAL candidate, encoded exactly once. Key and body agree by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedWal {
-    identity: WalIdentity,
+    batch: BatchId,
     bytes: FrozenBytes,
 }
 
@@ -29,21 +29,21 @@ impl EncodedWal {
     /// [`WAL_ENCODED_BYTES_MAX`].
     pub fn new(object: &WalObject) -> Result<Self, EncodeError> {
         let bytes = encode_wal(object)?;
-        Ok(Self::from_encoded(object.identity(), bytes))
+        Ok(Self::from_encoded(object.batch(), bytes))
     }
 
-    fn from_encoded(identity: WalIdentity, bytes: Vec<u8>) -> Self {
+    fn from_encoded(batch: BatchId, bytes: Vec<u8>) -> Self {
         let frozen = FrozenBytes::try_from(bytes)
             .expect("encode_wal yields a non-empty body within PUT_BYTES_MAX");
         Self {
-            identity,
+            batch,
             bytes: frozen,
         }
     }
 
     #[must_use]
-    pub const fn identity(&self) -> WalIdentity {
-        self.identity
+    pub const fn batch(&self) -> BatchId {
+        self.batch
     }
 
     /// Exact frozen bytes of this candidate. After an ambiguous create, reconcile
@@ -74,8 +74,8 @@ impl ObservedWal {
     }
 
     #[must_use]
-    pub const fn identity(&self) -> WalIdentity {
-        self.object.identity()
+    pub const fn batch(&self) -> BatchId {
+        self.object.batch()
     }
 
     #[must_use]
@@ -96,11 +96,11 @@ impl ObservedWal {
     pub fn into_run_delete(self) -> Result<AuthorizedWalRunDelete, WalDeleteRefusal> {
         match self.object.body() {
             WalBody::Run(_) => Ok(AuthorizedWalRunDelete {
-                identity: self.object.identity(),
+                batch: self.object.batch(),
                 validator: self.validator,
             }),
             WalBody::Fence => Err(WalDeleteRefusal::Fence {
-                identity: self.object.identity(),
+                batch: self.object.batch(),
             }),
         }
     }
@@ -111,7 +111,7 @@ impl ObservedWal {
 pub enum WalDeleteRefusal {
     /// FENCE objects are permanent; collectors never delete them.
     #[error("WAL fence cannot become a delete proof")]
-    Fence { identity: WalIdentity },
+    Fence { batch: BatchId },
 }
 
 /// Proof that one decoded, collectible RUN was observed at its exact bytes.
@@ -129,14 +129,14 @@ pub enum WalDeleteRefusal {
 /// defense in depth against a non-conforming actor in the namespace.
 #[derive(Debug, PartialEq, Eq)]
 pub struct AuthorizedWalRunDelete {
-    identity: WalIdentity,
+    batch: BatchId,
     validator: Etag,
 }
 
 impl AuthorizedWalRunDelete {
     #[must_use]
-    pub const fn identity(&self) -> WalIdentity {
-        self.identity
+    pub const fn batch(&self) -> BatchId {
+        self.batch
     }
 
     #[must_use]
@@ -203,7 +203,7 @@ impl WalStore {
         &self,
         candidate: &EncodedWal,
     ) -> Result<CreateEvidence, WalStoreError> {
-        let key = object_key(WalKey::from(candidate.identity));
+        let key = object_key(WalKey::from(candidate.batch));
         self.adapter
             .create_if_absent(&key, candidate.bytes.clone())
             .await
@@ -216,14 +216,11 @@ impl WalStore {
     ///
     /// Returns [`WalStoreError`] on adapter failure. A listed key that does
     /// not parse as this partition's WAL key is a contradiction.
-    pub async fn newest_surviving_batch(
-        &self,
-        partition: PartitionId,
-    ) -> Result<Option<BatchId>, WalStoreError> {
+    pub async fn newest_surviving_batch(&self) -> Result<Option<BatchId>, WalStoreError> {
         let page = self
             .adapter
             .list_page(ListPageRequest {
-                prefix: object_key(WalNamespace::from(partition)),
+                prefix: object_key(WalNamespace),
                 start_exclusive: None,
                 keys_max: newest_keys_bound(),
             })
@@ -237,12 +234,7 @@ impl WalStore {
                 "listed key {listed} under the WAL namespace is not a WAL key: {source}"
             ))
         })?;
-        if key.identity().partition() != partition {
-            return Err(WalStoreError::contradiction(format!(
-                "listed WAL key {listed} belongs to a foreign partition"
-            )));
-        }
-        Ok(Some(key.identity().batch()))
+        Ok(Some(key.batch()))
     }
 
     /// Bounded read then checked decode against the exact identity.
@@ -253,9 +245,10 @@ impl WalStore {
     /// decode is a contradiction, never absence.
     pub async fn read_wal(
         &self,
-        identity: WalIdentity,
+        partition: PartitionId,
+        batch: BatchId,
     ) -> Result<Option<ObservedWal>, WalStoreError> {
-        let key = object_key(WalKey::from(identity));
+        let key = object_key(WalKey::from(batch));
         let bound = wal_read_bound();
         let Some(observed) = self
             .adapter
@@ -265,9 +258,9 @@ impl WalStore {
         else {
             return Ok(None);
         };
-        let object = decode_wal(&identity, observed.body()).map_err(|source| {
+        let object = decode_wal(partition, batch, observed.body()).map_err(|source| {
             WalStoreError::contradiction(format!(
-                "WAL body at {key} failed checked decode for {identity:?}: {source}"
+                "WAL body at {key} failed checked decode for {partition}/{batch:?}: {source}"
             ))
         })?;
         let bytes = FrozenBytes::try_from(observed.body().to_vec()).map_err(|source| {
@@ -299,13 +292,10 @@ impl WalStore {
     /// Returns [`WalStoreError`] when the adapter reports a retryable,
     /// rejected, or contradictory outcome.
     pub async fn delete_run(&self, proof: AuthorizedWalRunDelete) -> Result<(), WalStoreError> {
-        let AuthorizedWalRunDelete {
-            identity,
-            validator,
-        } = proof;
+        let AuthorizedWalRunDelete { batch, validator } = proof;
         // Retained until If-Match delete is available; see AuthorizedWalRunDelete.
         drop(validator);
-        let key = object_key(WalKey::from(identity));
+        let key = object_key(WalKey::from(batch));
         self.adapter
             .delete_idempotent(&key)
             .await
@@ -340,7 +330,7 @@ mod tests {
         );
 
         let first = store
-            .read_wal(candidate.identity())
+            .read_wal(partition(), candidate.batch())
             .await
             .expect("read runs")
             .expect("created WAL is present");
@@ -350,7 +340,7 @@ mod tests {
             "read-after-create recovers the WAL object"
         );
         let second = store
-            .read_wal(candidate.identity())
+            .read_wal(partition(), candidate.batch())
             .await
             .expect("re-read runs")
             .expect("created WAL is still present");
@@ -371,10 +361,7 @@ mod tests {
                 let candidate = EncodedWal::new(&run_at(batch_id)).expect("run encodes");
                 store.create_wal(&candidate).await.expect("create runs");
             }
-            let newest = store
-                .newest_surviving_batch(partition())
-                .await
-                .expect("list runs");
+            let newest = store.newest_surviving_batch().await.expect("list runs");
             assert_eq!(
                 newest,
                 Some(two),
@@ -405,7 +392,7 @@ mod tests {
 
         let adapter = ObjectStoreAdapter::in_memory();
         let contested = WalStore::new(adapter.clone());
-        let key = object_key(WalKey::from(object.identity()));
+        let key = object_key(WalKey::from(object.batch()));
         let foreign = FrozenBytes::try_from(b"not-a-wal".to_vec()).expect("foreign body freezes");
         adapter
             .create_if_absent(&key, foreign)
@@ -425,13 +412,10 @@ mod tests {
     #[tokio::test]
     async fn absence_is_none_for_read_and_newest_surviving_batch() {
         let store = WalStore::new(ObjectStoreAdapter::in_memory());
-        let identity = WalIdentity::new(partition(), batch(1));
-        let read = store.read_wal(identity).await.expect("read runs");
+        let batch = batch(1);
+        let read = store.read_wal(partition(), batch).await.expect("read runs");
         assert!(read.is_none(), "absence is Ok(None), not an error");
-        let newest = store
-            .newest_surviving_batch(partition())
-            .await
-            .expect("list runs");
+        let newest = store.newest_surviving_batch().await.expect("list runs");
         assert!(
             newest.is_none(),
             "an empty WAL namespace has no newest surviving batch"
@@ -442,8 +426,8 @@ mod tests {
     async fn garbage_bytes_at_a_valid_wal_key_are_a_typed_contradiction() {
         let adapter = ObjectStoreAdapter::in_memory();
         let store = WalStore::new(adapter.clone());
-        let identity = WalIdentity::new(partition(), batch(1));
-        let key = object_key(WalKey::from(identity));
+        let batch = batch(1);
+        let key = object_key(WalKey::from(batch));
         let garbage =
             FrozenBytes::try_from(b"garbage-wal-body".to_vec()).expect("garbage body freezes");
         adapter
@@ -451,7 +435,7 @@ mod tests {
             .await
             .expect("plant runs");
 
-        let outcome = store.read_wal(identity).await;
+        let outcome = store.read_wal(partition(), batch).await;
         assert!(
             matches!(outcome, Err(WalStoreError::Contradiction { .. })),
             "decode failure at an owned WAL key is Contradiction, got {outcome:?}"
@@ -466,7 +450,7 @@ mod tests {
         store.create_wal(&candidate).await.expect("create runs");
 
         let observed = store
-            .read_wal(candidate.identity())
+            .read_wal(partition(), candidate.batch())
             .await
             .expect("read runs")
             .expect("fence is present");
@@ -477,7 +461,7 @@ mod tests {
         assert_eq!(
             observed.into_run_delete(),
             Err(WalDeleteRefusal::Fence {
-                identity: object.identity()
+                batch: object.batch()
             }),
             "a fence observation cannot construct a delete proof"
         );
@@ -493,14 +477,14 @@ mod tests {
         // Two observations before delete: AuthorizedWalRunDelete is consumed,
         // so a second delete needs its own proof rather than cloning the first.
         let first_proof = store
-            .read_wal(candidate.identity())
+            .read_wal(partition(), candidate.batch())
             .await
             .expect("read runs")
             .expect("run is present")
             .into_run_delete()
             .expect("a run observation yields a delete proof");
         let second_proof = store
-            .read_wal(candidate.identity())
+            .read_wal(partition(), candidate.batch())
             .await
             .expect("re-read runs")
             .expect("run is still present")
@@ -512,7 +496,7 @@ mod tests {
             .await
             .expect("delete of a present run runs");
         let after = store
-            .read_wal(candidate.identity())
+            .read_wal(partition(), candidate.batch())
             .await
             .expect("read after delete runs");
         assert!(after.is_none(), "a deleted RUN is absent");
@@ -538,7 +522,7 @@ mod tests {
             .expect("create newer runs");
 
         let proof = store
-            .read_wal(newer.identity())
+            .read_wal(partition(), newer.batch())
             .await
             .expect("read runs")
             .expect("newer run is present")
@@ -546,10 +530,7 @@ mod tests {
             .expect("newer run yields a delete proof");
         store.delete_run(proof).await.expect("delete newer runs");
 
-        let newest = store
-            .newest_surviving_batch(partition())
-            .await
-            .expect("list runs");
+        let newest = store.newest_surviving_batch().await.expect("list runs");
         assert_eq!(
             newest,
             Some(batch(1)),
@@ -563,16 +544,15 @@ mod tests {
         let adapter = ObjectStoreAdapter::in_memory();
         let store = WalStore::new(adapter.clone());
         // `-` sorts before digits, so MaxKeys=1 surfaces this before any WAL key.
-        let garbage_key =
-            ObjectKey::try_from(format!("{}/-garbage", WalNamespace::from(partition())))
-                .expect("garbage key is a legal ObjectKey");
+        let garbage_key = ObjectKey::try_from(format!("{WalNamespace}/-garbage"))
+            .expect("garbage key is a legal ObjectKey");
         let body = FrozenBytes::try_from(b"foreign".to_vec()).expect("body freezes");
         adapter
             .create_if_absent(&garbage_key, body)
             .await
             .expect("plant runs");
 
-        let outcome = store.newest_surviving_batch(partition()).await;
+        let outcome = store.newest_surviving_batch().await;
         assert!(
             matches!(outcome, Err(WalStoreError::Contradiction { .. })),
             "a foreign key under the WAL namespace is Contradiction, got {outcome:?}"
@@ -584,17 +564,17 @@ mod tests {
      {
         let adapter = ObjectStoreAdapter::in_memory();
         let store = WalStore::new(adapter.clone());
-        let identity_a = WalIdentity::new(partition(), batch(1));
-        let identity_b = WalIdentity::new(partition(), batch(2));
-        let candidate_a = EncodedWal::new(&run_at(identity_a.batch())).expect("wal a encodes");
+        let batch_a = batch(1);
+        let batch_b = batch(2);
+        let candidate_a = EncodedWal::new(&run_at(batch_a)).expect("wal a encodes");
         let planted = FrozenBytes::try_from(candidate_a.as_slice().to_vec())
             .expect("encoded wal body freezes");
         adapter
-            .create_if_absent(&object_key(WalKey::from(identity_b)), planted)
+            .create_if_absent(&object_key(WalKey::from(batch_b)), planted)
             .await
             .expect("plant runs");
 
-        let outcome = store.read_wal(identity_b).await;
+        let outcome = store.read_wal(partition(), batch_b).await;
         assert!(
             matches!(outcome, Err(WalStoreError::Contradiction { .. })),
             "IdentityMismatch at the read identity is Contradiction, got {outcome:?}"

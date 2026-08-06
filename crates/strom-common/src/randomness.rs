@@ -3,35 +3,57 @@
 
 use std::collections::BTreeSet;
 
-use rand::{SeedableRng as _, TryRngCore as _};
+use rand::{RngCore as _, SeedableRng as _, TryRngCore as _};
 use rand_chacha::ChaCha12Rng;
 
 pub type Generator = ChaCha12Rng;
 
 /// The root seed of a run. One value reproduces every random choice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Seed(u64);
+pub struct Seed([u8; 32]);
 
 impl Seed {
     #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    #[must_use]
-    pub const fn value(self) -> u64 {
+    pub const fn bytes(self) -> [u8; 32] {
         self.0
     }
 
-    /// Draws a fresh seed from the operating system. Call once, in `main`.
+    /// Draws a fresh seed from the operating system at the outermost
+    /// production constructor.
     ///
     /// # Panics
     ///
     /// Panics when the OS entropy source fails.
     #[must_use]
     pub fn from_os() -> Self {
+        let mut bytes = [0; 32];
         let mut os_rng = rand::rngs::OsRng;
-        Self(os_rng.try_next_u64().expect("the OS entropy source failed"))
+        os_rng
+            .try_fill_bytes(&mut bytes)
+            .expect("the OS entropy source failed");
+        Self(bytes)
+    }
+}
+
+impl From<[u8; 32]> for Seed {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl From<u64> for Seed {
+    fn from(value: u64) -> Self {
+        let words = [
+            splitmix64(value),
+            splitmix64(value ^ SPLITMIX64_GOLDEN_GAMMA),
+            splitmix64(value ^ SPLITMIX64_MULTIPLIER_ONE),
+            splitmix64(value ^ SPLITMIX64_MULTIPLIER_TWO),
+        ];
+        let mut bytes = [0; 32];
+        for (target, word) in bytes.chunks_exact_mut(8).zip(words) {
+            target.copy_from_slice(&word.to_le_bytes());
+        }
+        Self(bytes)
     }
 }
 
@@ -50,7 +72,7 @@ impl Entropy {
     pub fn from_seed(seed: Seed) -> Self {
         Self {
             seed,
-            generator: Generator::seed_from_u64(seed.value()),
+            generator: Generator::from_seed(seed.bytes()),
             forked_labels: BTreeSet::new(),
         }
     }
@@ -69,7 +91,11 @@ impl Entropy {
             newly_used,
             "fork label reused on the same entropy source: {label}"
         );
-        Self::from_seed(Seed::new(splitmix64(self.seed.value() ^ label_digest)))
+        let mut derivation = Generator::from_seed(self.seed.bytes());
+        derivation.set_stream(label_digest);
+        let mut child = [0; 32];
+        derivation.fill_bytes(&mut child);
+        Self::from_seed(Seed::from(child))
     }
 
     pub const fn rng(&mut self) -> &mut Generator {
@@ -112,15 +138,15 @@ mod tests {
     const FIXTURE_SEED: u64 = 42;
 
     /// First two draws of the root stream for [`FIXTURE_SEED`].
-    const FIXTURE_ROOT_DRAWS: [u64; 2] = [9_713_269_763_989_775_522, 10_011_513_049_433_592_189];
+    const FIXTURE_ROOT_DRAWS: [u64; 2] = [11_305_477_906_358_143_919, 15_654_538_575_330_592_847];
 
     /// First draw of the `wal` child of [`FIXTURE_SEED`].
-    const FIXTURE_WAL_CHILD_DRAW: u64 = 10_677_131_651_932_318_252;
+    const FIXTURE_WAL_CHILD_DRAW: u64 = 18_381_414_694_312_472_311;
 
     #[test]
     fn equal_seeds_produce_identical_streams() {
-        let mut source_a = Entropy::from_seed(Seed::new(FIXTURE_SEED));
-        let mut source_b = Entropy::from_seed(Seed::new(FIXTURE_SEED));
+        let mut source_a = Entropy::from_seed(Seed::from(FIXTURE_SEED));
+        let mut source_b = Entropy::from_seed(Seed::from(FIXTURE_SEED));
         for _ in 0u8..4u8 {
             assert_eq!(
                 source_a.rng().next_u64(),
@@ -132,7 +158,7 @@ mod tests {
 
     #[test]
     fn distinct_fork_labels_produce_distinct_streams() {
-        let mut root = Entropy::from_seed(Seed::new(FIXTURE_SEED));
+        let mut root = Entropy::from_seed(Seed::from(FIXTURE_SEED));
         let mut wal_stream = root.fork("wal");
         let mut id_stream = root.fork("ids");
         assert_ne!(
@@ -144,8 +170,8 @@ mod tests {
 
     #[test]
     fn forks_do_not_depend_on_draws_made_before_the_fork() {
-        let mut drained_root = Entropy::from_seed(Seed::new(FIXTURE_SEED));
-        let mut fresh_root = Entropy::from_seed(Seed::new(FIXTURE_SEED));
+        let mut drained_root = Entropy::from_seed(Seed::from(FIXTURE_SEED));
+        let mut fresh_root = Entropy::from_seed(Seed::from(FIXTURE_SEED));
         let _skipped = drained_root.rng().next_u64();
 
         let mut child_of_drained = drained_root.fork("wal");
@@ -162,7 +188,7 @@ mod tests {
     /// these numbers may change only when the recorded seeds are also retired.
     #[test]
     fn a_recorded_seed_replays_the_same_draws() {
-        let mut root = Entropy::from_seed(Seed::new(FIXTURE_SEED));
+        let mut root = Entropy::from_seed(Seed::from(FIXTURE_SEED));
         let first = root.rng().next_u64();
         let second = root.rng().next_u64();
         assert_eq!(
@@ -182,8 +208,23 @@ mod tests {
     #[test]
     #[should_panic(expected = "fork label reused")]
     fn reusing_a_fork_label_panics() {
-        let mut root = Entropy::from_seed(Seed::new(FIXTURE_SEED));
+        let mut root = Entropy::from_seed(Seed::from(FIXTURE_SEED));
         drop(root.fork("wal"));
         drop(root.fork("wal"));
+    }
+
+    #[test]
+    fn entropy_beyond_the_first_u64_changes_the_stream() {
+        let low = Seed::from([0; 32]);
+        let mut high_bytes = [0; 32];
+        high_bytes[31] = 1;
+        let high = Seed::from(high_bytes);
+        let mut low_entropy = Entropy::from_seed(low);
+        let mut high_entropy = Entropy::from_seed(high);
+        assert_ne!(
+            low_entropy.rng().next_u64(),
+            high_entropy.rng().next_u64(),
+            "entropy outside the first u64 must affect the generated stream"
+        );
     }
 }

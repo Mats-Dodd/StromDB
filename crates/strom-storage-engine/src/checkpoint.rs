@@ -30,6 +30,8 @@ use crate::store::{
 pub(crate) const WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER: u64 = 512;
 const CHECKPOINT_CHILD_CREATES_MAX: usize = 16;
 const CHECKPOINT_PREPARATIONS_MAX: usize = 2;
+// Keep preparation behind the fixed-width child-create pipeline instead of
+// retaining a checkpoint's encoded tables in aggregate.
 const CHECKPOINT_TABLE_CHANNEL_MAX: usize = 1;
 static CHECKPOINT_PREPARATIONS: Semaphore = Semaphore::const_new(CHECKPOINT_PREPARATIONS_MAX);
 
@@ -192,9 +194,7 @@ pub(crate) async fn execute_checkpoint(
     let preparation = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let prepared = prepare_checkpoint(input, &mut |table| {
-            table_sender.blocking_send(table).map_err(|_closed| {
-                CheckpointContradiction::from("checkpoint table consumer stopped".to_owned())
-            })
+            table_sender.blocking_send(table).is_ok()
         });
         let _consumer_may_be_gone = prepared_sender.send(prepared);
     });
@@ -215,7 +215,8 @@ pub(crate) async fn execute_checkpoint(
         }
     }
     let prepared = match prepared_receiver.await {
-        Ok(Ok(prepared)) => prepared,
+        Ok(Ok(Some(prepared))) => prepared,
+        Ok(Ok(None)) => return CheckpointOutcome::Abandoned,
         Ok(Err(error)) => {
             return CheckpointOutcome::Contradiction {
                 cut,
@@ -239,7 +240,7 @@ pub(crate) async fn execute_checkpoint(
 }
 
 pub(crate) async fn collect_advance(adapter: ObjectStoreAdapter, source: Seal, successor: Seal) {
-    let partition = successor.identity().partition();
+    let partition = successor.partition();
     let previous_cut = replay_batch(source.replay());
     let Some(cut) = advancing_batch(successor.replay()) else {
         return;
@@ -253,10 +254,7 @@ pub(crate) async fn collect_advance(adapter: ObjectStoreAdapter, source: Seal, s
         None => BatchId::try_from(1).expect("batch one is a legal WAL coordinate"),
     };
     loop {
-        match wal_store
-            .read_wal(strom_storage_domain::WalIdentity::new(partition, batch))
-            .await
-        {
+        match wal_store.read_wal(partition, batch).await {
             Ok(Some(observed)) => match observed.into_run_delete() {
                 Ok(proof) => {
                     if wal_store.delete_run(proof).await.is_err() {
@@ -351,8 +349,8 @@ async fn establish_table(
 
 fn prepare_checkpoint(
     input: CheckpointInput,
-    emit: &mut impl FnMut(EncodedTable) -> Result<(), CheckpointContradiction>,
-) -> Result<Box<PreparedCheckpoint>, CheckpointContradiction> {
+    emit: &mut impl FnMut(EncodedTable) -> bool,
+) -> Result<Option<Box<PreparedCheckpoint>>, CheckpointContradiction> {
     let CheckpointInput {
         source,
         base,
@@ -360,7 +358,7 @@ fn prepare_checkpoint(
         cut,
         attempt,
     } = input;
-    let partition = source.identity().partition();
+    let partition = source.partition();
     let owner_claim = attempt.owner_claim();
     let previous_cut = replay_batch(source.replay());
     if previous_cut.is_some_and(|previous| cut <= previous) {
@@ -369,7 +367,6 @@ fn prepare_checkpoint(
             .into());
     }
     let generation = source
-        .identity()
         .generation()
         .successor()
         .map_err(|error| error.to_string())?;
@@ -378,7 +375,7 @@ fn prepare_checkpoint(
     let mut ordinal = 0u32;
     let (directory, ledger) = match plan {
         CheckpointPlan::Delta => {
-            let directory = build_directory_tree(
+            let Some(directory) = build_directory_tree(
                 partition,
                 generation,
                 attempt,
@@ -386,8 +383,10 @@ fn prepare_checkpoint(
                 delta_directory_rows(&base, &snapshot),
                 Some(source.directory()),
                 emit,
-            )?;
-            let ledger = build_ledger_tree(
+            ) else {
+                return Ok(None);
+            };
+            let Some(ledger) = build_ledger_tree(
                 partition,
                 generation,
                 attempt,
@@ -395,7 +394,9 @@ fn prepare_checkpoint(
                 delta_ledger_rows(&base, &snapshot),
                 Some(source.ledger()),
                 emit,
-            )?;
+            ) else {
+                return Ok(None);
+            };
             (directory, ledger)
         }
         CheckpointPlan::Full => {
@@ -403,7 +404,7 @@ fn prepare_checkpoint(
                 .directory_rows()
                 .iter()
                 .map(|(key, entry)| (key.clone(), *entry));
-            let directory = build_directory_tree(
+            let Some(directory) = build_directory_tree(
                 partition,
                 generation,
                 attempt,
@@ -411,12 +412,14 @@ fn prepare_checkpoint(
                 directory_rows,
                 None,
                 emit,
-            )?;
+            ) else {
+                return Ok(None);
+            };
             let ledger_rows = snapshot
                 .ledger_rows()
                 .iter()
                 .map(|(uid, record)| (*uid, LedgerCell::Value(record.clone())));
-            let ledger = build_ledger_tree(
+            let Some(ledger) = build_ledger_tree(
                 partition,
                 generation,
                 attempt,
@@ -424,28 +427,26 @@ fn prepare_checkpoint(
                 ledger_rows,
                 None,
                 emit,
-            )?;
+            ) else {
+                return Ok(None);
+            };
             (directory, ledger)
         }
     };
-    let successor = Seal::new(
+    let (successor, encoded_seal) = assemble_checkpoint_seal(
         partition,
         generation,
-        WalReplayPoint::Through {
-            batch: cut,
-            owner: OwnerToken::from(owner_claim),
-        },
+        cut,
+        OwnerToken::from(owner_claim),
         directory,
         ledger,
-    )
-    .map_err(|error| error.to_string())?;
-    let encoded_seal = EncodedSeal::new(&successor).map_err(|error| error.to_string())?;
-    Ok(Box::new(PreparedCheckpoint {
+    );
+    Ok(Some(Box::new(PreparedCheckpoint {
         source,
         successor,
         snapshot,
         encoded_seal,
-    }))
+    })))
 }
 
 const fn replay_batch(replay: WalReplayPoint) -> Option<BatchId> {
@@ -537,9 +538,8 @@ fn chunk_rows<Row>(
     let mut chunks = Vec::new();
     for_each_chunk(rows, row_bytes, |chunk, _estimate| {
         chunks.push(chunk);
-        Ok(())
-    })
-    .expect("one checkpoint table estimate fits in u64");
+        true
+    });
     chunks
 }
 
@@ -557,10 +557,9 @@ fn account_rows(rows: impl IntoIterator<Item = u64>) -> ChunkAccounting {
                 .bytes
                 .checked_add(table_bytes)
                 .expect("a checkpoint byte estimate fits in u64");
-            Ok(())
+            true
         },
-    )
-    .expect("one checkpoint table estimate fits in u64");
+    );
     accounting
 }
 
@@ -622,6 +621,37 @@ fn assert_full_plan(directory: ChunkAccounting, ledger: ChunkAccounting) {
     );
 }
 
+fn build_directory_tree(
+    partition: PartitionId,
+    generation: SealGeneration,
+    attempt: AttemptId,
+    ordinal: &mut u32,
+    rows: impl IntoIterator<Item = (DirectoryKey, DirectoryEntry)>,
+    carried: Option<&TreeVersion>,
+    emit: &mut impl FnMut(EncodedTable) -> bool,
+) -> Option<TreeVersion> {
+    let mut references = Vec::new();
+    for_each_chunk(
+        rows,
+        |_row| DIRECTORY_ROW_ENCODED_BYTES_MAX,
+        |rows, estimate| {
+            let key = next_table_key(generation, attempt, ordinal, StoreKind::Directory);
+            let encoded = EncodedTable::new(
+                key,
+                encode_directory_sst(partition, &key, &rows)
+                    .expect("planned Directory rows fit the durable table encoding"),
+            );
+            assert!(
+                encoded.table().object_bytes().get() <= estimate,
+                "Directory encoded accounting dominates the exact frozen table length"
+            );
+            references.push(encoded.table());
+            emit(encoded)
+        },
+    )
+    .then(|| build_manifest(carried, references))
+}
+
 fn delta_directory_rows<'forest>(
     base: &'forest Forest,
     snapshot: &'forest Forest,
@@ -642,6 +672,37 @@ fn delta_directory_rows<'forest>(
                 None
             }
         })
+}
+
+fn build_ledger_tree(
+    partition: PartitionId,
+    generation: SealGeneration,
+    attempt: AttemptId,
+    ordinal: &mut u32,
+    rows: impl IntoIterator<Item = (StreamUid, LedgerCell)>,
+    carried: Option<&TreeVersion>,
+    emit: &mut impl FnMut(EncodedTable) -> bool,
+) -> Option<TreeVersion> {
+    let mut references = Vec::new();
+    for_each_chunk(
+        rows,
+        |(_uid, cell)| ledger_row_bytes(cell),
+        |rows, estimate| {
+            let key = next_table_key(generation, attempt, ordinal, StoreKind::Ledger);
+            let encoded = EncodedTable::new(
+                key,
+                encode_ledger_sst(partition, &key, &rows)
+                    .expect("planned Ledger rows fit the durable table encoding"),
+            );
+            assert!(
+                encoded.table().object_bytes().get() <= estimate,
+                "Ledger encoded accounting dominates the exact frozen table length"
+            );
+            references.push(encoded.table());
+            emit(encoded)
+        },
+    )
+    .then(|| build_manifest(carried, references))
 }
 
 fn delta_ledger_rows<'forest>(
@@ -667,77 +728,11 @@ const fn ledger_row_bytes(cell: &LedgerCell) -> u64 {
     }
 }
 
-fn build_directory_tree(
-    partition: PartitionId,
-    generation: SealGeneration,
-    attempt: AttemptId,
-    ordinal: &mut u32,
-    rows: impl IntoIterator<Item = (DirectoryKey, DirectoryEntry)>,
-    carried: Option<&TreeVersion>,
-    emit: &mut impl FnMut(EncodedTable) -> Result<(), CheckpointContradiction>,
-) -> Result<TreeVersion, CheckpointContradiction> {
-    let mut references = Vec::new();
-    for_each_chunk(
-        rows,
-        |_row| DIRECTORY_ROW_ENCODED_BYTES_MAX,
-        |rows, estimate| {
-            let key = next_table_key(
-                partition,
-                generation,
-                attempt,
-                ordinal,
-                StoreKind::Directory,
-            )?;
-            let encoded = EncodedTable::new(
-                key,
-                encode_directory_sst(&key, &rows).map_err(|error| error.to_string())?,
-            );
-            assert!(
-                encoded.table().object_bytes().get() <= estimate,
-                "Directory encoded accounting dominates the exact frozen table length"
-            );
-            references.push(encoded.table());
-            emit(encoded)
-        },
-    )?;
-    build_manifest(carried, references)
-}
-
-fn build_ledger_tree(
-    partition: PartitionId,
-    generation: SealGeneration,
-    attempt: AttemptId,
-    ordinal: &mut u32,
-    rows: impl IntoIterator<Item = (StreamUid, LedgerCell)>,
-    carried: Option<&TreeVersion>,
-    emit: &mut impl FnMut(EncodedTable) -> Result<(), CheckpointContradiction>,
-) -> Result<TreeVersion, CheckpointContradiction> {
-    let mut references = Vec::new();
-    for_each_chunk(
-        rows,
-        |(_uid, cell)| ledger_row_bytes(cell),
-        |rows, estimate| {
-            let key = next_table_key(partition, generation, attempt, ordinal, StoreKind::Ledger)?;
-            let encoded = EncodedTable::new(
-                key,
-                encode_ledger_sst(&key, &rows).map_err(|error| error.to_string())?,
-            );
-            assert!(
-                encoded.table().object_bytes().get() <= estimate,
-                "Ledger encoded accounting dominates the exact frozen table length"
-            );
-            references.push(encoded.table());
-            emit(encoded)
-        },
-    )?;
-    build_manifest(carried, references)
-}
-
 fn for_each_chunk<Row>(
     rows: impl IntoIterator<Item = Row>,
     row_bytes: impl Fn(&Row) -> u64,
-    mut emit: impl FnMut(Vec<Row>, u64) -> Result<(), CheckpointContradiction>,
-) -> Result<(), CheckpointContradiction> {
+    mut emit: impl FnMut(Vec<Row>, u64) -> bool,
+) -> bool {
     let mut chunk = Vec::new();
     let mut bytes = SST_ARCHIVE_FIXED_BYTES_MAX;
     for row in rows {
@@ -750,46 +745,44 @@ fn for_each_chunk<Row>(
         );
         let extended = bytes
             .checked_add(additional)
-            .ok_or_else(|| "checkpoint table estimate overflows u64".to_owned())?;
+            .expect("a checkpoint table estimate fits in u64");
         if !chunk.is_empty() && extended > SST_TABLE_TARGET_BYTES {
-            emit(std::mem::take(&mut chunk), bytes)?;
+            if !emit(std::mem::take(&mut chunk), bytes) {
+                return false;
+            }
             bytes = SST_ARCHIVE_FIXED_BYTES_MAX;
         }
         bytes = bytes
             .checked_add(additional)
-            .ok_or_else(|| "checkpoint table estimate overflows u64".to_owned())?;
+            .expect("a checkpoint table estimate fits in u64");
         chunk.push(row);
     }
-    if !chunk.is_empty() {
-        emit(chunk, bytes)?;
+    if !chunk.is_empty() && !emit(chunk, bytes) {
+        return false;
     }
-    Ok(())
+    true
 }
 
 fn next_table_key(
-    partition: PartitionId,
     generation: SealGeneration,
     attempt: AttemptId,
     ordinal: &mut u32,
     store: StoreKind,
-) -> Result<TableKey, CheckpointContradiction> {
+) -> TableKey {
     let current = *ordinal;
     *ordinal = ordinal
         .checked_add(1)
-        .ok_or_else(|| "checkpoint table ordinal is exhausted".to_owned())?;
-    let fresh =
-        FreshIdentity::new(generation, attempt, current).map_err(|error| error.to_string())?;
-    Ok(TableKey::new(partition, TableObjectId::new(fresh, store)))
+        .expect("a checkpoint table ordinal fits in u32");
+    let fresh = FreshIdentity::new(generation, attempt, current)
+        .expect("checkpoint planning constructs a valid fresh table identity");
+    TableKey::new(TableObjectId::new(fresh, store))
 }
 
-fn build_manifest(
-    carried: Option<&TreeVersion>,
-    tables: Vec<TableRef>,
-) -> Result<TreeVersion, CheckpointContradiction> {
+fn build_manifest(carried: Option<&TreeVersion>, tables: Vec<TableRef>) -> TreeVersion {
     let fresh = if tables.is_empty() {
         None
     } else {
-        Some(SortedRun::try_from(tables).map_err(|error| error.to_string())?)
+        Some(SortedRun::try_from(tables).expect("checkpoint tables form one legal sorted run"))
     };
     let runs = match (carried, fresh) {
         (Some(carried), Some(fresh)) => {
@@ -807,7 +800,28 @@ fn build_manifest(
         (None, Some(fresh)) => vec![fresh],
         (None, None) => Vec::new(),
     };
-    TreeVersion::try_from(runs).map_err(|error| error.to_string().into())
+    TreeVersion::try_from(runs).expect("checkpoint planning constructs a legal tree version")
+}
+
+fn assemble_checkpoint_seal(
+    partition: PartitionId,
+    generation: SealGeneration,
+    cut: BatchId,
+    owner: OwnerToken,
+    directory: TreeVersion,
+    ledger: TreeVersion,
+) -> (Seal, EncodedSeal) {
+    let successor = Seal::new(
+        partition,
+        generation,
+        WalReplayPoint::Through { batch: cut, owner },
+        directory,
+        ledger,
+    )
+    .expect("checkpoint planning constructs a valid exact-successor Seal");
+    let encoded = EncodedSeal::new(&successor)
+        .expect("a planned checkpoint Seal fits the durable encoding bound");
+    (successor, encoded)
 }
 
 #[cfg(test)]
@@ -913,12 +927,12 @@ mod tests {
             TreeVersion::empty(),
             TreeVersion::empty(),
         )?;
-        let owner_claim = source.identity().generation().successor()?;
+        let owner_claim = source.generation().successor()?;
         let source = source.claim_successor()?;
         let cut = BatchId::try_from(1)?;
         let source = Seal::new(
             partition,
-            source.identity().generation(),
+            source.generation(),
             WalReplayPoint::Through {
                 batch: cut,
                 owner: OwnerToken::from(SealGeneration::genesis()),
@@ -996,8 +1010,7 @@ mod tests {
                 .iter()
                 .chain(successor.ledger().runs())
                 .flat_map(SortedRun::tables)
-                .all(|table| table.object().fresh().birth_generation()
-                    == successor.identity().generation()),
+                .all(|table| table.object().fresh().birth_generation() == successor.generation()),
             "global fallback carries no source table"
         );
         Ok(())
@@ -1087,7 +1100,7 @@ mod tests {
         )?;
         let successor = Seal::new(
             partition,
-            source.identity().generation().successor()?,
+            source.generation().successor()?,
             WalReplayPoint::Through {
                 batch: BatchId::try_from(3)?,
                 owner,
@@ -1097,8 +1110,13 @@ mod tests {
         )?;
 
         collect_advance(adapter, source, successor).await;
-        assert!(wal_store.read_wal(fence.identity()).await?.is_some());
-        assert!(wal_store.read_wal(run.identity()).await?.is_none());
+        assert!(
+            wal_store
+                .read_wal(partition, fence.batch())
+                .await?
+                .is_some()
+        );
+        assert!(wal_store.read_wal(partition, run.batch()).await?.is_none());
         Ok(())
     }
 
@@ -1109,18 +1127,15 @@ mod tests {
         let partition = partition();
         let owner_claim = SealGeneration::genesis();
         let source_generation = owner_claim.successor()?;
-        let key = TableKey::new(
-            partition,
-            TableObjectId::new(
-                FreshIdentity::new(source_generation, AttemptId::new(owner_claim, 1), 0)?,
-                StoreKind::Directory,
-            ),
-        );
+        let key = TableKey::new(TableObjectId::new(
+            FreshIdentity::new(source_generation, AttemptId::new(owner_claim, 1), 0)?,
+            StoreKind::Directory,
+        ));
         let rows = vec![(
             directory_key("events/dead")?,
             DirectoryEntry::Tombstone(StreamUid::try_from(1)?),
         )];
-        let encoded = EncodedTable::new(key, encode_directory_sst(&key, &rows)?);
+        let encoded = EncodedTable::new(key, encode_directory_sst(partition, &key, &rows)?);
         let table_store = TableStore::new(adapter.clone());
         assert_eq!(
             CreateEvidence::Direct,
@@ -1230,8 +1245,9 @@ mod tests {
         let mut tables = Vec::new();
         let prepared = prepare_checkpoint(input, &mut |table| {
             tables.push(table);
-            Ok(())
-        })?;
+            true
+        })?
+        .expect("the test table consumer remains open");
         Ok((*prepared, tables))
     }
 

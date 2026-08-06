@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 object_store = { workspace = true }
+strom-common = { path = "../strom-common", version = "0.1.0" }
 strom-domain = { path = "../strom-domain", version = "0.1.0" }
 strom-object-store = { path = "../strom-object-store", version = "0.1.0" }
 strom-storage-domain = { path = "../strom-storage-domain", version = "0.1.0" }

@@ -86,22 +86,21 @@ enum WriterEvent {
 
 pub(crate) fn spawn_writer(
     adapter: strom_object_store::ObjectStoreAdapter,
-    partition: PartitionId,
     ready: Ready,
     ingress: mpsc::Receiver<CommandEnvelope>,
     view: watch::Sender<PublishedView>,
 ) -> JoinHandle<WriterExit> {
-    let writer = Writer::new(adapter, partition, ready, view);
+    let writer = Writer::new(adapter, ready, view);
     tokio::spawn(writer.run(ingress))
 }
 
 impl Writer {
     fn new(
         adapter: strom_object_store::ObjectStoreAdapter,
-        partition: PartitionId,
         ready: Ready,
         view: watch::Sender<PublishedView>,
     ) -> Self {
+        let partition = ready.partition();
         let WriterSeed {
             claim,
             seal,
@@ -348,7 +347,10 @@ impl Writer {
                 batch: flight.batch,
             }),
             Ok(CreateEvidence::Unresolved) => {
-                let observed = self.wal_store.read_wal(flight.encoded.identity()).await;
+                let observed = self
+                    .wal_store
+                    .read_wal(self.partition, flight.encoded.batch())
+                    .await;
                 match observed {
                     Ok(Some(observed)) if observed.as_slice() == flight.encoded.as_slice() => {
                         self.commit(flight);
@@ -398,7 +400,7 @@ impl Writer {
             replay_batch(self.seal.replay()).is_none_or(|cut| self.durable_batch > cut),
             "a checkpoint trigger names an advancing durable cut"
         );
-        let attempt = AttemptId::new(self.claim.identity().generation(), self.checkpoint_attempt);
+        let attempt = AttemptId::new(self.claim.generation(), self.checkpoint_attempt);
         self.checkpoint_attempt =
             self.checkpoint_attempt
                 .checked_add(1)
@@ -438,7 +440,7 @@ impl Writer {
                     self.seal = successor.clone();
                     self.base = install.snapshot;
                     self.view.send_replace(PublishedView::new(
-                        successor.identity(),
+                        successor.generation(),
                         successor.replay(),
                         self.durable.clone(),
                     ));
@@ -520,7 +522,7 @@ impl Writer {
         }
         self.durable_batch = flight.batch;
         self.view.send_replace(PublishedView::new(
-            self.seal.identity(),
+            self.seal.generation(),
             self.seal.replay(),
             self.durable.clone(),
         ));
@@ -572,7 +574,7 @@ mod tests {
     use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
     use strom_object_store::ObjectStoreAdapter;
     use strom_storage_domain::{
-        DirectoryEntry, DirectoryKey, StreamUid, WAL_SUFFIX_COORDINATES_MAX_V2, WalIdentity,
+        DirectoryEntry, DirectoryKey, StreamUid, WAL_SUFFIX_COORDINATES_MAX_V2,
     };
 
     use super::*;
@@ -589,6 +591,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let adapter = ObjectStoreAdapter::in_memory();
         let (mut writer, _view) = writer(adapter.clone()).await?;
+        let partition = writer.partition;
         let batch_2 = writer.next_batch;
         let initial = create_command("events/a")?;
         let initial = admitted_command(&mut writer, &initial, batch_2)?;
@@ -630,7 +633,7 @@ mod tests {
         );
 
         let grouped = WalStore::new(adapter)
-            .read_wal(WalIdentity::new(partition(), BatchId::try_from(3)?))
+            .read_wal(partition, BatchId::try_from(3)?)
             .await?
             .expect("the grouped pending RUN was created");
         let WalBody::Run(facts) = grouped.body() else {
@@ -765,7 +768,7 @@ mod tests {
         writer.start_checkpoint()?;
         complete_active_checkpoint(&mut writer).await?;
 
-        let ready = bootstrap(adapter, partition()).await?;
+        let ready = bootstrap(adapter, crate::test_entropy()).await?;
         assert_eq!(
             Some(DirectoryEntry::Live(StreamUid::try_from(1)?)),
             ready.forest().resolve(&path),
@@ -790,24 +793,24 @@ mod tests {
         assert!(matches!(reply.await?, Ok(StreamReply::Created { .. })));
         drop(first);
 
-        let ready = bootstrap(adapter.clone(), partition()).await?;
+        let ready = bootstrap(adapter.clone(), crate::test_entropy()).await?;
         assert_eq!(
             Some(DirectoryEntry::Live(StreamUid::try_from(1)?)),
             ready.forest().resolve(&path),
             "takeover replays the older owner's RUN before Ready"
         );
         let initial = PublishedView::new(
-            ready.claim().identity(),
+            ready.claim().generation(),
             ready.replay(),
             ready.forest().clone(),
         );
         let (view, _receiver) = watch::channel(initial);
-        let mut takeover = Writer::new(adapter.clone(), partition(), ready, view);
+        let mut takeover = Writer::new(adapter.clone(), ready, view);
         takeover.checkpoint_requested = true;
         takeover.start_checkpoint()?;
         complete_active_checkpoint(&mut takeover).await?;
 
-        let reopened = bootstrap(adapter, partition()).await?;
+        let reopened = bootstrap(adapter, crate::test_entropy()).await?;
         assert_eq!(
             Some(DirectoryEntry::Live(StreamUid::try_from(1)?)),
             reopened.forest().resolve(&path),
@@ -1018,14 +1021,14 @@ mod tests {
     async fn writer(
         adapter: ObjectStoreAdapter,
     ) -> Result<(Writer, watch::Receiver<PublishedView>), Box<dyn std::error::Error>> {
-        let ready = bootstrap(adapter.clone(), partition()).await?;
+        let ready = bootstrap(adapter.clone(), crate::test_entropy()).await?;
         let initial = PublishedView::new(
-            ready.claim().identity(),
+            ready.claim().generation(),
             ready.replay(),
             ready.forest().clone(),
         );
         let (view, receiver) = watch::channel(initial);
-        Ok((Writer::new(adapter, partition(), ready, view), receiver))
+        Ok((Writer::new(adapter, ready, view), receiver))
     }
 
     fn admitted_command(
@@ -1097,6 +1100,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let adapter = ObjectStoreAdapter::in_memory();
         let (mut writer, _view) = writer(adapter.clone()).await?;
+        let partition = writer.partition;
         let batch_2 = writer.next_batch;
         let initial = create_command("events/a")?;
         let initial = admitted_command(&mut writer, &initial, batch_2)?;
@@ -1135,7 +1139,7 @@ mod tests {
         );
 
         let grouped = WalStore::new(adapter)
-            .read_wal(WalIdentity::new(partition(), BatchId::try_from(3)?))
+            .read_wal(partition, BatchId::try_from(3)?)
             .await?;
         assert!(
             grouped.is_none(),
@@ -1173,11 +1177,5 @@ mod tests {
             "an idempotent retry consumes no WAL coordinate and stays answerable"
         );
         Ok(())
-    }
-
-    fn partition() -> PartitionId {
-        "00112233-4455-6677-8899-aabbccddeeff"
-            .parse()
-            .expect("test partition is canonical")
     }
 }

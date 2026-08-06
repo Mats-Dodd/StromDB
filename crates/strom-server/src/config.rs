@@ -8,7 +8,6 @@ use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use object_store::memory::InMemory;
 use object_store::prefix::PrefixStore;
-use stromdb::PartitionId;
 
 // Path is relative to this crate's manifest directory (`crates/strom-server`).
 // Isolated so secretspec_derive's serde/`std::env::var` expansion can carry an
@@ -32,10 +31,6 @@ pub struct ServerConfig {
     /// Socket address to bind.
     #[arg(long, env = "STROM_BIND", default_value = "127.0.0.1:4437")]
     pub bind: SocketAddr,
-
-    /// Partition served by this process.
-    #[arg(long, env = "STROM_PARTITION")]
-    pub partition: PartitionId,
 
     /// Object-store backend.
     #[arg(long, env = "STROM_STORE", default_value = "memory")]

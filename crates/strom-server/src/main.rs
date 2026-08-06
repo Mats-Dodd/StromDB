@@ -20,7 +20,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let config = ServerConfig::parse();
     let store = config.build_store()?;
-    let db = Arc::new(Db::open(store, config.partition).await?);
+    let db = Arc::new(Db::open(store).await?);
+    tracing::info!(partition = %db.partition_id(), "opened partition");
     let app = router(Arc::clone(&db));
     let listener = TcpListener::bind(config.bind)
         .await

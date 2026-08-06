@@ -6,9 +6,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt as _;
 use strom_server::router;
+use stromdb::Db;
 use stromdb::object_store::ObjectStore;
 use stromdb::object_store::memory::InMemory;
-use stromdb::{Db, PartitionId};
 use tower::ServiceExt as _;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -317,14 +317,8 @@ async fn invalid_ttl_is_bad_request() -> TestResult {
 
 async fn open_app() -> TestResult<axum::Router> {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let db = Db::open(store, partition()).await?;
+    let db = Db::open(store).await?;
     Ok(router(Arc::new(db)))
-}
-
-fn partition() -> PartitionId {
-    "00112233-4455-6677-8899-aabbccddeeff"
-        .parse()
-        .expect("test partition is canonical")
 }
 
 fn put_request(

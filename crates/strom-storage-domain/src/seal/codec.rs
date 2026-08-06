@@ -4,7 +4,7 @@ use rkyv::rancor::Failure;
 
 use super::{
     ArchivedSeal, ArchivedSortedRun, ArchivedTableRef, ArchivedTreeVersion, ArchivedWalReplayPoint,
-    Seal, SealIdentity, SortedRun, TableRef, TreeVersion, WalReplayPoint,
+    Seal, SortedRun, TableRef, TreeVersion, WalReplayPoint,
 };
 use crate::archive::{DecodeError, EncodeError, decode_bound, encode};
 use crate::bounds::{RUN_TABLES_MAX, SEAL_ENCODED_BYTES_MAX, TREE_RUNS_MAX};
@@ -22,13 +22,13 @@ pub fn encode_seal(seal: &Seal) -> Result<Vec<u8>, EncodeError> {
 ///
 /// Returns [`DecodeError`] when the archive is malformed, violates a Seal
 /// invariant, exceeds its resource bounds, or disagrees with its location.
-pub fn decode_seal(identity: &SealIdentity, bytes: &[u8]) -> Result<Seal, DecodeError> {
+pub fn decode_seal(expected_generation: SealGeneration, bytes: &[u8]) -> Result<Seal, DecodeError> {
     decode_bound(bytes, SEAL_ENCODED_BYTES_MAX)?;
     let archived = rkyv::access::<ArchivedSeal, Failure>(bytes)
         .map_err(|_archive_error| DecodeError::MalformedArchive)?;
     let partition = PartitionId::try_from(&archived.partition)?;
     let generation = SealGeneration::from(&archived.generation);
-    if SealIdentity::new(partition, generation) != *identity {
+    if generation != expected_generation {
         return Err(DecodeError::IdentityMismatch);
     }
     decode_archived_seal(archived, partition, generation)
@@ -107,7 +107,7 @@ mod tests {
         assert_eq!(
             Ok(seal.clone()),
             decode_seal(
-                &seal.identity(),
+                seal.generation(),
                 misaligned.get(1..).ok_or("misaligned archive exists")?,
             )
         );
@@ -122,7 +122,7 @@ mod tests {
             assert_eq!(
                 Err(DecodeError::MalformedArchive),
                 decode_seal(
-                    &seal.identity(),
+                    seal.generation(),
                     encoded.get(..length).ok_or("truncated archive exists")?,
                 ),
                 "truncation at byte {length} must fail closed"
@@ -140,7 +140,7 @@ mod tests {
                 bytes_max: SEAL_ENCODED_BYTES_MAX,
                 bytes_actual: bytes.len(),
             }),
-            decode_seal(&seal.identity(), &bytes)
+            decode_seal(seal.generation(), &bytes)
         );
         Ok(())
     }
@@ -149,11 +149,10 @@ mod tests {
     fn durable_location_is_checked_before_manifest_reconstruction()
     -> Result<(), Box<dyn std::error::Error>> {
         let seal = valid_seal()?;
-        let wrong_identity =
-            SealIdentity::new(seal.identity().partition(), SealGeneration::try_from(2)?);
+        let wrong_generation = SealGeneration::try_from(2)?;
         assert_eq!(
             Err(DecodeError::IdentityMismatch),
-            decode_seal(&wrong_identity, &encode_seal(&seal)?)
+            decode_seal(wrong_generation, &encode_seal(&seal)?)
         );
         Ok(())
     }
@@ -173,7 +172,7 @@ mod tests {
 
         assert_eq!(
             Err(DecodeError::InvalidBody),
-            decode_seal(&seal.identity(), &bytes)
+            decode_seal(seal.generation(), &bytes)
         );
         Ok(())
     }

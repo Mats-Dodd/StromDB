@@ -1,13 +1,15 @@
 //! Bounded bootstrap from the newest Seal through an authored takeover fence.
 
 use imbl::OrdMap;
+use rand::RngCore as _;
+use strom_common::Entropy;
 use strom_object_store::{CreateEvidence, ObjectStoreAdapter};
 use strom_storage_domain::{
     BatchId, DIRECTORY_ROW_LOGICAL_BYTES_MAX, DirectoryKey, LEDGER_VALUE_ROW_LOGICAL_BYTES_MAX,
     LedgerCell, OperationFact, OwnerToken, PARTITION_BOOTSTRAP_BYTES_MAX_V2,
     PARTITION_BOOTSTRAP_OBJECTS_MAX_V2, PARTITION_RESIDENT_LOGICAL_BYTES_MAX_V2, PartitionId, Seal,
-    SealGeneration, SealIdentity, StreamUid, TableRef, WAL_SUFFIX_COORDINATES_MAX_V2, WalBody,
-    WalIdentity, WalObject, WalReplayPoint,
+    SealGeneration, StreamUid, TableRef, WAL_SUFFIX_COORDINATES_MAX_V2, WalBody, WalObject,
+    WalReplayPoint,
 };
 
 use crate::Forest;
@@ -30,6 +32,7 @@ pub enum BootstrapExit {
 
 #[derive(Debug)]
 pub(crate) struct Ready {
+    partition: PartitionId,
     claim: AuthoredClaim,
     seal: Seal,
     base: Forest,
@@ -49,13 +52,13 @@ pub(crate) struct WriterSeed {
 
 #[derive(Debug)]
 pub(crate) struct AuthoredClaim {
-    identity: SealIdentity,
+    generation: SealGeneration,
     owner: OwnerToken,
 }
 
 impl AuthoredClaim {
-    pub(crate) const fn identity(&self) -> SealIdentity {
-        self.identity
+    pub(crate) const fn generation(&self) -> SealGeneration {
+        self.generation
     }
 
     pub(crate) const fn owner(&self) -> OwnerToken {
@@ -64,6 +67,10 @@ impl AuthoredClaim {
 }
 
 impl Ready {
+    pub(crate) const fn partition(&self) -> PartitionId {
+        self.partition
+    }
+
     pub(crate) const fn claim(&self) -> &AuthoredClaim {
         &self.claim
     }
@@ -172,35 +179,45 @@ enum FenceTailGate {
 
 pub(crate) async fn bootstrap(
     adapter: ObjectStoreAdapter,
-    partition: PartitionId,
+    mut entropy: Entropy,
 ) -> Result<Ready, BootstrapExit> {
     let seal_store = SealStore::new(adapter.clone());
     let wal_store = WalStore::new(adapter.clone());
     let table_store = TableStore::new(adapter);
+    let mut partition = None;
+    let mut genesis_entropy = entropy.fork("partition-id");
     let mut phase = BootstrapPhase::DiscoverHead;
 
     loop {
         phase = match phase {
             BootstrapPhase::DiscoverHead => {
-                let generation = match seal_store
-                    .newest_generation(partition)
+                let observed = seal_store
+                    .newest_generation()
                     .await
-                    .map_err(map_seal_error)?
-                {
-                    Some(generation) => generation,
-                    None => provision_genesis(&seal_store, partition).await?,
+                    .map_err(map_seal_error)?;
+                let generation = if let Some(generation) = observed {
+                    generation
+                } else {
+                    let minted = mint_partition_id(&mut genesis_entropy);
+                    match provision_genesis(&seal_store, minted).await? {
+                        GenesisProvision::Created => SealGeneration::genesis(),
+                        GenesisProvision::LostRace => {
+                            phase = BootstrapPhase::DiscoverHead;
+                            continue;
+                        }
+                    }
                 };
                 BootstrapPhase::ReadHead { generation }
             }
             BootstrapPhase::ReadHead { generation } => {
-                let identity = SealIdentity::new(partition, generation);
                 let head = seal_store
-                    .read_seal(identity)
+                    .read_seal(generation)
                     .await
                     .map_err(map_seal_error)?
                     .ok_or_else(|| BootstrapExit::Contradiction {
-                        detail: format!("newest Seal {identity:?} is absent"),
+                        detail: format!("newest Seal {generation:?} is absent"),
                     })?;
+                partition = Some(head.partition());
                 let plan = plan_bootstrap_sources(&head)?;
                 let candidate =
                     head.claim_successor()
@@ -230,11 +247,11 @@ pub(crate) async fn bootstrap(
                 .map_err(map_seal_error)?
             {
                 CreateEvidence::Direct => {
-                    let identity = candidate.identity();
+                    let generation = candidate.generation();
                     BootstrapPhase::LoadAdmissionBase {
                         claim: AuthoredClaim {
-                            identity,
-                            owner: OwnerToken::from(identity.generation()),
+                            generation,
+                            owner: OwnerToken::from(generation),
                         },
                         seal: candidate,
                         plan,
@@ -242,19 +259,23 @@ pub(crate) async fn bootstrap(
                 }
                 CreateEvidence::DurableMatch | CreateEvidence::NotOurs => {
                     return Err(BootstrapExit::Fenced {
-                        observed: candidate.identity().generation(),
+                        observed: candidate.generation(),
                     });
                 }
                 CreateEvidence::Unresolved => {
                     return Err(BootstrapExit::Retryable {
-                        detail: format!("claim create at {:?} is unresolved", candidate.identity()),
+                        detail: format!(
+                            "claim create at {:?} is unresolved",
+                            candidate.generation()
+                        ),
                     });
                 }
             },
             BootstrapPhase::LoadAdmissionBase { claim, seal, plan } => {
+                let partition = partition.expect("ReadHead discovers the partition identity");
                 let forest = load_admission_base(&table_store, partition, plan).await?;
                 let listed_tail = wal_store
-                    .newest_surviving_batch(partition)
+                    .newest_surviving_batch()
                     .await
                     .map_err(map_wal_error)?;
                 let replay = seal.replay();
@@ -277,6 +298,7 @@ pub(crate) async fn bootstrap(
                 fence,
                 listed_tail,
             } => {
+                let partition = partition.expect("ReadHead discovers the partition identity");
                 let replay = seal.replay();
                 if let FenceTailGate::RefreshAnomaly { detail } = guard_fence_tail(
                     &wal_store,
@@ -305,7 +327,7 @@ pub(crate) async fn bootstrap(
                     CreateEvidence::Direct | CreateEvidence::DurableMatch => true,
                     CreateEvidence::NotOurs => false,
                     CreateEvidence::Unresolved => {
-                        match wal_store.read_wal(encoded.identity()).await {
+                        match wal_store.read_wal(partition, encoded.batch()).await {
                             Ok(Some(observed)) => observed.as_slice() == encoded.as_slice(),
                             Ok(None) => {
                                 return Err(BootstrapExit::Retryable {
@@ -330,7 +352,7 @@ pub(crate) async fn bootstrap(
                     }
                 } else {
                     let listed_tail = wal_store
-                        .newest_surviving_batch(partition)
+                        .newest_surviving_batch()
                         .await
                         .map_err(map_wal_error)?;
                     let next_candidate = plan_fence_candidate(replay_batch(replay), listed_tail)?;
@@ -360,15 +382,13 @@ pub(crate) async fn bootstrap(
                 fence,
                 mut owner,
             } => {
-                let identity = WalIdentity::new(partition, next);
-                let observed = match wal_store.read_wal(identity).await {
+                let partition = partition.expect("ReadHead discovers the partition identity");
+                let observed = match wal_store.read_wal(partition, next).await {
                     Ok(Some(observed)) => observed,
                     Ok(None) => {
                         phase = BootstrapPhase::RefreshAnomaly {
                             claim,
-                            detail: format!(
-                                "WAL coordinate {identity:?} is absent below the FENCE"
-                            ),
+                            detail: format!("WAL coordinate {next:?} is absent below the FENCE"),
                         };
                         continue;
                     }
@@ -444,21 +464,21 @@ pub(crate) async fn bootstrap(
             }
             BootstrapPhase::RefreshAnomaly { claim, detail } => {
                 let newest = seal_store
-                    .newest_generation(partition)
+                    .newest_generation()
                     .await
                     .map_err(map_seal_error)?;
                 match newest {
-                    Some(observed) if observed > claim.identity.generation() => {
+                    Some(observed) if observed > claim.generation => {
                         return Err(BootstrapExit::Fenced { observed });
                     }
-                    Some(observed) if observed == claim.identity.generation() => {
+                    Some(observed) if observed == claim.generation => {
                         return Err(BootstrapExit::Contradiction { detail });
                     }
                     Some(observed) => {
                         return Err(BootstrapExit::Contradiction {
                             detail: format!(
                                 "Seal head regressed from authored claim {:?} to {observed:?} while classifying: {detail}",
-                                claim.identity
+                                claim.generation
                             ),
                         });
                     }
@@ -473,12 +493,14 @@ pub(crate) async fn bootstrap(
             }
             BootstrapPhase::FinalRefresh { replayed } => {
                 let newest = seal_store
-                    .newest_generation(partition)
+                    .newest_generation()
                     .await
                     .map_err(map_seal_error)?;
                 match newest {
-                    Some(observed) if observed == replayed.claim.identity.generation() => {
+                    Some(observed) if observed == replayed.claim.generation => {
                         BootstrapPhase::Ready(Ready {
+                            partition: partition
+                                .expect("ReadHead discovers the partition identity"),
                             claim: replayed.claim,
                             seal: replayed.seal,
                             base: replayed.base,
@@ -487,14 +509,14 @@ pub(crate) async fn bootstrap(
                             next_batch: replayed.next_batch,
                         })
                     }
-                    Some(observed) if observed > replayed.claim.identity.generation() => {
+                    Some(observed) if observed > replayed.claim.generation => {
                         return Err(BootstrapExit::Fenced { observed });
                     }
                     Some(observed) => {
                         return Err(BootstrapExit::Contradiction {
                             detail: format!(
                                 "final Seal refresh regressed from {:?} to {observed:?}",
-                                replayed.claim.identity
+                                replayed.claim.generation
                             ),
                         });
                     }
@@ -684,12 +706,11 @@ async fn guard_fence_tail(
     let Some(tail) = listed_tail.filter(|tail| cut.is_none_or(|cut| *tail > cut)) else {
         return Ok(FenceTailGate::Clear);
     };
-    let identity = WalIdentity::new(partition, tail);
-    let observed = match store.read_wal(identity).await {
+    let observed = match store.read_wal(partition, tail).await {
         Ok(Some(observed)) => observed,
         Ok(None) => {
             return Err(BootstrapExit::Retryable {
-                detail: format!("listed WAL tail {identity:?} disappeared before FENCE placement"),
+                detail: format!("listed WAL tail {tail:?} disappeared before FENCE placement"),
             });
         }
         Err(WalStoreError::Contradiction { detail }) => {
@@ -735,10 +756,16 @@ fn bound_fence(cut: Option<BatchId>, fence: BatchId) -> Result<BoundedFence, Boo
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenesisProvision {
+    Created,
+    LostRace,
+}
+
 async fn provision_genesis(
     store: &SealStore,
     partition: PartitionId,
-) -> Result<SealGeneration, BootstrapExit> {
+) -> Result<GenesisProvision, BootstrapExit> {
     let generation = SealGeneration::genesis();
     let genesis = Seal::new(
         partition,
@@ -752,13 +779,21 @@ async fn provision_genesis(
         detail: format!("canonical genesis could not be encoded: {source}"),
     })?;
     match store.create_seal(&encoded).await.map_err(map_seal_error)? {
-        CreateEvidence::Direct | CreateEvidence::DurableMatch => Ok(generation),
-        CreateEvidence::NotOurs => Err(BootstrapExit::Contradiction {
-            detail: "foreign bytes occupy the canonical genesis coordinate".into(),
-        }),
+        CreateEvidence::Direct | CreateEvidence::DurableMatch => Ok(GenesisProvision::Created),
+        CreateEvidence::NotOurs => Ok(GenesisProvision::LostRace),
         CreateEvidence::Unresolved => Err(BootstrapExit::Retryable {
             detail: "canonical genesis create is unresolved".into(),
         }),
+    }
+}
+
+fn mint_partition_id(entropy: &mut Entropy) -> PartitionId {
+    loop {
+        let mut bytes = [0; 16];
+        entropy.rng().fill_bytes(&mut bytes);
+        if let Ok(partition) = PartitionId::try_from(bytes) {
+            return partition;
+        }
     }
 }
 
@@ -918,7 +953,7 @@ mod tests {
         ));
         assert!(
             store
-                .read_wal(WalIdentity::new(partition, BatchId::try_from(2)?))
+                .read_wal(partition, BatchId::try_from(2)?)
                 .await?
                 .is_none(),
             "the stale claimant performs no create after observing the newer owner"
@@ -1017,14 +1052,35 @@ mod tests {
     #[tokio::test]
     async fn empty_namespace_bootstraps_through_genesis_claim_and_fence()
     -> Result<(), Box<dyn std::error::Error>> {
-        let ready = bootstrap(ObjectStoreAdapter::in_memory(), partition()).await?;
+        let ready = bootstrap(ObjectStoreAdapter::in_memory(), crate::test_entropy()).await?;
         assert_eq!(
             SealGeneration::genesis().successor()?,
-            ready.claim.identity.generation()
+            ready.claim.generation
         );
         assert_eq!(WalReplayPoint::Genesis, ready.replay());
         assert_eq!(0, ready.forest.path_count());
         assert_eq!(BatchId::try_from(2)?, ready.next_batch);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn genesis_race_loser_adopts_the_winners_partition_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adapter = ObjectStoreAdapter::in_memory();
+        let winner = partition();
+        let loser: PartitionId = "10112233-4455-6677-8899-aabbccddeeff".parse()?;
+        let store = SealStore::new(adapter.clone());
+        assert_eq!(
+            GenesisProvision::Created,
+            provision_genesis(&store, winner).await?
+        );
+        assert_eq!(
+            GenesisProvision::LostRace,
+            provision_genesis(&store, loser).await?
+        );
+
+        let ready = bootstrap(adapter, crate::test_entropy()).await?;
+        assert_eq!(winner, ready.partition());
         Ok(())
     }
 
@@ -1070,7 +1126,7 @@ mod tests {
         );
 
         assert!(matches!(
-            bootstrap(adapter, partition).await,
+            bootstrap(adapter, crate::test_entropy()).await,
             Err(BootstrapExit::Contradiction { .. })
         ));
         Ok(())
@@ -1091,6 +1147,7 @@ mod tests {
 
         let directory_key = table_key(generation_2, StoreKind::Directory, 0)?;
         let directory_bytes = encode_directory_sst(
+            partition,
             &directory_key,
             &[
                 (
@@ -1107,6 +1164,7 @@ mod tests {
 
         let older_key = table_key(generation_2, StoreKind::Ledger, 1)?;
         let older_bytes = encode_ledger_sst(
+            partition,
             &older_key,
             &[
                 (
@@ -1139,6 +1197,7 @@ mod tests {
             created_at,
         );
         let newer_bytes = encode_ledger_sst(
+            partition,
             &newer_key,
             &[
                 (uid, LedgerCell::Value(newer_record.clone())),
@@ -1179,7 +1238,7 @@ mod tests {
             seals.create_seal(&EncodedSeal::new(&materialized)?).await?
         );
 
-        let ready = bootstrap(adapter, partition).await?;
+        let ready = bootstrap(adapter, crate::test_entropy()).await?;
         assert_eq!(
             Some(strom_storage_domain::DirectoryEntry::Live(uid)),
             ready.forest.resolve(&path)
@@ -1230,7 +1289,7 @@ mod tests {
     ) -> Result<TableKey, Box<dyn std::error::Error>> {
         let fresh =
             FreshIdentity::new(birth, AttemptId::new(SealGeneration::genesis(), 1), ordinal)?;
-        Ok(TableKey::new(partition(), TableObjectId::new(fresh, store)))
+        Ok(TableKey::new(TableObjectId::new(fresh, store)))
     }
 
     async fn plant_table(

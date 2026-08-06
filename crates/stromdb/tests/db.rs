@@ -7,8 +7,8 @@ use std::sync::Arc;
 use stromdb::object_store::ObjectStore;
 use stromdb::object_store::memory::InMemory;
 use stromdb::{
-    CloseOutcome, CloseStreamOutcome, CreateOutcome, Db, ExpiryPolicy, PartitionId,
-    StreamContentType, StreamError, StreamId, StreamLifecycle, StreamStatus,
+    CloseOutcome, CloseStreamOutcome, CreateOutcome, Db, ExpiryPolicy, StreamContentType,
+    StreamError, StreamId, StreamLifecycle, StreamStatus,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -16,10 +16,10 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 #[tokio::test]
 async fn every_verb_is_visible_by_status_and_survives_reopen() -> TestResult {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let partition = partition();
     let id: StreamId = "events/a".parse()?;
 
-    let db = Db::open(Arc::clone(&store), partition).await?;
+    let db = Db::open(Arc::clone(&store)).await?;
+    let partition = db.partition_id();
     assert_eq!(StreamStatus::Missing, db.stream(&id)?);
     assert_eq!(
         CreateOutcome::Created,
@@ -42,7 +42,8 @@ async fn every_verb_is_visible_by_status_and_survives_reopen() -> TestResult {
     );
     assert_eq!(CloseOutcome::Shutdown, db.close().await);
 
-    let reopened = Db::open(store, partition).await?;
+    let reopened = Db::open(store).await?;
+    assert_eq!(partition, reopened.partition_id());
     assert!(
         matches!(reopened.stream(&id)?, StreamStatus::Live { .. }),
         "bootstrap replay reconstructs an acknowledged create"
@@ -85,7 +86,7 @@ async fn every_verb_is_visible_by_status_and_survives_reopen() -> TestResult {
 
 #[tokio::test]
 async fn typed_refusal_does_not_change_stream_status() -> TestResult {
-    let db = Db::open(Arc::new(InMemory::new()), partition()).await?;
+    let db = Db::open(Arc::new(InMemory::new())).await?;
     let missing: StreamId = "events/missing".parse()?;
     assert_eq!(Err(StreamError::NotLive), db.delete_stream(&missing).await);
     assert_eq!(StreamStatus::Missing, db.stream(&missing)?);
@@ -95,7 +96,7 @@ async fn typed_refusal_does_not_change_stream_status() -> TestResult {
 
 #[tokio::test]
 async fn duplicate_create_returns_already_exists() -> TestResult {
-    let db = Db::open(Arc::new(InMemory::new()), partition()).await?;
+    let db = Db::open(Arc::new(InMemory::new())).await?;
     let id: StreamId = "events/a".parse()?;
     assert_eq!(
         CreateOutcome::Created,
@@ -124,7 +125,7 @@ async fn duplicate_create_returns_already_exists() -> TestResult {
 
 #[tokio::test]
 async fn config_mismatch_create_refuses_occupied() -> TestResult {
-    let db = Db::open(Arc::new(InMemory::new()), partition()).await?;
+    let db = Db::open(Arc::new(InMemory::new())).await?;
     let id: StreamId = "events/a".parse()?;
     db.create_stream(
         &id,
@@ -151,10 +152,10 @@ async fn config_mismatch_create_refuses_occupied() -> TestResult {
 #[tokio::test]
 async fn create_closed_is_visible_and_survives_reopen() -> TestResult {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let partition = partition();
     let id: StreamId = "events/closed".parse()?;
 
-    let db = Db::open(Arc::clone(&store), partition).await?;
+    let db = Db::open(Arc::clone(&store)).await?;
+    let partition = db.partition_id();
     assert_eq!(
         CreateOutcome::Created,
         db.create_stream(
@@ -175,7 +176,8 @@ async fn create_closed_is_visible_and_survives_reopen() -> TestResult {
     );
     assert_eq!(CloseOutcome::Shutdown, db.close().await);
 
-    let reopened = Db::open(store, partition).await?;
+    let reopened = Db::open(store).await?;
+    assert_eq!(partition, reopened.partition_id());
     assert_eq!(
         StreamStatus::Live {
             content_type: StreamContentType::octet_stream(),
@@ -191,7 +193,7 @@ async fn create_closed_is_visible_and_survives_reopen() -> TestResult {
 
 #[tokio::test]
 async fn duplicate_close_returns_already_closed() -> TestResult {
-    let db = Db::open(Arc::new(InMemory::new()), partition()).await?;
+    let db = Db::open(Arc::new(InMemory::new())).await?;
     let id: StreamId = "events/a".parse()?;
     db.create_stream(
         &id,
@@ -208,10 +210,4 @@ async fn duplicate_close_returns_already_closed() -> TestResult {
     );
     assert_eq!(CloseOutcome::Shutdown, db.close().await);
     Ok(())
-}
-
-fn partition() -> PartitionId {
-    "00112233-4455-6677-8899-aabbccddeeff"
-        .parse()
-        .expect("test partition is canonical")
 }
