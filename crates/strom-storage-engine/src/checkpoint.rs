@@ -50,11 +50,6 @@ pub(crate) struct PreparedCheckpoint {
     encoded_seal: EncodedSeal,
 }
 
-enum PreparationOutcome {
-    Prepared(Box<PreparedCheckpoint>),
-    Contradiction(CheckpointContradiction),
-}
-
 #[derive(Debug, thiserror::Error)]
 #[error("{detail}")]
 struct CheckpointContradiction {
@@ -220,8 +215,8 @@ pub(crate) async fn execute_checkpoint(
         }
     }
     let prepared = match prepared_receiver.await {
-        Ok(PreparationOutcome::Prepared(prepared)) => prepared,
-        Ok(PreparationOutcome::Contradiction(error)) => {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(error)) => {
             return CheckpointOutcome::Contradiction {
                 cut,
                 detail: error.to_string(),
@@ -357,7 +352,7 @@ async fn establish_table(
 fn prepare_checkpoint(
     input: CheckpointInput,
     emit: &mut impl FnMut(EncodedTable) -> Result<(), CheckpointContradiction>,
-) -> PreparationOutcome {
+) -> Result<Box<PreparedCheckpoint>, CheckpointContradiction> {
     let CheckpointInput {
         source,
         base,
@@ -369,47 +364,38 @@ fn prepare_checkpoint(
     let owner_claim = attempt.owner_claim();
     let previous_cut = replay_batch(source.replay());
     if previous_cut.is_some_and(|previous| cut <= previous) {
-        return PreparationOutcome::Contradiction(
-            "checkpoint cut does not advance its source Seal"
-                .to_owned()
-                .into(),
-        );
+        return Err("checkpoint cut does not advance its source Seal"
+            .to_owned()
+            .into());
     }
-    let generation = match source.identity().generation().successor() {
-        Ok(generation) => generation,
-        Err(error) => return PreparationOutcome::Contradiction(error.to_string().into()),
-    };
+    let generation = source
+        .identity()
+        .generation()
+        .successor()
+        .map_err(|error| error.to_string())?;
 
     let plan = plan_checkpoint(&source, &base, &snapshot);
     let mut ordinal = 0u32;
     let (directory, ledger) = match plan {
         CheckpointPlan::Delta => {
-            let directory_rows = delta_directory_rows(&base, &snapshot);
-            let ledger_rows = delta_ledger_rows(&base, &snapshot);
-            let directory = match build_directory_tree(
+            let directory = build_directory_tree(
                 partition,
                 generation,
                 attempt,
                 &mut ordinal,
-                directory_rows,
+                delta_directory_rows(&base, &snapshot),
                 Some(source.directory()),
                 emit,
-            ) {
-                Ok(directory) => directory,
-                Err(detail) => return PreparationOutcome::Contradiction(detail),
-            };
-            let ledger = match build_ledger_tree(
+            )?;
+            let ledger = build_ledger_tree(
                 partition,
                 generation,
                 attempt,
                 &mut ordinal,
-                ledger_rows,
+                delta_ledger_rows(&base, &snapshot),
                 Some(source.ledger()),
                 emit,
-            ) {
-                Ok(ledger) => ledger,
-                Err(detail) => return PreparationOutcome::Contradiction(detail),
-            };
+            )?;
             (directory, ledger)
         }
         CheckpointPlan::Full => {
@@ -417,7 +403,7 @@ fn prepare_checkpoint(
                 .directory_rows()
                 .iter()
                 .map(|(key, entry)| (key.clone(), *entry));
-            let directory = match build_directory_tree(
+            let directory = build_directory_tree(
                 partition,
                 generation,
                 attempt,
@@ -425,15 +411,12 @@ fn prepare_checkpoint(
                 directory_rows,
                 None,
                 emit,
-            ) {
-                Ok(directory) => directory,
-                Err(detail) => return PreparationOutcome::Contradiction(detail),
-            };
+            )?;
             let ledger_rows = snapshot
                 .ledger_rows()
                 .iter()
                 .map(|(uid, record)| (*uid, LedgerCell::Value(record.clone())));
-            let ledger = match build_ledger_tree(
+            let ledger = build_ledger_tree(
                 partition,
                 generation,
                 attempt,
@@ -441,14 +424,11 @@ fn prepare_checkpoint(
                 ledger_rows,
                 None,
                 emit,
-            ) {
-                Ok(ledger) => ledger,
-                Err(detail) => return PreparationOutcome::Contradiction(detail),
-            };
+            )?;
             (directory, ledger)
         }
     };
-    let successor = match Seal::new(
+    let successor = Seal::new(
         partition,
         generation,
         WalReplayPoint::Through {
@@ -457,15 +437,10 @@ fn prepare_checkpoint(
         },
         directory,
         ledger,
-    ) {
-        Ok(successor) => successor,
-        Err(error) => return PreparationOutcome::Contradiction(error.to_string().into()),
-    };
-    let encoded_seal = match EncodedSeal::new(&successor) {
-        Ok(encoded) => encoded,
-        Err(error) => return PreparationOutcome::Contradiction(error.to_string().into()),
-    };
-    PreparationOutcome::Prepared(Box::new(PreparedCheckpoint {
+    )
+    .map_err(|error| error.to_string())?;
+    let encoded_seal = EncodedSeal::new(&successor).map_err(|error| error.to_string())?;
+    Ok(Box::new(PreparedCheckpoint {
         source,
         successor,
         snapshot,
@@ -560,50 +535,20 @@ fn chunk_rows<Row>(
     row_bytes: impl Fn(&Row) -> u64,
 ) -> Vec<Vec<Row>> {
     let mut chunks = Vec::new();
-    let mut chunk = Vec::new();
-    let mut bytes = SST_ARCHIVE_FIXED_BYTES_MAX;
-    for row in rows {
-        let additional = row_bytes(&row);
-        let one_row = SST_ARCHIVE_FIXED_BYTES_MAX
-            .checked_add(additional)
-            .expect("one worst-case encoded row estimate fits in u64");
-        assert!(
-            one_row <= SST_TABLE_TARGET_BYTES,
-            "one worst-case encoded row fits the checkpoint table target"
-        );
-        let extended = bytes
-            .checked_add(additional)
-            .expect("one checkpoint table estimate fits in u64");
-        if !chunk.is_empty() && extended > SST_TABLE_TARGET_BYTES {
-            chunks.push(std::mem::take(&mut chunk));
-            bytes = SST_ARCHIVE_FIXED_BYTES_MAX;
-        }
-        bytes = bytes
-            .checked_add(additional)
-            .expect("one checkpoint table estimate fits in u64");
-        chunk.push(row);
-    }
-    if !chunk.is_empty() {
+    for_each_chunk(rows, row_bytes, |chunk, _estimate| {
         chunks.push(chunk);
-    }
+        Ok(())
+    })
+    .expect("one checkpoint table estimate fits in u64");
     chunks
 }
 
 fn account_rows(rows: impl IntoIterator<Item = u64>) -> ChunkAccounting {
     let mut accounting = ChunkAccounting::default();
-    let mut table_bytes = SST_ARCHIVE_FIXED_BYTES_MAX;
-    let mut table_has_rows = false;
-    for row_bytes in rows {
-        assert!(
-            SST_ARCHIVE_FIXED_BYTES_MAX
-                .checked_add(row_bytes)
-                .is_some_and(|bytes| bytes <= SST_TABLE_TARGET_BYTES),
-            "one worst-case encoded row fits the checkpoint table target"
-        );
-        let extended = table_bytes
-            .checked_add(row_bytes)
-            .expect("one checkpoint table estimate fits in u64");
-        if table_has_rows && extended > SST_TABLE_TARGET_BYTES {
+    for_each_chunk(
+        rows,
+        |row_bytes| *row_bytes,
+        |_rows, table_bytes| {
             accounting.tables = accounting
                 .tables
                 .checked_add(1)
@@ -612,23 +557,10 @@ fn account_rows(rows: impl IntoIterator<Item = u64>) -> ChunkAccounting {
                 .bytes
                 .checked_add(table_bytes)
                 .expect("a checkpoint byte estimate fits in u64");
-            table_bytes = SST_ARCHIVE_FIXED_BYTES_MAX;
-        }
-        table_bytes = table_bytes
-            .checked_add(row_bytes)
-            .expect("one checkpoint table estimate fits in u64");
-        table_has_rows = true;
-    }
-    if table_has_rows {
-        accounting.tables = accounting
-            .tables
-            .checked_add(1)
-            .expect("a checkpoint table count fits in usize");
-        accounting.bytes = accounting
-            .bytes
-            .checked_add(table_bytes)
-            .expect("a checkpoint byte estimate fits in u64");
-    }
+            Ok(())
+        },
+    )
+    .expect("one checkpoint table estimate fits in u64");
     accounting
 }
 
@@ -810,6 +742,12 @@ fn for_each_chunk<Row>(
     let mut bytes = SST_ARCHIVE_FIXED_BYTES_MAX;
     for row in rows {
         let additional = row_bytes(&row);
+        assert!(
+            SST_ARCHIVE_FIXED_BYTES_MAX
+                .checked_add(additional)
+                .is_some_and(|one_row| one_row <= SST_TABLE_TARGET_BYTES),
+            "one worst-case encoded row fits the checkpoint table target"
+        );
         let extended = bytes
             .checked_add(additional)
             .ok_or_else(|| "checkpoint table estimate overflows u64".to_owned())?;
@@ -1293,11 +1231,8 @@ mod tests {
         let prepared = prepare_checkpoint(input, &mut |table| {
             tables.push(table);
             Ok(())
-        });
-        match prepared {
-            PreparationOutcome::Prepared(prepared) => Ok((*prepared, tables)),
-            PreparationOutcome::Contradiction(detail) => Err(detail),
-        }
+        })?;
+        Ok((*prepared, tables))
     }
 
     fn seal_with_directory_tables(
