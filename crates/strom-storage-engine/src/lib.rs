@@ -12,14 +12,9 @@ mod writer;
 pub use admission::{AdmissionRefusal, StreamCommand, StreamReply};
 pub use bootstrap::BootstrapExit;
 pub use engine::{CommandError, Engine, PublishedView};
-pub use forest::{Applied, FoldContradiction, Forest};
-pub use store::{
-    AuthorizedWalRunDelete, EncodedSeal, EncodedWal, ObservedWal, SealStore, SealStoreError,
-    WalDeleteRefusal, WalStore, WalStoreError,
-};
-pub use strom_object_store::{CreateEvidence, Etag, ObjectStoreAdapter};
-pub use strom_storage_domain::EncodeError;
 pub use writer::WriterExit;
+
+pub(crate) use forest::{Applied, FoldContradiction, Forest};
 
 #[cfg(test)]
 fn test_entropy() -> strom_common::Entropy {

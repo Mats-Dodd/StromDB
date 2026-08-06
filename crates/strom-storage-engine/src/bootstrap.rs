@@ -71,10 +71,7 @@ impl Ready {
         self.partition
     }
 
-    pub(crate) const fn claim(&self) -> &AuthoredClaim {
-        &self.claim
-    }
-
+    #[cfg(test)]
     pub(crate) const fn replay(&self) -> WalReplayPoint {
         self.seal.replay()
     }

@@ -10,6 +10,7 @@ pub(super) struct ResidentLedger {
 }
 
 impl ResidentLedger {
+    #[cfg(test)]
     #[must_use]
     pub(super) fn empty() -> Self {
         Self {

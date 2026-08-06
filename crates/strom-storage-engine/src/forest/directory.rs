@@ -10,6 +10,7 @@ pub(super) struct ResidentDirectory {
 }
 
 impl ResidentDirectory {
+    #[cfg(test)]
     #[must_use]
     pub(super) fn empty() -> Self {
         Self {

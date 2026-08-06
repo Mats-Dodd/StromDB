@@ -16,18 +16,18 @@ use crate::admission::decide_successor_uid;
 
 /// Resident Directory and Ledger under the no-forks cross-store invariants.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Forest {
+pub(crate) struct Forest {
     directory: ResidentDirectory,
     ledger: ResidentLedger,
 }
 
 /// Zero-sized witness that one fact applied exactly once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Applied;
+pub(crate) struct Applied;
 
 /// A fact that cannot join this forest under strict fold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum FoldContradiction {
+pub(crate) enum FoldContradiction {
     /// Create: the path already has a Live or Tombstone row.
     #[error("path is already occupied")]
     PathOccupied,
@@ -71,8 +71,9 @@ enum UidState {
 }
 
 impl Forest {
+    #[cfg(test)]
     #[must_use]
-    pub fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             directory: ResidentDirectory::empty(),
             ledger: ResidentLedger::empty(),
@@ -155,7 +156,7 @@ impl Forest {
     /// Panics when a Live directory row has no ledger record. That breaks the
     /// cross-store invariant established by [`Forest::empty`] and preserved by
     /// every successful fold.
-    pub fn strict_fold(
+    pub(crate) fn strict_fold(
         &mut self,
         batch: BatchId,
         fact: &OperationFact,
@@ -215,12 +216,12 @@ impl Forest {
     }
 
     #[must_use]
-    pub fn resolve(&self, path: &DirectoryKey) -> Option<DirectoryEntry> {
+    pub(crate) fn resolve(&self, path: &DirectoryKey) -> Option<DirectoryEntry> {
         self.directory.get(path).copied()
     }
 
     #[must_use]
-    pub fn record(&self, uid: StreamUid) -> Option<&StreamRecord> {
+    pub(crate) fn record(&self, uid: StreamUid) -> Option<&StreamRecord> {
         self.ledger.get(uid)
     }
 
@@ -228,7 +229,7 @@ impl Forest {
     ///
     /// Panics when the directory row count does not fit in `u64`.
     #[must_use]
-    pub fn path_count(&self) -> u64 {
+    pub(crate) fn path_count(&self) -> u64 {
         u64::try_from(self.directory.len()).expect("directory row count fits in u64")
     }
 
@@ -376,3 +377,6 @@ mod tests {
         ))
     }
 }
+
+#[cfg(test)]
+mod behavior_tests;

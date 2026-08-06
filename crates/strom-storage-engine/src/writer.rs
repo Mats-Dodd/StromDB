@@ -439,11 +439,8 @@ impl Writer {
                     let successor = install.successor;
                     self.seal = successor.clone();
                     self.base = install.snapshot;
-                    self.view.send_replace(PublishedView::new(
-                        successor.generation(),
-                        successor.replay(),
-                        self.durable.clone(),
-                    ));
+                    self.view
+                        .send_replace(PublishedView::new(self.durable.clone()));
                     if self.collector.is_none() {
                         let adapter = self.adapter.clone();
                         self.collector =
@@ -521,11 +518,8 @@ impl Writer {
             );
         }
         self.durable_batch = flight.batch;
-        self.view.send_replace(PublishedView::new(
-            self.seal.generation(),
-            self.seal.replay(),
-            self.durable.clone(),
-        ));
+        self.view
+            .send_replace(PublishedView::new(self.durable.clone()));
         for command in flight.commands.drain(..) {
             let _receiver_may_be_gone = command.waiter.send(Ok(command.reply));
         }
@@ -799,11 +793,7 @@ mod tests {
             ready.forest().resolve(&path),
             "takeover replays the older owner's RUN before Ready"
         );
-        let initial = PublishedView::new(
-            ready.claim().generation(),
-            ready.replay(),
-            ready.forest().clone(),
-        );
+        let initial = PublishedView::new(ready.forest().clone());
         let (view, _receiver) = watch::channel(initial);
         let mut takeover = Writer::new(adapter.clone(), ready, view);
         takeover.checkpoint_requested = true;
@@ -1022,11 +1012,7 @@ mod tests {
         adapter: ObjectStoreAdapter,
     ) -> Result<(Writer, watch::Receiver<PublishedView>), Box<dyn std::error::Error>> {
         let ready = bootstrap(adapter.clone(), crate::test_entropy()).await?;
-        let initial = PublishedView::new(
-            ready.claim().generation(),
-            ready.replay(),
-            ready.forest().clone(),
-        );
+        let initial = PublishedView::new(ready.forest().clone());
         let (view, receiver) = watch::channel(initial);
         Ok((Writer::new(adapter, ready, view), receiver))
     }

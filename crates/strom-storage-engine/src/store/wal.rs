@@ -15,7 +15,7 @@ use super::{StoreErrorClass, map_store_error, newest_keys_bound, object_key};
 
 /// One WAL candidate, encoded exactly once. Key and body agree by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EncodedWal {
+pub(crate) struct EncodedWal {
     batch: BatchId,
     bytes: FrozenBytes,
 }
@@ -27,7 +27,7 @@ impl EncodedWal {
     ///
     /// Returns [`EncodeError`] when serialization fails or the archive exceeds
     /// [`WAL_ENCODED_BYTES_MAX`].
-    pub fn new(object: &WalObject) -> Result<Self, EncodeError> {
+    pub(crate) fn new(object: &WalObject) -> Result<Self, EncodeError> {
         let bytes = encode_wal(object)?;
         Ok(Self::from_encoded(object.batch(), bytes))
     }
@@ -42,21 +42,21 @@ impl EncodedWal {
     }
 
     #[must_use]
-    pub const fn batch(&self) -> BatchId {
+    pub(crate) const fn batch(&self) -> BatchId {
         self.batch
     }
 
     /// Exact frozen bytes of this candidate. After an ambiguous create, reconcile
     /// with one bounded GET compared against these bytes—never re-encode.
     #[must_use]
-    pub fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         self.bytes.as_slice()
     }
 }
 
 /// One decoded WAL object plus the exact validator that observed it.
 #[derive(Debug, PartialEq, Eq)]
-pub struct ObservedWal {
+pub(crate) struct ObservedWal {
     object: WalObject,
     validator: Etag,
     bytes: FrozenBytes,
@@ -64,27 +64,24 @@ pub struct ObservedWal {
 
 impl ObservedWal {
     #[must_use]
-    pub const fn object(&self) -> &WalObject {
+    pub(crate) const fn object(&self) -> &WalObject {
         &self.object
     }
 
     #[must_use]
-    pub const fn validator(&self) -> &Etag {
+    #[cfg(test)]
+    pub(crate) const fn validator(&self) -> &Etag {
         &self.validator
     }
 
     #[must_use]
-    pub const fn batch(&self) -> BatchId {
-        self.object.batch()
-    }
-
-    #[must_use]
-    pub const fn body(&self) -> &WalBody {
+    #[cfg(test)]
+    pub(crate) const fn body(&self) -> &WalBody {
         self.object.body()
     }
 
     #[must_use]
-    pub fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         self.bytes.as_slice()
     }
 
@@ -93,7 +90,7 @@ impl ObservedWal {
     /// # Errors
     ///
     /// Returns [`WalDeleteRefusal`] when the observed body is a FENCE.
-    pub fn into_run_delete(self) -> Result<AuthorizedWalRunDelete, WalDeleteRefusal> {
+    pub(crate) fn into_run_delete(self) -> Result<AuthorizedWalRunDelete, WalDeleteRefusal> {
         match self.object.body() {
             WalBody::Run(_) => Ok(AuthorizedWalRunDelete {
                 batch: self.object.batch(),
@@ -108,7 +105,7 @@ impl ObservedWal {
 
 /// Why an observation cannot become a collector delete proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum WalDeleteRefusal {
+pub(crate) enum WalDeleteRefusal {
     /// FENCE objects are permanent; collectors never delete them.
     #[error("WAL fence cannot become a delete proof")]
     Fence { batch: BatchId },
@@ -128,26 +125,14 @@ pub enum WalDeleteRefusal {
 /// writer from re-occupying a collected coordinate. The validator is
 /// defense in depth against a non-conforming actor in the namespace.
 #[derive(Debug, PartialEq, Eq)]
-pub struct AuthorizedWalRunDelete {
+pub(crate) struct AuthorizedWalRunDelete {
     batch: BatchId,
     validator: Etag,
 }
 
-impl AuthorizedWalRunDelete {
-    #[must_use]
-    pub const fn batch(&self) -> BatchId {
-        self.batch
-    }
-
-    #[must_use]
-    pub const fn validator(&self) -> &Etag {
-        &self.validator
-    }
-}
-
 /// Failures of WAL store operations, shaped for the writer state machine.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum WalStoreError {
+pub(crate) enum WalStoreError {
     /// Transport trouble; a bounded retry of the same idempotent request is legal.
     #[error("retryable WAL store failure: {detail}")]
     Retryable { detail: String },
@@ -178,13 +163,13 @@ impl WalStoreError {
 
 /// Typed WAL namespace over the raw object-store adapter.
 #[derive(Debug, Clone)]
-pub struct WalStore {
+pub(crate) struct WalStore {
     adapter: ObjectStoreAdapter,
 }
 
 impl WalStore {
     #[must_use]
-    pub const fn new(adapter: ObjectStoreAdapter) -> Self {
+    pub(crate) const fn new(adapter: ObjectStoreAdapter) -> Self {
         Self { adapter }
     }
 
@@ -199,7 +184,7 @@ impl WalStore {
     ///
     /// Returns [`WalStoreError`] when the adapter reports a retryable,
     /// rejected, or contradictory outcome.
-    pub async fn create_wal(
+    pub(crate) async fn create_wal(
         &self,
         candidate: &EncodedWal,
     ) -> Result<CreateEvidence, WalStoreError> {
@@ -216,7 +201,7 @@ impl WalStore {
     ///
     /// Returns [`WalStoreError`] on adapter failure. A listed key that does
     /// not parse as this partition's WAL key is a contradiction.
-    pub async fn newest_surviving_batch(&self) -> Result<Option<BatchId>, WalStoreError> {
+    pub(crate) async fn newest_surviving_batch(&self) -> Result<Option<BatchId>, WalStoreError> {
         let page = self
             .adapter
             .list_page(ListPageRequest {
@@ -243,7 +228,7 @@ impl WalStore {
     ///
     /// Returns [`WalStoreError`] on adapter failure. A present body that fails
     /// decode is a contradiction, never absence.
-    pub async fn read_wal(
+    pub(crate) async fn read_wal(
         &self,
         partition: PartitionId,
         batch: BatchId,
@@ -291,7 +276,10 @@ impl WalStore {
     ///
     /// Returns [`WalStoreError`] when the adapter reports a retryable,
     /// rejected, or contradictory outcome.
-    pub async fn delete_run(&self, proof: AuthorizedWalRunDelete) -> Result<(), WalStoreError> {
+    pub(crate) async fn delete_run(
+        &self,
+        proof: AuthorizedWalRunDelete,
+    ) -> Result<(), WalStoreError> {
         let AuthorizedWalRunDelete { batch, validator } = proof;
         // Retained until If-Match delete is available; see AuthorizedWalRunDelete.
         drop(validator);

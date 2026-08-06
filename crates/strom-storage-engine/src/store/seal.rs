@@ -14,7 +14,7 @@ use super::{StoreErrorClass, map_store_error, newest_keys_bound, object_key};
 
 /// One Seal candidate, encoded exactly once. Key and body agree by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EncodedSeal {
+pub(crate) struct EncodedSeal {
     generation: SealGeneration,
     bytes: FrozenBytes,
 }
@@ -26,7 +26,7 @@ impl EncodedSeal {
     ///
     /// Returns [`EncodeError`] when serialization fails or the archive exceeds
     /// [`SEAL_ENCODED_BYTES_MAX`].
-    pub fn new(seal: &Seal) -> Result<Self, EncodeError> {
+    pub(crate) fn new(seal: &Seal) -> Result<Self, EncodeError> {
         let bytes = encode_seal(seal)?;
         Ok(Self::from_encoded(seal.generation(), bytes))
     }
@@ -40,22 +40,24 @@ impl EncodedSeal {
         }
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub const fn generation(&self) -> SealGeneration {
+    pub(crate) const fn generation(&self) -> SealGeneration {
         self.generation
     }
 
     /// Exact frozen bytes of this candidate. After an ambiguous create, reconcile
     /// with one bounded GET compared against these bytes—never re-encode.
+    #[cfg(test)]
     #[must_use]
-    pub fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         self.bytes.as_slice()
     }
 }
 
 /// Failures of Seal store operations, shaped for the writer state machine.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum SealStoreError {
+pub(crate) enum SealStoreError {
     /// Transport trouble; a bounded retry of the same idempotent request is legal.
     #[error("retryable Seal store failure: {detail}")]
     Retryable { detail: String },
@@ -86,13 +88,13 @@ impl SealStoreError {
 
 /// Typed Seal namespace over the raw object-store adapter.
 #[derive(Debug, Clone)]
-pub struct SealStore {
+pub(crate) struct SealStore {
     adapter: ObjectStoreAdapter,
 }
 
 impl SealStore {
     #[must_use]
-    pub const fn new(adapter: ObjectStoreAdapter) -> Self {
+    pub(crate) const fn new(adapter: ObjectStoreAdapter) -> Self {
         Self { adapter }
     }
 
@@ -107,7 +109,7 @@ impl SealStore {
     ///
     /// Returns [`SealStoreError`] when the adapter reports a retryable,
     /// rejected, or contradictory outcome.
-    pub async fn create_seal(
+    pub(crate) async fn create_seal(
         &self,
         candidate: &EncodedSeal,
     ) -> Result<CreateEvidence, SealStoreError> {
@@ -124,7 +126,7 @@ impl SealStore {
     ///
     /// Returns [`SealStoreError`] on adapter failure. A listed key that does
     /// not parse as this partition's Seal key is a contradiction.
-    pub async fn newest_generation(&self) -> Result<Option<SealGeneration>, SealStoreError> {
+    pub(crate) async fn newest_generation(&self) -> Result<Option<SealGeneration>, SealStoreError> {
         let page = self
             .adapter
             .list_page(ListPageRequest {
@@ -151,7 +153,7 @@ impl SealStore {
     ///
     /// Returns [`SealStoreError`] on adapter failure. A present body that fails
     /// decode is a contradiction, never absence.
-    pub async fn read_seal(
+    pub(crate) async fn read_seal(
         &self,
         generation: SealGeneration,
     ) -> Result<Option<Seal>, SealStoreError> {
