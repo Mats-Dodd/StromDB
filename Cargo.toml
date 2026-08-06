@@ -5,6 +5,7 @@ members = [
     "crates/strom-domain",
     "crates/strom-object-store",
     "crates/strom-storage-domain",
+    "crates/strom-storage-engine",
     "crates/stromdb",
 ]
 

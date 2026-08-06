@@ -9,7 +9,7 @@ use strom_storage_domain::{
     BatchId, DirectoryEntry, DirectoryKey, OperationFact, PARTITION_PATH_OCCUPANCIES_MAX_V2,
     StreamRecord, StreamUid,
 };
-use stromdb::{Applied, FoldContradiction, Forest};
+use strom_storage_engine::{Applied, FoldContradiction, Forest};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

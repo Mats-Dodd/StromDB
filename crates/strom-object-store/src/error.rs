@@ -39,10 +39,3 @@ pub enum StoreContradiction {
         listed: ObjectKey,
     },
 }
-
-/// The S3 client could not be constructed from the given configuration.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("invalid S3 configuration: {detail}")]
-pub struct S3ConfigError {
-    pub detail: String,
-}

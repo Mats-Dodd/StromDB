@@ -1,24 +1,21 @@
 [package]
 name = "stromdb"
-description = "StromDB database engine"
+description = "StromDB, the embeddable durable streams database"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-futures = { workspace = true }
-imbl = { workspace = true }
+object_store = { workspace = true }
 strom-domain = { path = "../strom-domain", version = "0.1.0" }
 strom-object-store = { path = "../strom-object-store", version = "0.1.0" }
 strom-storage-domain = { path = "../strom-storage-domain", version = "0.1.0" }
+strom-storage-engine = { path = "../strom-storage-engine", version = "0.1.0" }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 
 [dev-dependencies]
-proptest = { workspace = true }
-strom-domain = { path = "../strom-domain", version = "0.1.0", features = ["proptest"] }
-strom-storage-domain = { path = "../strom-storage-domain", version = "0.1.0", features = ["proptest"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

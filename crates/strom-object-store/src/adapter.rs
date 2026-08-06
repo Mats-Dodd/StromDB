@@ -1,56 +1,20 @@
-//! The one concrete adapter over the `object_store` backends.
+//! The one concrete adapter over an injected `object_store` backend.
 //!
-//! All foreign vocabulary is translated at this boundary (stromstyle §9); no
-//! `object_store` type crosses the public seam.
+//! The backend trait object enters through [`ObjectStoreAdapter::new`]. All
+//! other foreign vocabulary is translated at this boundary (stromstyle §9);
+//! no other `object_store` type crosses the public seam.
 
-use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures::StreamExt as _;
-use object_store::aws::AmazonS3Builder;
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::{
-    ClientOptions, GetOptions, ObjectStore, ObjectStoreExt as _, PutMode, PutOptions, PutPayload,
-    RetryConfig,
-};
+use object_store::{GetOptions, ObjectStore, ObjectStoreExt as _, PutMode, PutOptions, PutPayload};
 
 use crate::bytes::{ByteBound, Etag, FrozenBytes};
-use crate::error::{S3ConfigError, StoreContradiction, StoreError};
+use crate::error::{StoreContradiction, StoreError};
 use crate::evidence::{CreateEvidence, ListPage, ListPageRequest, RawObject};
 use crate::key::ObjectKey;
-
-/// Explicit S3 client configuration (stromstyle §6: options are spelled out).
-#[derive(Debug, Clone)]
-pub struct S3Config {
-    pub bucket: String,
-    pub region: String,
-    /// Custom endpoint for S3-compatible stores such as `MinIO`.
-    pub endpoint: Option<String>,
-    /// Permit plain HTTP; only for local test endpoints.
-    pub allow_http: bool,
-    /// Explicit credentials; `None` falls back to the process environment.
-    pub credentials: Option<S3Credentials>,
-    pub request_timeout: Duration,
-}
-
-/// Static S3 credentials.
-#[derive(Clone)]
-pub struct S3Credentials {
-    pub access_key_id: String,
-    pub secret_access_key: String,
-}
-
-impl fmt::Debug for S3Credentials {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("S3Credentials")
-            .field("access_key_id", &self.access_key_id)
-            .field("secret_access_key", &"<redacted>")
-            .finish()
-    }
-}
 
 /// The raw object-store adapter beneath the typed Seal, WAL, and content stores.
 #[derive(Debug, Clone)]
@@ -59,43 +23,16 @@ pub struct ObjectStoreAdapter {
 }
 
 impl ObjectStoreAdapter {
-    /// An S3 backend with retries disabled.
+    /// Wrap one injected `object_store` backend.
     ///
-    /// Retries stay off because a transparently resent create can win on the
-    /// wire and then observe its own bytes as an occupant, which would turn a
-    /// `Direct` win into weaker evidence. Callers own every retry decision.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`S3ConfigError`] when the client cannot be built from the
-    /// given configuration.
-    pub fn s3(config: S3Config) -> Result<Self, S3ConfigError> {
-        let retry = RetryConfig {
-            max_retries: 0,
-            ..RetryConfig::default()
-        };
-        let client = ClientOptions::new()
-            .with_timeout(config.request_timeout)
-            .with_allow_http(config.allow_http);
-        let mut builder = AmazonS3Builder::new()
-            .with_bucket_name(config.bucket)
-            .with_region(config.region)
-            .with_retry(retry)
-            .with_client_options(client);
-        if let Some(endpoint) = config.endpoint {
-            builder = builder.with_endpoint(endpoint);
-        }
-        if let Some(credentials) = config.credentials {
-            builder = builder
-                .with_access_key_id(credentials.access_key_id)
-                .with_secret_access_key(credentials.secret_access_key);
-        }
-        let store = builder.build().map_err(|source| S3ConfigError {
-            detail: source.to_string(),
-        })?;
-        Ok(Self {
-            store: Arc::new(store),
-        })
+    /// The backend must not transparently resend a create after an ambiguous
+    /// result. A resent create can win on the wire and then observe its own
+    /// bytes as an occupant, which would turn a `Direct` win into weaker
+    /// evidence. Callers own every retry decision, so configure the injected
+    /// store with transport retries disabled.
+    #[must_use]
+    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+        Self { store }
     }
 
     /// A deterministic in-memory backend for tests above this seam.
