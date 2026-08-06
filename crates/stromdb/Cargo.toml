@@ -10,10 +10,7 @@ repository.workspace = true
 object_store = { workspace = true }
 strom-common = { path = "../strom-common", version = "0.1.0" }
 strom-domain = { path = "../strom-domain", version = "0.1.0" }
-strom-object-store = { path = "../strom-object-store", version = "0.1.0" }
-strom-storage-domain = { path = "../strom-storage-domain", version = "0.1.0" }
 strom-storage-engine = { path = "../strom-storage-engine", version = "0.1.0" }
-thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

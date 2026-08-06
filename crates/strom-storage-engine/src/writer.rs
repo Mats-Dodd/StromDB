@@ -1,14 +1,18 @@
 //! Single-owner writer, bounded group commit, and publication ordering.
 
+use strom_domain::{CloseStreamOutcome, CreateOutcome};
 use strom_object_store::CreateEvidence;
 use strom_storage_domain::{
-    AttemptId, BatchId, OperationFact, PartitionId, Seal, WAL_RUN_FACTS_MAX, WalBody, WalFacts,
-    WalObject, WalReplayPoint,
+    AttemptId, BatchId, DirectoryKey, OperationFact, PartitionId, Seal, WAL_RUN_FACTS_MAX, WalBody,
+    WalFacts, WalObject, WalReplayPoint,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::admission::{Admission, admit, decide_suffix_room};
+use crate::admission::{
+    AdmissionRefusal, AdmittedCommand, CloseAdmission, CreateAdmission, CreateStream, admit_close,
+    admit_create, admit_delete, decide_suffix_room,
+};
 use crate::bootstrap::{AuthoredClaim, Ready, WriterSeed};
 use crate::checkpoint::{
     CheckpointInput, CheckpointOutcome, PublicationGate, WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER,
@@ -16,13 +20,13 @@ use crate::checkpoint::{
 };
 use crate::engine::PublishedView;
 use crate::store::{EncodedWal, WalStore, WalStoreError};
-use crate::{AdmissionRefusal, Applied, Forest, StreamCommand, StreamReply};
+use crate::{Applied, Forest};
 
 /// Commands waiting to be considered by the single writer.
 pub(crate) const WRITER_INGRESS_COMMANDS_MAX: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum WriterExit {
+pub(crate) enum WriterExit {
     #[error("partition writer shut down after draining ingress")]
     Shutdown,
     #[error("partition writer was fenced at WAL batch {batch:?}")]
@@ -33,9 +37,19 @@ pub enum WriterExit {
     Contradiction { batch: BatchId, detail: String },
 }
 
-pub(crate) struct CommandEnvelope {
-    pub(crate) command: StreamCommand,
-    pub(crate) reply: oneshot::Sender<Result<StreamReply, AdmissionRefusal>>,
+pub(crate) enum CommandEnvelope {
+    Create {
+        command: CreateStream,
+        reply: oneshot::Sender<Result<CreateOutcome, AdmissionRefusal>>,
+    },
+    Close {
+        path: DirectoryKey,
+        reply: oneshot::Sender<Result<CloseStreamOutcome, AdmissionRefusal>>,
+    },
+    Delete {
+        path: DirectoryKey,
+        reply: oneshot::Sender<Result<(), AdmissionRefusal>>,
+    },
 }
 
 struct Writer {
@@ -62,8 +76,21 @@ struct Writer {
 struct PendingCommand {
     /// `None` when the reply is idempotent and inherits an earlier fact's barrier.
     fact: Option<OperationFact>,
-    reply: StreamReply,
-    waiter: oneshot::Sender<Result<StreamReply, AdmissionRefusal>>,
+    completion: Completion,
+}
+
+enum Completion {
+    Create {
+        outcome: CreateOutcome,
+        reply: oneshot::Sender<Result<CreateOutcome, AdmissionRefusal>>,
+    },
+    Close {
+        outcome: CloseStreamOutcome,
+        reply: oneshot::Sender<Result<CloseStreamOutcome, AdmissionRefusal>>,
+    },
+    Delete {
+        reply: oneshot::Sender<Result<(), AdmissionRefusal>>,
+    },
 }
 
 struct Flight {
@@ -243,45 +270,90 @@ impl Writer {
         );
         let batch = self.next_batch;
         if self.pending.len() == WAL_RUN_FACTS_MAX {
-            send_refusal(envelope.reply, AdmissionRefusal::Overloaded);
+            envelope.refuse(AdmissionRefusal::Overloaded);
             return;
         }
 
-        match admit(&self.admitted, &envelope.command, batch) {
-            Ok(Admission::Fact(admitted)) => {
-                // Only a fact consumes a WAL coordinate, so the suffix gate
-                // sheds new mutations while idempotent replies stay answerable.
-                if !decide_suffix_room(replay_batch(self.seal.replay()), batch) {
-                    if self.checkpoint.is_none() {
-                        self.checkpoint_requested = true;
+        match envelope {
+            CommandEnvelope::Create { command, reply } => {
+                match admit_create(&self.admitted, &command, batch) {
+                    Ok(CreateAdmission::Fact(admitted)) => self.accept_fact(
+                        admitted,
+                        Completion::Create {
+                            outcome: CreateOutcome::Created,
+                            reply,
+                        },
+                    ),
+                    Ok(CreateAdmission::AlreadyExists) => {
+                        self.accept_idempotent(Completion::Create {
+                            outcome: CreateOutcome::AlreadyExists,
+                            reply,
+                        });
                     }
-                    send_refusal(envelope.reply, AdmissionRefusal::Overloaded);
-                    return;
-                }
-                self.admitted = admitted.forest;
-                self.pending.push(PendingCommand {
-                    fact: Some(admitted.fact),
-                    reply: admitted.reply,
-                    waiter: envelope.reply,
-                });
-                if self.flight.is_none() {
-                    self.promote_pending();
+                    Err(refusal) => {
+                        let _receiver_may_be_gone = reply.send(Err(refusal));
+                    }
                 }
             }
-            Ok(Admission::Idempotent(reply)) => {
-                if self.flight.is_none() {
-                    let _receiver_may_be_gone = envelope.reply.send(Ok(reply));
-                } else {
-                    self.pending.push(PendingCommand {
-                        fact: None,
-                        reply,
-                        waiter: envelope.reply,
-                    });
+            CommandEnvelope::Close { path, reply } => {
+                match admit_close(&self.admitted, &path, batch) {
+                    Ok(CloseAdmission::Fact(admitted)) => self.accept_fact(
+                        admitted,
+                        Completion::Close {
+                            outcome: CloseStreamOutcome::Closed,
+                            reply,
+                        },
+                    ),
+                    Ok(CloseAdmission::AlreadyClosed) => {
+                        self.accept_idempotent(Completion::Close {
+                            outcome: CloseStreamOutcome::AlreadyClosed,
+                            reply,
+                        });
+                    }
+                    Err(refusal) => {
+                        let _receiver_may_be_gone = reply.send(Err(refusal));
+                    }
                 }
             }
-            Err(refusal) => {
-                send_refusal(envelope.reply, refusal);
+            CommandEnvelope::Delete { path, reply } => {
+                match admit_delete(&self.admitted, &path, batch) {
+                    Ok(admitted) => self.accept_fact(admitted, Completion::Delete { reply }),
+                    Err(refusal) => {
+                        let _receiver_may_be_gone = reply.send(Err(refusal));
+                    }
+                }
             }
+        }
+    }
+
+    fn accept_fact(&mut self, admitted: AdmittedCommand, completion: Completion) {
+        // Only a fact consumes a WAL coordinate, so the suffix gate
+        // sheds new mutations while idempotent replies stay answerable.
+        if !decide_suffix_room(replay_batch(self.seal.replay()), self.next_batch) {
+            if self.checkpoint.is_none() {
+                self.checkpoint_requested = true;
+            }
+            completion.refuse(AdmissionRefusal::Overloaded);
+            return;
+        }
+        self.admitted = admitted.forest;
+        self.pending.push(PendingCommand {
+            fact: Some(admitted.fact),
+            completion,
+        });
+        if self.flight.is_none() {
+            self.promote_pending();
+        }
+    }
+
+    fn accept_idempotent(&mut self, completion: Completion) {
+        if self.flight.is_none() {
+            completion.send();
+        } else {
+            self.pending.push(PendingCommand {
+                fact: None,
+                completion,
+            });
         }
     }
 
@@ -302,7 +374,7 @@ impl Writer {
         if facts.is_empty() {
             let mut commands = commands;
             for command in commands.drain(..) {
-                let _receiver_may_be_gone = command.waiter.send(Ok(command.reply));
+                command.completion.send();
             }
             self.spare = commands;
             return;
@@ -521,7 +593,7 @@ impl Writer {
         self.view
             .send_replace(PublishedView::new(self.durable.clone()));
         for command in flight.commands.drain(..) {
-            let _receiver_may_be_gone = command.waiter.send(Ok(command.reply));
+            command.completion.send();
         }
         self.spare = flight.commands;
         if self.checkpoint.is_none()
@@ -551,11 +623,50 @@ const fn suffix_span(replay: WalReplayPoint, durable_batch: BatchId) -> u64 {
         .expect("the durable WAL head never precedes the replay cut")
 }
 
-fn send_refusal(
-    waiter: oneshot::Sender<Result<StreamReply, AdmissionRefusal>>,
-    refusal: AdmissionRefusal,
-) {
-    let _receiver_may_be_gone = waiter.send(Err(refusal));
+impl CommandEnvelope {
+    fn refuse(self, refusal: AdmissionRefusal) {
+        match self {
+            Self::Create { command: _, reply } => {
+                let _receiver_may_be_gone = reply.send(Err(refusal));
+            }
+            Self::Close { path: _, reply } => {
+                let _receiver_may_be_gone = reply.send(Err(refusal));
+            }
+            Self::Delete { path: _, reply } => {
+                let _receiver_may_be_gone = reply.send(Err(refusal));
+            }
+        }
+    }
+}
+
+impl Completion {
+    fn send(self) {
+        match self {
+            Self::Create { outcome, reply } => {
+                let _receiver_may_be_gone = reply.send(Ok(outcome));
+            }
+            Self::Close { outcome, reply } => {
+                let _receiver_may_be_gone = reply.send(Ok(outcome));
+            }
+            Self::Delete { reply } => {
+                let _receiver_may_be_gone = reply.send(Ok(()));
+            }
+        }
+    }
+
+    fn refuse(self, refusal: AdmissionRefusal) {
+        match self {
+            Self::Create { outcome: _, reply } => {
+                let _receiver_may_be_gone = reply.send(Err(refusal));
+            }
+            Self::Close { outcome: _, reply } => {
+                let _receiver_may_be_gone = reply.send(Err(refusal));
+            }
+            Self::Delete { reply } => {
+                let _receiver_may_be_gone = reply.send(Err(refusal));
+            }
+        }
+    }
 }
 
 fn pending_facts(facts: Vec<OperationFact>) -> WalFacts {
@@ -565,7 +676,7 @@ fn pending_facts(facts: Vec<OperationFact>) -> WalFacts {
 
 #[cfg(test)]
 mod tests {
-    use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
+    use strom_domain::{CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle};
     use strom_object_store::ObjectStoreAdapter;
     use strom_storage_domain::{
         DirectoryEntry, DirectoryKey, StreamUid, WAL_SUFFIX_COORDINATES_MAX_V2,
@@ -577,7 +688,7 @@ mod tests {
     struct TestAdmission {
         command: PendingCommand,
         candidate: EncodedWal,
-        reply: oneshot::Receiver<Result<StreamReply, AdmissionRefusal>>,
+        reply: oneshot::Receiver<Result<CreateOutcome, AdmissionRefusal>>,
     }
 
     #[tokio::test]
@@ -613,18 +724,8 @@ mod tests {
         let (sender, ingress) = mpsc::channel(WRITER_INGRESS_COMMANDS_MAX);
         drop(sender);
         assert_eq!(WriterExit::Shutdown, writer.run(ingress).await);
-        assert_eq!(
-            StreamReply::Created {
-                uid: StreamUid::try_from(2)?
-            },
-            reply_b.await??
-        );
-        assert_eq!(
-            StreamReply::Created {
-                uid: StreamUid::try_from(3)?
-            },
-            reply_c.await??
-        );
+        assert_eq!(CreateOutcome::Created, reply_b.await??);
+        assert_eq!(CreateOutcome::Created, reply_c.await??);
 
         let grouped = WalStore::new(adapter)
             .read_wal(partition, BatchId::try_from(3)?)
@@ -665,10 +766,7 @@ mod tests {
             exact.complete_flight(Ok(CreateEvidence::Unresolved)).await,
             "one exact read reconciles an ambiguous create"
         );
-        assert!(matches!(
-            admission.reply.await?,
-            Ok(StreamReply::Created { .. })
-        ));
+        assert!(matches!(admission.reply.await?, Ok(CreateOutcome::Created)));
 
         let foreign_adapter = ObjectStoreAdapter::in_memory();
         let (mut foreign, _view) = writer(foreign_adapter).await?;
@@ -756,7 +854,7 @@ mod tests {
             .await
             .expect("the in-memory WAL task completes");
         writer.complete_flight(completion).await?;
-        assert!(matches!(reply.await?, Ok(StreamReply::Created { .. })));
+        assert_eq!(Ok(CreateOutcome::Created), reply.await?);
 
         writer.checkpoint_requested = true;
         writer.start_checkpoint()?;
@@ -784,7 +882,7 @@ mod tests {
         let path = DirectoryKey::try_from(Box::<[u8]>::from(b"events/takeover".as_slice()))?;
         let reply = consider(&mut first, create_command("events/takeover")?);
         complete_active_wal(&mut first).await?;
-        assert!(matches!(reply.await?, Ok(StreamReply::Created { .. })));
+        assert_eq!(Ok(CreateOutcome::Created), reply.await?);
         drop(first);
 
         let ready = bootstrap(adapter.clone(), crate::test_entropy()).await?;
@@ -1019,10 +1117,11 @@ mod tests {
 
     fn admitted_command(
         writer: &mut Writer,
-        command: &StreamCommand,
+        command: &CreateStream,
         batch: BatchId,
     ) -> Result<TestAdmission, Box<dyn std::error::Error>> {
-        let Admission::Fact(admitted) = admit(&writer.admitted, command, batch)? else {
+        let CreateAdmission::Fact(admitted) = admit_create(&writer.admitted, command, batch)?
+        else {
             return Err("test admission helper requires a new fact".into());
         };
         writer.admitted = admitted.forest;
@@ -1036,8 +1135,10 @@ mod tests {
         Ok(TestAdmission {
             command: PendingCommand {
                 fact: Some(admitted.fact),
-                reply: admitted.reply,
-                waiter,
+                completion: Completion::Create {
+                    outcome: CreateOutcome::Created,
+                    reply: waiter,
+                },
             },
             candidate,
             reply: receiver,
@@ -1065,15 +1166,15 @@ mod tests {
 
     fn consider(
         writer: &mut Writer,
-        command: StreamCommand,
-    ) -> oneshot::Receiver<Result<StreamReply, AdmissionRefusal>> {
+        command: CreateStream,
+    ) -> oneshot::Receiver<Result<CreateOutcome, AdmissionRefusal>> {
         let (reply, outcome) = oneshot::channel();
-        writer.consider(CommandEnvelope { command, reply });
+        writer.consider(CommandEnvelope::Create { command, reply });
         outcome
     }
 
-    fn create_command(raw: &str) -> Result<StreamCommand, Box<dyn std::error::Error>> {
-        Ok(StreamCommand::Create {
+    fn create_command(raw: &str) -> Result<CreateStream, Box<dyn std::error::Error>> {
+        Ok(CreateStream {
             path: DirectoryKey::try_from(Box::<[u8]>::from(raw.as_bytes()))?,
             content_type: StreamContentType::octet_stream(),
             expiry: ExpiryPolicy::None,
@@ -1117,12 +1218,7 @@ mod tests {
         let (sender, ingress) = mpsc::channel(WRITER_INGRESS_COMMANDS_MAX);
         drop(sender);
         assert_eq!(WriterExit::Shutdown, writer.run(ingress).await);
-        assert_eq!(
-            StreamReply::AlreadyCreated {
-                uid: StreamUid::try_from(1)?
-            },
-            duplicate.await??
-        );
+        assert_eq!(CreateOutcome::AlreadyExists, duplicate.await??);
 
         let grouped = WalStore::new(adapter)
             .read_wal(partition, BatchId::try_from(3)?)
@@ -1140,7 +1236,7 @@ mod tests {
         let (mut writer, _view) = writer(ObjectStoreAdapter::in_memory()).await?;
         let created = consider(&mut writer, create_command("events/a")?);
         complete_active_wal(&mut writer).await?;
-        assert!(matches!(created.await?, Ok(StreamReply::Created { .. })));
+        assert_eq!(Ok(CreateOutcome::Created), created.await?);
 
         writer.next_batch = BatchId::try_from(WAL_SUFFIX_COORDINATES_MAX_V2)?;
         let shed = consider(&mut writer, create_command("events/b")?);
@@ -1156,9 +1252,7 @@ mod tests {
 
         let duplicate = consider(&mut writer, create_command("events/a")?);
         assert_eq!(
-            Ok(StreamReply::AlreadyCreated {
-                uid: StreamUid::try_from(1)?
-            }),
+            Ok(CreateOutcome::AlreadyExists),
             duplicate.await?,
             "an idempotent retry consumes no WAL coordinate and stays answerable"
         );

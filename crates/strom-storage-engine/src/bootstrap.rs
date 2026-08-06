@@ -21,7 +21,7 @@ use crate::store::{
 
 /// Why a partition did not become Ready.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum BootstrapExit {
+pub(crate) enum BootstrapExit {
     #[error("bootstrap should be retried: {detail}")]
     Retryable { detail: String },
     #[error("bootstrap claim was fenced by Seal generation {observed:?}")]

@@ -3211,6 +3211,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "imbl",
+ "object_store",
  "proptest",
  "rand 0.9.5",
  "strom-common",
@@ -3228,10 +3229,7 @@ dependencies = [
  "object_store",
  "strom-common",
  "strom-domain",
- "strom-object-store",
- "strom-storage-domain",
  "strom-storage-engine",
- "thiserror",
  "tokio",
 ]
 

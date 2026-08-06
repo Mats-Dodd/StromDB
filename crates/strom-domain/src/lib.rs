@@ -1,4 +1,4 @@
-//! Cold stream metadata types for the Durable Streams protocol.
+//! Durable Streams protocol vocabulary and caller-visible outcomes.
 //!
 //! ```
 //! use strom_domain::{ExpiryPolicy, StreamId, StreamTtl};
@@ -13,6 +13,7 @@
 mod content_type;
 mod expiry;
 mod lifecycle;
+mod outcome;
 #[cfg(feature = "proptest")]
 pub mod strategy;
 mod stream_id;
@@ -23,4 +24,5 @@ pub use expiry::{
     StreamTtlError,
 };
 pub use lifecycle::StreamLifecycle;
+pub use outcome::{CloseStreamOutcome, CreateOutcome, StreamStatus};
 pub use stream_id::{STREAM_ID_BYTES_MAX, StreamId, StreamIdError};

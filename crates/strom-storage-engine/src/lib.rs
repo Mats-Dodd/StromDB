@@ -9,10 +9,8 @@ mod forest;
 mod store;
 mod writer;
 
-pub use admission::{AdmissionRefusal, StreamCommand, StreamReply};
-pub use bootstrap::BootstrapExit;
-pub use engine::{CommandError, Engine, PublishedView};
-pub use writer::WriterExit;
+pub use engine::{CloseOutcome, Engine, OpenError, StreamError};
+pub use strom_storage_domain::PartitionId;
 
 pub(crate) use forest::{Applied, FoldContradiction, Forest};
 

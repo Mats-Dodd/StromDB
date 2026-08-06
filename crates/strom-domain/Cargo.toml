@@ -1,6 +1,6 @@
 [package]
 name = "strom-domain"
-description = "Pure Durable Streams protocol domain types for cold, per-stream Ledger metadata"
+description = "Pure Durable Streams protocol vocabulary and caller-visible outcomes"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

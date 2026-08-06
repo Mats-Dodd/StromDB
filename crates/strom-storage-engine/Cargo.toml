@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 futures = { workspace = true }
 imbl = { workspace = true }
+object_store = { workspace = true }
 rand = { workspace = true }
 strom-common = { path = "../strom-common", version = "0.1.0" }
 strom-domain = { path = "../strom-domain", version = "0.1.0" }
