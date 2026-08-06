@@ -4,15 +4,15 @@
 mod admission;
 mod bootstrap;
 mod checkpoint;
+mod engine;
 mod forest;
-mod partition;
 mod store;
 mod writer;
 
 pub use admission::{AdmissionRefusal, StreamCommand, StreamReply};
 pub use bootstrap::BootstrapExit;
+pub use engine::{CommandError, Engine, PublishedView};
 pub use forest::{Applied, FoldContradiction, Forest};
-pub use partition::{CommandError, Partition, PartitionHandle, PublishedView};
 pub use store::{
     AuthorizedWalRunDelete, EncodedSeal, EncodedWal, ObservedWal, SealStore, SealStoreError,
     WalDeleteRefusal, WalStore, WalStoreError,

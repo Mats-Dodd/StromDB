@@ -14,7 +14,7 @@ use crate::checkpoint::{
     CheckpointInput, CheckpointOutcome, PublicationGate, WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER,
     collect_advance, execute_checkpoint,
 };
-use crate::partition::PublishedView;
+use crate::engine::PublishedView;
 use crate::store::{EncodedWal, WalStore, WalStoreError};
 use crate::{AdmissionRefusal, Applied, Forest, StreamCommand, StreamReply};
 

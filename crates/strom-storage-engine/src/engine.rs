@@ -1,4 +1,4 @@
-//! Partition startup, immutable views, bounded commands, and graceful drain.
+//! Engine startup, immutable views, bounded commands, and graceful drain.
 
 use strom_common::Entropy;
 use strom_object_store::ObjectStoreAdapter;
@@ -54,20 +54,25 @@ impl PublishedView {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct Partition;
+#[derive(Debug)]
+pub struct Engine {
+    partition: PartitionId,
+    commands: mpsc::Sender<CommandEnvelope>,
+    view: watch::Receiver<PublishedView>,
+    writer: JoinHandle<WriterExit>,
+}
 
-impl Partition {
+impl Engine {
     /// Bootstrap one partition and start its sole writer.
     ///
     /// # Errors
     ///
     /// Returns [`BootstrapExit`] unless the complete durable state is bounded,
     /// internally consistent, directly claimed, fenced, replayed, and current.
-    pub async fn start(
+    pub async fn open(
         adapter: ObjectStoreAdapter,
         entropy: Entropy,
-    ) -> Result<PartitionHandle, BootstrapExit> {
+    ) -> Result<Self, BootstrapExit> {
         let ready = bootstrap(adapter.clone(), entropy).await?;
         let partition = ready.partition();
         let initial = PublishedView::new(
@@ -78,24 +83,14 @@ impl Partition {
         let (view_sender, view) = watch::channel(initial);
         let (commands, ingress) = mpsc::channel(WRITER_INGRESS_COMMANDS_MAX);
         let writer = spawn_writer(adapter, ready, ingress, view_sender);
-        Ok(PartitionHandle {
+        Ok(Self {
             partition,
             commands,
             view,
             writer,
         })
     }
-}
 
-#[derive(Debug)]
-pub struct PartitionHandle {
-    partition: PartitionId,
-    commands: mpsc::Sender<CommandEnvelope>,
-    view: watch::Receiver<PublishedView>,
-    writer: JoinHandle<WriterExit>,
-}
-
-impl PartitionHandle {
     #[must_use]
     pub const fn partition_id(&self) -> PartitionId {
         self.partition
@@ -185,7 +180,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let adapter = ObjectStoreAdapter::in_memory();
         let path = directory_key("events/a")?;
-        let handle = Partition::start(adapter.clone(), crate::test_entropy()).await?;
+        let handle = Engine::open(adapter.clone(), crate::test_entropy()).await?;
         let reply = handle
             .command(StreamCommand::Create {
                 path: path.clone(),
@@ -204,7 +199,7 @@ mod tests {
         );
         assert_eq!(WriterExit::Shutdown, handle.shutdown().await);
 
-        let reopened = Partition::start(adapter, crate::test_entropy()).await?;
+        let reopened = Engine::open(adapter, crate::test_entropy()).await?;
         assert_eq!(
             Some(DirectoryEntry::Live(uid)),
             reopened.snapshot()?.resolve(&path),
@@ -219,7 +214,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let adapter = ObjectStoreAdapter::in_memory();
         let path = directory_key("events/dup")?;
-        let handle = Partition::start(adapter.clone(), crate::test_entropy()).await?;
+        let handle = Engine::open(adapter.clone(), crate::test_entropy()).await?;
         let partition_id = handle.partition_id();
         let first = handle
             .command(StreamCommand::Create {
@@ -268,8 +263,7 @@ mod tests {
     #[tokio::test]
     async fn typed_refusal_does_not_change_the_published_view()
     -> Result<(), Box<dyn std::error::Error>> {
-        let handle =
-            Partition::start(ObjectStoreAdapter::in_memory(), crate::test_entropy()).await?;
+        let handle = Engine::open(ObjectStoreAdapter::in_memory(), crate::test_entropy()).await?;
         let missing = directory_key("events/missing")?;
         assert_eq!(
             Err(CommandError::Refused(AdmissionRefusal::PathNotLive)),
@@ -288,7 +282,7 @@ mod tests {
     async fn writer_exit_revokes_new_snapshot_acquisition() -> Result<(), Box<dyn std::error::Error>>
     {
         let adapter = ObjectStoreAdapter::in_memory();
-        let handle = Partition::start(adapter.clone(), crate::test_entropy()).await?;
+        let handle = Engine::open(adapter.clone(), crate::test_entropy()).await?;
         let partition_id = handle.partition_id();
         let seal = handle.snapshot()?.generation();
         let batch = BatchId::try_from(2)?;

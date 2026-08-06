@@ -50,18 +50,18 @@ use strom_common::{Entropy, Seed};
 use strom_object_store::ObjectStoreAdapter;
 use strom_storage_domain::{DirectoryEntry, DirectoryKey};
 use strom_storage_engine::{
-    AdmissionRefusal, BootstrapExit, CommandError, Partition, PartitionHandle, PublishedView,
-    StreamCommand, StreamReply, WriterExit,
+    AdmissionRefusal, BootstrapExit, CommandError, Engine, PublishedView, StreamCommand,
+    StreamReply, WriterExit,
 };
 
-/// One open partition of a `StromDB` durable streams database.
+/// One open `StromDB` durable streams database.
 #[derive(Debug)]
 pub struct Db {
-    handle: PartitionHandle,
+    engine: Engine,
 }
 
 impl Db {
-    /// Bootstrap one partition over `store` and take sole writer authority.
+    /// Open a database over `store` and take sole writer authority.
     ///
     /// The injected store must not transparently resend a create after an
     /// ambiguous result; `StromDB` owns every retry decision, so configure
@@ -74,8 +74,8 @@ impl Db {
     pub async fn open(store: Arc<dyn ObjectStore>) -> Result<Self, OpenError> {
         let adapter = ObjectStoreAdapter::new(store);
         let entropy = Entropy::from_seed(Seed::from_os());
-        match Partition::start(adapter, entropy).await {
-            Ok(handle) => Ok(Self { handle }),
+        match Engine::open(adapter, entropy).await {
+            Ok(engine) => Ok(Self { engine }),
             Err(exit) => Err(open_error(exit)),
         }
     }
@@ -83,7 +83,7 @@ impl Db {
     /// The genesis-born identity of the partition at this store root.
     #[must_use]
     pub const fn partition_id(&self) -> PartitionId {
-        self.handle.partition_id()
+        self.engine.partition_id()
     }
 
     /// Create one stream at `id`, or confirm it already exists at the same configuration.
@@ -155,7 +155,7 @@ impl Db {
     /// Returns [`StreamError::Unavailable`] after this partition has stopped
     /// serving.
     pub fn stream(&self, id: &StreamId) -> Result<StreamStatus, StreamError> {
-        match self.handle.snapshot() {
+        match self.engine.snapshot() {
             Ok(view) => Ok(stream_status(&view, &DirectoryKey::from(id))),
             Err(error) => Err(stream_error(error)),
         }
@@ -168,11 +168,11 @@ impl Db {
     /// Panics when the writer task was externally cancelled or violated an
     /// in-process invariant.
     pub async fn close(self) -> CloseOutcome {
-        close_outcome(self.handle.shutdown().await)
+        close_outcome(self.engine.shutdown().await)
     }
 
     async fn send(&self, command: StreamCommand) -> Result<StreamReply, StreamError> {
-        match self.handle.command(command).await {
+        match self.engine.command(command).await {
             Ok(reply) => Ok(reply),
             Err(error) => Err(stream_error(error)),
         }
