@@ -3,10 +3,9 @@ use std::num::NonZeroU64;
 use strom_domain::{ExpiryPolicy, StreamContentType, StreamId};
 use strom_storage_domain::{
     AttemptId, BatchId, DecodeError, DirectoryKey, FreshIdentity, OperationFact, OwnerToken,
-    PartitionId, RangeVersion, SEAL_ENCODED_BYTES_MAX, Seal, SealGeneration, SealIdentity,
-    SortedRun, StoreKind, StreamUid, TableObjectId, TableRef, TreeVersion, WAL_ENCODED_BYTES_MAX,
-    WalBody, WalFacts, WalIdentity, WalObject, WalReplayPoint, decode_seal, decode_wal,
-    encode_seal, encode_wal,
+    PartitionId, SEAL_ENCODED_BYTES_MAX, Seal, SealGeneration, SealIdentity, SortedRun, StoreKind,
+    StreamUid, TableObjectId, TableRef, TreeVersion, WAL_ENCODED_BYTES_MAX, WalBody, WalFacts,
+    WalIdentity, WalObject, WalReplayPoint, decode_seal, decode_wal, encode_seal, encode_wal,
 };
 
 fn partition() -> Result<PartitionId, strom_storage_domain::PartitionIdError> {
@@ -29,8 +28,6 @@ fn genesis_seal() -> Result<Seal, Box<dyn std::error::Error>> {
         WalReplayPoint::Genesis,
         TreeVersion::empty(),
         TreeVersion::empty(),
-        TreeVersion::empty(),
-        TreeVersion::empty(),
     )?)
 }
 
@@ -48,9 +45,8 @@ fn tree_with_table(
         TableObjectId::new(fresh, store),
         NonZeroU64::new(123).ok_or("table length is nonzero")?,
     )?;
-    Ok(TreeVersion::try_from_ranges(vec![RangeVersion::full(
-        vec![SortedRun::try_from_tables(vec![table])?],
-    )?])?)
+    let run = SortedRun::try_from(vec![table])?;
+    Ok(TreeVersion::try_from(vec![run])?)
 }
 
 fn representative_seal() -> Result<Seal, Box<dyn std::error::Error>> {
@@ -64,8 +60,6 @@ fn representative_seal() -> Result<Seal, Box<dyn std::error::Error>> {
         },
         tree_with_table(generation, StoreKind::Directory, 0)?,
         tree_with_table(generation, StoreKind::Ledger, 1)?,
-        TreeVersion::empty(),
-        TreeVersion::empty(),
     )?)
 }
 
@@ -97,13 +91,9 @@ fn fence() -> Result<WalObject, Box<dyn std::error::Error>> {
 fn seal_archive_fixture_anchors_the_root() -> Result<(), Box<dyn std::error::Error>> {
     let seal = genesis_seal()?;
     let expected = &[
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 238, 255, 255, 255, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 238, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 238, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 238, 255, 255, 255, 0, 0, 0, 0, 0, 17, 34, 51, 68, 85,
-        102, 119, 136, 153, 170, 187, 204, 221, 238, 255, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 111, 255, 255, 255, 1, 0, 0, 0, 129, 255, 255, 255, 1, 0,
-        0, 0, 147, 255, 255, 255, 1, 0, 0, 0, 165, 255, 255, 255, 1, 0, 0, 0,
+        0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204, 221, 238, 255, 1, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 215, 255, 255, 255, 0, 0, 0, 0,
+        207, 255, 255, 255, 0, 0, 0, 0,
     ];
     let encoded = encode_seal(&seal)?;
     let first_difference =

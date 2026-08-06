@@ -25,6 +25,8 @@ pub enum SstEncodeError {
     Serialization,
     #[error("SST exceeds the {SST_OBJECT_BYTES_MAX}-byte bound")]
     EncodedBytesOverMax,
+    #[error("SST exceeds an encode resource bound")]
+    ResourceBound,
 }
 
 impl From<EncodeError> for SstEncodeError {
@@ -38,10 +40,11 @@ impl From<EncodeError> for SstEncodeError {
 
 pub(super) fn check_encode_rows<Row: Archive>(rows_len: usize) -> Result<(), SstEncodeError> {
     let rows_len_u64 = u64::try_from(rows_len).unwrap_or(u64::MAX);
+    if rows_len_u64 > PARTITION_PATH_OCCUPANCIES_MAX_V2 {
+        return Err(SstEncodeError::ResourceBound);
+    }
     let archived_rows_bytes = rows_len.saturating_mul(size_of::<Archived<Row>>());
-    if rows_len_u64 > PARTITION_PATH_OCCUPANCIES_MAX_V2
-        || archived_rows_bytes > SST_OBJECT_BYTES_MAX_USIZE
-    {
+    if archived_rows_bytes > SST_OBJECT_BYTES_MAX_USIZE {
         return Err(SstEncodeError::EncodedBytesOverMax);
     }
     Ok(())
@@ -79,7 +82,7 @@ mod tests {
     fn impossible_row_counts_fail_before_input_iteration() {
         assert_eq!(
             check_encode_rows::<u64>(usize::MAX),
-            Err(SstEncodeError::EncodedBytesOverMax)
+            Err(SstEncodeError::ResourceBound)
         );
     }
 }

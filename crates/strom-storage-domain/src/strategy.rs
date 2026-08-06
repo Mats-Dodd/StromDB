@@ -114,8 +114,6 @@ pub fn seal() -> impl Strategy<Value = Seal> {
                     replay,
                     TreeVersion::empty(),
                     TreeVersion::empty(),
-                    TreeVersion::empty(),
-                    TreeVersion::empty(),
                 )
                 .ok()
             },

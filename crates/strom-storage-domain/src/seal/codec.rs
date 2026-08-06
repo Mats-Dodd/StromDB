@@ -3,15 +3,11 @@
 use rkyv::rancor::Failure;
 
 use super::{
-    ArchivedKeyBound, ArchivedRangeVersion, ArchivedSeal, ArchivedSortedRun, ArchivedTableRef,
-    ArchivedTreeVersion, ArchivedWalReplayPoint, KeyBound, RangeVersion, Seal, SealIdentity,
-    SortedRun, TableRef, TreeVersion, WalReplayPoint,
+    ArchivedSeal, ArchivedSortedRun, ArchivedTableRef, ArchivedTreeVersion, ArchivedWalReplayPoint,
+    Seal, SealIdentity, SortedRun, TableRef, TreeVersion, WalReplayPoint,
 };
 use crate::archive::{DecodeError, EncodeError, decode_bound, encode};
-use crate::bounds::{
-    DIRECTORY_KEY_BYTES_MAX, RUN_TABLES_MAX, SEAL_ENCODED_BYTES_MAX, TREE_RANGES_MAX_V2,
-    TREE_RUNS_MAX,
-};
+use crate::bounds::{RUN_TABLES_MAX, SEAL_ENCODED_BYTES_MAX, TREE_RUNS_MAX};
 use crate::{BatchId, OwnerToken, PartitionId, SealGeneration, TableObjectId};
 
 /// # Errors
@@ -49,8 +45,6 @@ fn decode_archived_seal(
         decode_replay(&archived.replay),
         decode_tree(&archived.directory)?,
         decode_tree(&archived.ledger)?,
-        decode_tree(&archived.tally)?,
-        decode_tree(&archived.annals)?,
     )
     .map_err(|_domain_error| DecodeError::InvalidBody)
 }
@@ -66,17 +60,6 @@ fn decode_replay(archived: &ArchivedWalReplayPoint) -> WalReplayPoint {
 }
 
 fn decode_tree(archived: &ArchivedTreeVersion) -> Result<TreeVersion, DecodeError> {
-    if archived.ranges.len() != TREE_RANGES_MAX_V2 {
-        return Err(DecodeError::InvalidBody);
-    }
-    let mut ranges = Vec::with_capacity(archived.ranges.len());
-    for range in archived.ranges.iter() {
-        ranges.push(decode_range(range)?);
-    }
-    TreeVersion::try_from_ranges(ranges).map_err(|_domain_error| DecodeError::InvalidBody)
-}
-
-fn decode_range(archived: &ArchivedRangeVersion) -> Result<RangeVersion, DecodeError> {
     if archived.runs.len() > TREE_RUNS_MAX {
         return Err(DecodeError::InvalidBody);
     }
@@ -84,25 +67,7 @@ fn decode_range(archived: &ArchivedRangeVersion) -> Result<RangeVersion, DecodeE
     for run in archived.runs.iter() {
         runs.push(decode_run(run)?);
     }
-    RangeVersion::new(
-        decode_key_bound(&archived.start)?,
-        decode_key_bound(&archived.end)?,
-        runs,
-    )
-    .map_err(|_domain_error| DecodeError::InvalidBody)
-}
-
-fn decode_key_bound(archived: &ArchivedKeyBound) -> Result<KeyBound, DecodeError> {
-    match archived {
-        ArchivedKeyBound::Minimum => Ok(KeyBound::Minimum),
-        ArchivedKeyBound::Key(key) => {
-            if key.len() > DIRECTORY_KEY_BYTES_MAX {
-                return Err(DecodeError::InvalidBody);
-            }
-            Ok(KeyBound::key(key.as_ref()))
-        }
-        ArchivedKeyBound::Maximum => Ok(KeyBound::Maximum),
-    }
+    TreeVersion::try_from(runs).map_err(|_domain_error| DecodeError::InvalidBody)
 }
 
 fn decode_run(archived: &ArchivedSortedRun) -> Result<SortedRun, DecodeError> {
@@ -113,7 +78,7 @@ fn decode_run(archived: &ArchivedSortedRun) -> Result<SortedRun, DecodeError> {
     for table in archived.tables.iter() {
         tables.push(decode_table_ref(table)?);
     }
-    SortedRun::try_from_tables(tables).map_err(|_domain_error| DecodeError::InvalidBody)
+    SortedRun::try_from(tables).map_err(|_domain_error| DecodeError::InvalidBody)
 }
 
 fn decode_table_ref(archived: &ArchivedTableRef) -> Result<TableRef, DecodeError> {
@@ -126,7 +91,10 @@ fn decode_table_ref(archived: &ArchivedTableRef) -> Result<TableRef, DecodeError
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
+
     use super::*;
+    use crate::{AttemptId, FreshIdentity, StoreKind, TREE_RUNS_MAX, TableObjectId};
 
     #[test]
     fn checked_access_accepts_a_misaligned_byte_slice() -> Result<(), Box<dyn std::error::Error>> {
@@ -191,16 +159,15 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_an_invalid_tree_shape() -> Result<(), Box<dyn std::error::Error>> {
+    fn decode_rejects_a_tree_with_too_many_runs() -> Result<(), Box<dyn std::error::Error>> {
         let partition: PartitionId = "00112233-4455-6677-8899-aabbccddeeff".parse()?;
+        let generation = SealGeneration::try_from(2)?;
         let seal = Seal {
             partition,
-            generation: SealGeneration::genesis(),
+            generation,
             replay: WalReplayPoint::Genesis,
-            directory: TreeVersion { ranges: Vec::new() },
+            directory: tree_over_run_max()?,
             ledger: TreeVersion::empty(),
-            tally: TreeVersion::empty(),
-            annals: TreeVersion::empty(),
         };
         let bytes = encode_seal(&seal)?;
 
@@ -211,13 +178,26 @@ mod tests {
         Ok(())
     }
 
+    fn tree_over_run_max() -> Result<TreeVersion, Box<dyn std::error::Error>> {
+        let birth = SealGeneration::try_from(2)?;
+        let mut runs = Vec::with_capacity(TREE_RUNS_MAX.saturating_add(1));
+        for ordinal in 0..=u32::try_from(TREE_RUNS_MAX)? {
+            let fresh =
+                FreshIdentity::new(birth, AttemptId::new(SealGeneration::genesis(), 1), ordinal)?;
+            let table = TableRef::new(
+                TableObjectId::new(fresh, StoreKind::Directory),
+                NonZeroU64::new(1).ok_or("table length is nonzero")?,
+            )?;
+            runs.push(SortedRun::try_from(vec![table])?);
+        }
+        Ok(TreeVersion { runs })
+    }
+
     fn valid_seal() -> Result<Seal, Box<dyn std::error::Error>> {
         Ok(Seal::new(
             "00112233-4455-6677-8899-aabbccddeeff".parse()?,
             SealGeneration::genesis(),
             WalReplayPoint::Genesis,
-            TreeVersion::empty(),
-            TreeVersion::empty(),
             TreeVersion::empty(),
             TreeVersion::empty(),
         )?)

@@ -73,15 +73,6 @@ impl TryFrom<&ArchivedStreamRecord> for StreamRecord {
     }
 }
 
-impl ArchivedStreamRecord {
-    pub(crate) fn validated(&self) -> Result<&Self, DecodeError> {
-        StreamContentType::validate_canonical(self.content_type.as_str())
-            .map_err(|_domain_error| DecodeError::InvalidBody)?;
-        ExpiryPolicy::try_from(&self.expiry)?;
-        Ok(self)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
 #[rkyv(bytecheck(bounds(__C: rkyv::validation::ArchiveContext)))]
 pub enum LedgerCell {
@@ -103,12 +94,5 @@ impl TryFrom<&ArchivedLedgerCell> for LedgerCell {
 impl ArchivedLedgerCell {
     pub(crate) const fn is_value(&self) -> bool {
         matches!(self, Self::Value(_))
-    }
-
-    pub(crate) fn validated(&self) -> Result<&Self, DecodeError> {
-        if let Self::Value(record) = self {
-            record.validated()?;
-        }
-        Ok(self)
     }
 }

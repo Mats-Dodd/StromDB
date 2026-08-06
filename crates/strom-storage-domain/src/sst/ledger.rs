@@ -85,6 +85,9 @@ pub fn decode_ledger_sst(
         return Err(SstDecodeError::ResourceBound);
     }
 
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(root.rows.len())
+        .map_err(|_allocation_error| SstDecodeError::ResourceBound)?;
     let mut previous = None;
     let mut resident_bytes = 0u64;
     for row in root.rows.iter() {
@@ -92,9 +95,6 @@ pub fn decode_ledger_sst(
         if previous.is_some_and(|previous_uid| uid <= previous_uid) {
             return Err(SstDecodeError::InvalidBody);
         }
-        row.1
-            .validated()
-            .map_err(|_domain_error| SstDecodeError::InvalidBody)?;
         let row_bytes = if row.1.is_value() {
             LEDGER_VALUE_ROW_LOGICAL_BYTES_MAX
         } else {
@@ -106,17 +106,11 @@ pub fn decode_ledger_sst(
         if resident_bytes > PARTITION_RESIDENT_LOGICAL_BYTES_MAX_V2 {
             return Err(SstDecodeError::ResourceBound);
         }
-        previous = Some(uid);
-    }
-
-    let mut rows = Vec::new();
-    rows.try_reserve_exact(root.rows.len())
-        .map_err(|_allocation_error| SstDecodeError::ResourceBound)?;
-    for row in root.rows.iter() {
         rows.push((
-            StreamUid::from(&row.0),
+            uid,
             LedgerCell::try_from(&row.1).map_err(|_domain_error| SstDecodeError::InvalidBody)?,
         ));
+        previous = Some(uid);
     }
     Ok(rows)
 }

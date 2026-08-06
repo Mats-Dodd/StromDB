@@ -21,8 +21,8 @@ pub use bounds::{
     LEDGER_VALUE_ROW_LOGICAL_BYTES_MAX, PARTITION_BOOTSTRAP_BYTES_MAX_V2,
     PARTITION_BOOTSTRAP_OBJECTS_MAX_V2, PARTITION_PATH_OCCUPANCIES_MAX_V2,
     PARTITION_RESIDENT_LOGICAL_BYTES_MAX_V2, RUN_TABLES_MAX, SEAL_ENCODED_BYTES_MAX,
-    SST_OBJECT_BYTES_MAX, TREE_RANGES_MAX_V2, TREE_RUNS_MAX, WAL_ENCODED_BYTES_MAX,
-    WAL_RUN_FACTS_MAX, WAL_SUFFIX_COORDINATES_MAX_V2,
+    SST_OBJECT_BYTES_MAX, TREE_RUNS_MAX, WAL_ENCODED_BYTES_MAX, WAL_RUN_FACTS_MAX,
+    WAL_SUFFIX_COORDINATES_MAX_V2,
 };
 pub use coordinate::{BatchId, CoordinateExhausted, SealGeneration, StreamUid, ZeroCoordinate};
 pub use directory::{DirectoryEntry, DirectoryKey, DirectoryKeyError};
@@ -30,8 +30,8 @@ pub use ledger::{LedgerCell, StreamRecord};
 pub use owner::OwnerToken;
 pub use partition::{PartitionId, PartitionIdError};
 pub use seal::{
-    KeyBound, RangeVersion, Seal, SealError, SealIdentity, SortedRun, TableRef, TreeVersion,
-    WalReplayPoint, decode_seal, encode_seal,
+    Seal, SealError, SealIdentity, SortedRun, TableRef, TreeVersion, WalReplayPoint, decode_seal,
+    encode_seal,
 };
 pub use spelling::{KeySpellingError, SealKey, TableKey, WalKey};
 pub use sst::{

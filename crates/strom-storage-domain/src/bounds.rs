@@ -9,9 +9,6 @@ pub const WAL_ENCODED_BYTES_MAX: usize = 4 * 1024 * 1024;
 /// Most operation facts one WAL run may carry.
 pub const WAL_RUN_FACTS_MAX: usize = 4096;
 
-/// Most ranges carried by one V2 tree manifest.
-pub const TREE_RANGES_MAX_V2: usize = 1;
-
 /// Most sorted runs carried by one tree manifest.
 pub const TREE_RUNS_MAX: usize = 16;
 

@@ -84,36 +84,30 @@ pub fn decode_directory_sst(
         return Err(SstDecodeError::ResourceBound);
     }
 
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(root.rows.len())
+        .map_err(|_allocation_error| SstDecodeError::ResourceBound)?;
     let mut previous = None;
     let mut resident_bytes = 0u64;
     for row in root.rows.iter() {
-        let key = row.0.as_bytes();
-        if key.is_empty() || key.len() > DIRECTORY_KEY_BYTES_MAX {
+        let key_bytes = row.0.as_bytes();
+        if key_bytes.is_empty() || key_bytes.len() > DIRECTORY_KEY_BYTES_MAX {
             return Err(SstDecodeError::InvalidBody);
         }
-        if previous.is_some_and(|previous_key| key <= previous_key) {
+        if previous.is_some_and(|previous_key| key_bytes <= previous_key) {
             return Err(SstDecodeError::InvalidBody);
         }
-        row.0
-            .validated_bytes()
-            .map_err(|_domain_error| SstDecodeError::InvalidBody)?;
         resident_bytes = resident_bytes
             .checked_add(DIRECTORY_ROW_LOGICAL_BYTES_MAX)
             .ok_or(SstDecodeError::ResourceBound)?;
         if resident_bytes > PARTITION_RESIDENT_LOGICAL_BYTES_MAX_V2 {
             return Err(SstDecodeError::ResourceBound);
         }
-        previous = Some(key);
-    }
-
-    let mut rows = Vec::new();
-    rows.try_reserve_exact(root.rows.len())
-        .map_err(|_allocation_error| SstDecodeError::ResourceBound)?;
-    for row in root.rows.iter() {
         rows.push((
             DirectoryKey::try_from(&row.0).map_err(|_domain_error| SstDecodeError::InvalidBody)?,
             DirectoryEntry::from(&row.1),
         ));
+        previous = Some(key_bytes);
     }
     Ok(rows)
 }
