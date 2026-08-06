@@ -101,7 +101,7 @@ impl Writer<Failure> for BoundedWriter {
             return Err(Failure);
         }
         if bytes.len() > self.bytes.capacity().saturating_sub(self.bytes.len())
-            && self.bytes.try_reserve_exact(bytes.len()).is_err()
+            && self.bytes.try_reserve(bytes.len()).is_err()
         {
             return Err(Failure);
         }

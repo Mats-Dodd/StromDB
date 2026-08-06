@@ -10,7 +10,10 @@ use strom_object_store::{KeysBound, ObjectKey, PUT_BYTES_MAX, StoreError};
 use strom_storage_domain::{SEAL_ENCODED_BYTES_MAX, WAL_ENCODED_BYTES_MAX};
 
 pub use seal::{EncodedSeal, SealStore, SealStoreError};
-pub(crate) use table::{TableRows, TableStore, TableStoreError};
+pub(crate) use table::{
+    CandidateTableEvidence, EncodedTable, TableRows, TableStore, TableStoreError,
+    targeted_table_deletes,
+};
 pub use wal::{
     AuthorizedWalRunDelete, EncodedWal, ObservedWal, WalDeleteRefusal, WalStore, WalStoreError,
 };

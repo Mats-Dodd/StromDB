@@ -117,8 +117,57 @@ pub fn decode_ledger_sst(
 
 #[cfg(test)]
 mod tests {
+    use strom_domain::{CONTENT_TYPE_BYTES_MAX, ExpiryPolicy, StreamContentType, StreamLifecycle};
+
     use super::*;
-    use crate::{AttemptId, SealGeneration, TableObjectId};
+    use crate::{
+        AttemptId, BatchId, LEDGER_DELETE_ROW_ENCODED_BYTES_MAX,
+        LEDGER_VALUE_ROW_ENCODED_BYTES_MAX, SST_ARCHIVE_FIXED_BYTES_MAX, SealGeneration,
+        StreamRecord, TableObjectId,
+    };
+
+    #[test]
+    fn encoded_ledger_bounds_dominate_maximum_identity_and_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let expected = table_key()?;
+        let empty = LedgerSstArchive {
+            partition: expected.partition(),
+            fresh: expected.object().fresh(),
+            rows: &[],
+        };
+        let empty_bytes = archive::encode(&empty, SST_OBJECT_BYTES_MAX_USIZE)?;
+        assert!(
+            u64::try_from(empty_bytes.len())? <= SST_ARCHIVE_FIXED_BYTES_MAX,
+            "fixed accounting dominates empty archive framing and identity"
+        );
+
+        let content_type: StreamContentType =
+            format!("a/{}", "b".repeat(CONTENT_TYPE_BYTES_MAX - 2)).parse()?;
+        let value = [(
+            StreamUid::try_from(u64::MAX)?,
+            LedgerCell::Value(StreamRecord::new(
+                content_type,
+                ExpiryPolicy::None,
+                StreamLifecycle::Closed,
+                BatchId::try_from(u64::MAX)?,
+            )),
+        )];
+        let value_bytes = encode_ledger_sst(&expected, &value)?;
+        assert!(
+            u64::try_from(value_bytes.len())?
+                <= SST_ARCHIVE_FIXED_BYTES_MAX + LEDGER_VALUE_ROW_ENCODED_BYTES_MAX,
+            "Ledger value accounting dominates the maximum encoded fixture"
+        );
+
+        let delete = [(StreamUid::try_from(u64::MAX)?, LedgerCell::Delete)];
+        let delete_bytes = encode_ledger_sst(&expected, &delete)?;
+        assert!(
+            u64::try_from(delete_bytes.len())?
+                <= SST_ARCHIVE_FIXED_BYTES_MAX + LEDGER_DELETE_ROW_ENCODED_BYTES_MAX,
+            "Ledger delete accounting dominates the maximum encoded fixture"
+        );
+        Ok(())
+    }
 
     #[test]
     fn decoder_rejects_a_structurally_valid_descending_uid()

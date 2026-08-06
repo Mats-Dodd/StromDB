@@ -115,7 +115,37 @@ pub fn decode_directory_sst(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AttemptId, SealGeneration, StreamUid, TableObjectId};
+    use crate::{
+        AttemptId, DIRECTORY_ROW_ENCODED_BYTES_MAX, SST_ARCHIVE_FIXED_BYTES_MAX, SealGeneration,
+        StreamUid, TableObjectId,
+    };
+
+    #[test]
+    fn encoded_directory_bounds_dominate_maximum_identity_and_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let expected = table_key()?;
+        let empty = DirectorySstArchive {
+            partition: expected.partition(),
+            fresh: expected.object().fresh(),
+            rows: &[],
+        };
+        let empty_bytes = archive::encode(&empty, SST_OBJECT_BYTES_MAX_USIZE)?;
+        assert!(
+            u64::try_from(empty_bytes.len())? <= SST_ARCHIVE_FIXED_BYTES_MAX,
+            "fixed accounting dominates empty archive framing and identity"
+        );
+
+        let raw = format!("a/{}", "b".repeat(DIRECTORY_KEY_BYTES_MAX - 2));
+        let key = DirectoryKey::try_from(raw.into_bytes().into_boxed_slice())?;
+        let rows = [(key, DirectoryEntry::Live(StreamUid::try_from(u64::MAX)?))];
+        let bytes = encode_directory_sst(&expected, &rows)?;
+        assert!(
+            u64::try_from(bytes.len())?
+                <= SST_ARCHIVE_FIXED_BYTES_MAX + DIRECTORY_ROW_ENCODED_BYTES_MAX,
+            "Directory row accounting dominates the maximum encoded fixture"
+        );
+        Ok(())
+    }
 
     #[test]
     fn decoder_rejects_a_structurally_valid_duplicate_key() -> Result<(), Box<dyn std::error::Error>>

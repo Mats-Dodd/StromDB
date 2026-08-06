@@ -230,6 +230,14 @@ impl Forest {
     pub fn path_count(&self) -> u64 {
         u64::try_from(self.directory.len()).expect("directory row count fits in u64")
     }
+
+    pub(crate) const fn directory_rows(&self) -> &OrdMap<DirectoryKey, DirectoryEntry> {
+        self.directory.rows()
+    }
+
+    pub(crate) const fn ledger_rows(&self) -> &OrdMap<StreamUid, StreamRecord> {
+        self.ledger.rows()
+    }
 }
 
 fn require_live_uid(

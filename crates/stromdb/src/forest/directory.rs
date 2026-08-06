@@ -32,6 +32,11 @@ impl ResidentDirectory {
         self.rows.len()
     }
 
+    #[must_use]
+    pub(super) const fn rows(&self) -> &OrdMap<DirectoryKey, DirectoryEntry> {
+        &self.rows
+    }
+
     pub(super) fn insert_live(&mut self, path: DirectoryKey, uid: StreamUid) {
         let previous = self.rows.insert(path, DirectoryEntry::Live(uid));
         assert!(

@@ -18,12 +18,40 @@ pub const RUN_TABLES_MAX: usize = 4096;
 /// Largest complete SST object accepted or produced.
 pub const SST_OBJECT_BYTES_MAX: u64 = 128 * 1024 * 1024;
 
+/// Largest estimated SST emitted by one checkpoint table.
+pub const SST_TABLE_TARGET_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Worst-case fixed archive framing and table identity bytes.
+pub const SST_ARCHIVE_FIXED_BYTES_MAX: u64 = 256;
+
+/// Worst-case encoded contribution of one Directory row, including alignment.
+pub const DIRECTORY_ROW_ENCODED_BYTES_MAX: u64 = 1_024;
+
+/// Worst-case encoded contribution of one Ledger value row, including alignment.
+pub const LEDGER_VALUE_ROW_ENCODED_BYTES_MAX: u64 = 2_048;
+
+/// Worst-case encoded contribution of one Ledger delete row, including alignment.
+pub const LEDGER_DELETE_ROW_ENCODED_BYTES_MAX: u64 = 64;
+
 /// Same SST object bound for rkyv gates that take `usize`.
 pub(crate) const SST_OBJECT_BYTES_MAX_USIZE: usize = 128 * 1024 * 1024;
 
 const _: () = assert!(
     SST_OBJECT_BYTES_MAX == 128 * 1024 * 1024 && SST_OBJECT_BYTES_MAX_USIZE == 128 * 1024 * 1024,
     "the rkyv byte gate and durable SST bound must agree"
+);
+
+const _: () = assert!(
+    SST_TABLE_TARGET_BYTES < SST_OBJECT_BYTES_MAX,
+    "the checkpoint table target must leave room below the hard SST bound"
+);
+
+const _: () = assert!(
+    SST_ARCHIVE_FIXED_BYTES_MAX
+        + PARTITION_PATH_OCCUPANCIES_MAX_V2
+            * (DIRECTORY_ROW_ENCODED_BYTES_MAX + LEDGER_VALUE_ROW_ENCODED_BYTES_MAX)
+        <= PARTITION_BOOTSTRAP_BYTES_MAX_V2,
+    "a complete maximum-capacity Directory and Ledger base must fit the V2 bootstrap byte bound"
 );
 
 /// Largest canonical Directory key.

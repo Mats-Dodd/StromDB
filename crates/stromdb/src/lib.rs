@@ -2,6 +2,7 @@
 
 mod admission;
 mod bootstrap;
+mod checkpoint;
 mod forest;
 mod partition;
 mod store;

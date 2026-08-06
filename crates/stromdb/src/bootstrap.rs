@@ -31,9 +31,20 @@ pub enum BootstrapExit {
 #[derive(Debug)]
 pub(crate) struct Ready {
     claim: AuthoredClaim,
-    replay: WalReplayPoint,
+    seal: Seal,
+    base: Forest,
     forest: Forest,
+    durable_batch: BatchId,
     next_batch: BatchId,
+}
+
+pub(crate) struct WriterSeed {
+    pub(crate) claim: AuthoredClaim,
+    pub(crate) seal: Seal,
+    pub(crate) base: Forest,
+    pub(crate) forest: Forest,
+    pub(crate) durable_batch: BatchId,
+    pub(crate) next_batch: BatchId,
 }
 
 #[derive(Debug)]
@@ -58,23 +69,32 @@ impl Ready {
     }
 
     pub(crate) const fn replay(&self) -> WalReplayPoint {
-        self.replay
+        self.seal.replay()
     }
 
     pub(crate) const fn forest(&self) -> &Forest {
         &self.forest
     }
 
-    pub(crate) fn into_writer_parts(self) -> (AuthoredClaim, WalReplayPoint, Forest, BatchId) {
-        (self.claim, self.replay, self.forest, self.next_batch)
+    pub(crate) fn into_writer_seed(self) -> WriterSeed {
+        WriterSeed {
+            claim: self.claim,
+            seal: self.seal,
+            base: self.base,
+            forest: self.forest,
+            durable_batch: self.durable_batch,
+            next_batch: self.next_batch,
+        }
     }
 }
 
 #[derive(Debug)]
 struct ReplayComplete {
     claim: AuthoredClaim,
-    replay: WalReplayPoint,
+    seal: Seal,
+    base: Forest,
     forest: Forest,
+    durable_batch: BatchId,
     next_batch: BatchId,
 }
 
@@ -97,19 +117,21 @@ enum BootstrapPhase {
     },
     LoadAdmissionBase {
         claim: AuthoredClaim,
-        replay: WalReplayPoint,
+        seal: Seal,
         plan: BootstrapPlan,
     },
     PlaceFence {
         claim: AuthoredClaim,
-        replay: WalReplayPoint,
+        seal: Seal,
+        base: Forest,
         forest: Forest,
         fence: BoundedFence,
         listed_tail: Option<BatchId>,
     },
     Replay {
         claim: AuthoredClaim,
-        replay: WalReplayPoint,
+        seal: Seal,
+        base: Forest,
         forest: Forest,
         next: BatchId,
         fence: BoundedFence,
@@ -214,7 +236,7 @@ pub(crate) async fn bootstrap(
                             identity,
                             owner: OwnerToken::from(identity.generation()),
                         },
-                        replay: candidate.replay(),
+                        seal: candidate,
                         plan,
                     }
                 }
@@ -229,21 +251,19 @@ pub(crate) async fn bootstrap(
                     });
                 }
             },
-            BootstrapPhase::LoadAdmissionBase {
-                claim,
-                replay,
-                plan,
-            } => {
+            BootstrapPhase::LoadAdmissionBase { claim, seal, plan } => {
                 let forest = load_admission_base(&table_store, partition, plan).await?;
                 let listed_tail = wal_store
                     .newest_surviving_batch(partition)
                     .await
                     .map_err(map_wal_error)?;
+                let replay = seal.replay();
                 let candidate = plan_fence_candidate(replay_batch(replay), listed_tail)?;
                 let fence = bound_fence(replay_batch(replay), candidate)?;
                 BootstrapPhase::PlaceFence {
                     claim,
-                    replay,
+                    seal,
+                    base: forest.clone(),
                     forest,
                     fence,
                     listed_tail,
@@ -251,11 +271,13 @@ pub(crate) async fn bootstrap(
             }
             BootstrapPhase::PlaceFence {
                 claim,
-                replay,
+                seal,
+                base,
                 forest,
                 fence,
                 listed_tail,
             } => {
+                let replay = seal.replay();
                 if let FenceTailGate::RefreshAnomaly { detail } = guard_fence_tail(
                     &wal_store,
                     partition,
@@ -299,7 +321,8 @@ pub(crate) async fn bootstrap(
                 if established {
                     BootstrapPhase::Replay {
                         claim,
-                        replay,
+                        seal,
+                        base,
                         forest,
                         next: replay_start(replay)?,
                         fence,
@@ -320,7 +343,8 @@ pub(crate) async fn bootstrap(
                     }
                     BootstrapPhase::PlaceFence {
                         claim,
-                        replay,
+                        seal,
+                        base,
                         forest,
                         fence: bound_fence(replay_batch(replay), next_candidate)?,
                         listed_tail,
@@ -329,7 +353,8 @@ pub(crate) async fn bootstrap(
             }
             BootstrapPhase::Replay {
                 claim,
-                replay,
+                seal,
+                base,
                 mut forest,
                 next,
                 fence,
@@ -384,8 +409,10 @@ pub(crate) async fn bootstrap(
                         BootstrapPhase::FinalRefresh {
                             replayed: ReplayComplete {
                                 claim,
-                                replay,
+                                seal,
+                                base,
                                 forest,
+                                durable_batch: fence.batch,
                                 next_batch: fence.next_batch,
                             },
                         }
@@ -406,7 +433,8 @@ pub(crate) async fn bootstrap(
                             })?;
                     BootstrapPhase::Replay {
                         claim,
-                        replay,
+                        seal,
+                        base,
                         forest,
                         next,
                         fence,
@@ -452,8 +480,10 @@ pub(crate) async fn bootstrap(
                     Some(observed) if observed == replayed.claim.identity.generation() => {
                         BootstrapPhase::Ready(Ready {
                             claim: replayed.claim,
-                            replay: replayed.replay,
+                            seal: replayed.seal,
+                            base: replayed.base,
                             forest: replayed.forest,
+                            durable_batch: replayed.durable_batch,
                             next_batch: replayed.next_batch,
                         })
                     }
@@ -992,7 +1022,7 @@ mod tests {
             SealGeneration::genesis().successor()?,
             ready.claim.identity.generation()
         );
-        assert_eq!(WalReplayPoint::Genesis, ready.replay);
+        assert_eq!(WalReplayPoint::Genesis, ready.replay());
         assert_eq!(0, ready.forest.path_count());
         assert_eq!(BatchId::try_from(2)?, ready.next_batch);
         Ok(())

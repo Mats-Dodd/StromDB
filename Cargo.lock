@@ -1868,6 +1868,7 @@ dependencies = [
 name = "stromdb"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "imbl",
  "proptest",
  "strom-domain",

@@ -27,6 +27,11 @@ impl ResidentLedger {
         self.records.get(&uid)
     }
 
+    #[must_use]
+    pub(super) const fn rows(&self) -> &OrdMap<StreamUid, StreamRecord> {
+        &self.records
+    }
+
     pub(super) fn insert(&mut self, uid: StreamUid, record: StreamRecord) {
         let previous = self.records.insert(uid, record);
         assert!(previous.is_none(), "create folds a fresh ledger uid");

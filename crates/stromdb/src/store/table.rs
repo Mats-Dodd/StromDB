@@ -1,9 +1,12 @@
-//! Read-only typed SST store for Seal-selected tables.
+//! Typed SST store for checkpoint children and Seal-selected tables.
 
-use strom_object_store::{ByteBound, ObjectStoreAdapter};
+use std::collections::BTreeSet;
+use std::num::NonZeroU64;
+
+use strom_object_store::{ByteBound, CreateEvidence, FrozenBytes, ObjectStoreAdapter};
 use strom_storage_domain::{
-    DirectoryEntry, DirectoryKey, LedgerCell, PartitionId, StoreKind, StreamUid, TableKey,
-    TableRef, decode_directory_sst, decode_ledger_sst,
+    DirectoryEntry, DirectoryKey, LedgerCell, PartitionId, Seal, StoreKind, StreamUid, TableKey,
+    TableObjectId, TableRef, decode_directory_sst, decode_ledger_sst,
 };
 
 use super::{StoreErrorClass, map_store_error, object_key};
@@ -12,6 +15,50 @@ use super::{StoreErrorClass, map_store_error, object_key};
 pub(crate) enum TableRows {
     Directory(Vec<(DirectoryKey, DirectoryEntry)>),
     Ledger(Vec<(StreamUid, LedgerCell)>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EncodedTable {
+    key: TableKey,
+    table: TableRef,
+    bytes: FrozenBytes,
+}
+
+impl EncodedTable {
+    pub(crate) fn new(key: TableKey, bytes: Vec<u8>) -> Self {
+        let object_bytes = u64::try_from(bytes.len())
+            .ok()
+            .and_then(NonZeroU64::new)
+            .expect("an encoded SST has a nonzero length representable by u64");
+        let table = TableRef::new(key.object(), object_bytes)
+            .expect("the SST encoder enforces the hard object bound");
+        let bytes = FrozenBytes::try_from(bytes)
+            .expect("an encoded SST is nonempty and fits the adapter PUT bound");
+        Self { key, table, bytes }
+    }
+
+    #[must_use]
+    pub(crate) const fn table(&self) -> TableRef {
+        self.table
+    }
+
+    #[must_use]
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CandidateTableEvidence {
+    Match,
+    Foreign,
+    Absent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuthorizedTableDelete {
+    partition: PartitionId,
+    object: TableObjectId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -50,6 +97,49 @@ impl TableStore {
     #[must_use]
     pub(crate) const fn new(adapter: ObjectStoreAdapter) -> Self {
         Self { adapter }
+    }
+
+    pub(crate) async fn create_table(
+        &self,
+        candidate: &EncodedTable,
+    ) -> Result<CreateEvidence, TableStoreError> {
+        let key = object_key(candidate.key);
+        self.adapter
+            .create_if_absent(&key, candidate.bytes.clone())
+            .await
+            .map_err(TableStoreError::from_store)
+    }
+
+    pub(crate) async fn reconcile_table(
+        &self,
+        candidate: &EncodedTable,
+    ) -> Result<CandidateTableEvidence, TableStoreError> {
+        let key = object_key(candidate.key);
+        let bound = ByteBound::try_from(candidate.table.object_bytes().get())
+            .expect("a TableRef carries a nonzero in-bound object length");
+        let observed = self
+            .adapter
+            .read(&key, bound)
+            .await
+            .map_err(TableStoreError::from_store)?;
+        Ok(match observed {
+            Some(observed) if observed.body() == candidate.as_slice() => {
+                CandidateTableEvidence::Match
+            }
+            Some(_foreign) => CandidateTableEvidence::Foreign,
+            None => CandidateTableEvidence::Absent,
+        })
+    }
+
+    pub(crate) async fn delete_table(
+        &self,
+        proof: AuthorizedTableDelete,
+    ) -> Result<(), TableStoreError> {
+        let key = object_key(TableKey::new(proof.partition, proof.object));
+        self.adapter
+            .delete_idempotent(&key)
+            .await
+            .map_err(TableStoreError::from_store)
     }
 
     pub(crate) async fn read_table(
@@ -99,6 +189,46 @@ impl TableStore {
             ))),
         }
     }
+}
+
+pub(crate) fn targeted_table_deletes(
+    source: &Seal,
+    successor: &Seal,
+) -> Vec<AuthorizedTableDelete> {
+    assert_eq!(
+        source.identity().partition(),
+        successor.identity().partition(),
+        "one advance keeps the partition identity"
+    );
+    assert!(
+        source.identity().generation() < successor.identity().generation(),
+        "targeted collection compares a source with its advancing successor"
+    );
+    assert_eq!(
+        source
+            .identity()
+            .generation()
+            .successor()
+            .expect("an observed successor proves the source generation is not exhausted"),
+        successor.identity().generation(),
+        "targeted collection requires an exact Seal successor pair"
+    );
+    let successor_objects: BTreeSet<TableObjectId> = seal_tables(successor).collect();
+    seal_tables(source)
+        .filter(|object| !successor_objects.contains(object))
+        .map(|object| AuthorizedTableDelete {
+            partition: source.identity().partition(),
+            object,
+        })
+        .collect()
+}
+
+fn seal_tables(seal: &Seal) -> impl Iterator<Item = TableObjectId> + '_ {
+    [seal.directory(), seal.ledger()]
+        .into_iter()
+        .flat_map(strom_storage_domain::TreeVersion::runs)
+        .flat_map(strom_storage_domain::SortedRun::tables)
+        .map(|table| table.object())
 }
 
 #[cfg(test)]
