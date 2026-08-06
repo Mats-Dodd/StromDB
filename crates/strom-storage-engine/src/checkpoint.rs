@@ -877,7 +877,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     use proptest::prelude::*;
-    use strom_domain::{ExpiryPolicy, StreamContentType};
+    use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
     use strom_storage_domain::{OperationFact, StreamUid, WalBody, WalFacts, WalObject};
 
     use super::*;
@@ -945,6 +945,7 @@ mod tests {
                 uid,
                 content_type: StreamContentType::octet_stream(),
                 expiry: ExpiryPolicy::None,
+                lifecycle: StreamLifecycle::Open,
             },
         )?;
         snapshot.strict_fold(
@@ -1036,6 +1037,7 @@ mod tests {
                 uid,
                 content_type: StreamContentType::octet_stream(),
                 expiry: ExpiryPolicy::None,
+                lifecycle: StreamLifecycle::Open,
             },
         )?;
 
@@ -1134,6 +1136,7 @@ mod tests {
                 uid: StreamUid::try_from(1)?,
                 content_type: StreamContentType::octet_stream(),
                 expiry: ExpiryPolicy::None,
+                lifecycle: StreamLifecycle::Open,
             }])?),
         ))?;
         assert_eq!(CreateEvidence::Direct, wal_store.create_wal(&run).await?);
@@ -1269,6 +1272,7 @@ mod tests {
             uid,
             content_type: StreamContentType::octet_stream(),
             expiry: ExpiryPolicy::None,
+            lifecycle: StreamLifecycle::Open,
         }
     }
 

@@ -1,0 +1,41 @@
+[package]
+name = "strom-server"
+description = "HTTP server exposing the Durable Streams protocol over StromDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "strom-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
+object_store = { workspace = true, features = ["aws"] }
+secrecy = { workspace = true }
+secretspec = { workspace = true }
+secretspec-derive = { workspace = true }
+serde = { workspace = true }
+strom-domain = { path = "../strom-domain", version = "0.1.0" }
+stromdb = { path = "../stromdb", version = "0.1.0" }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tower = { workspace = true }
+tower-http = { workspace = true, features = ["trace", "limit"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tokio = { workspace = true, features = ["macros", "rt"] }
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true
+
+# These crates appear only inside the declare_secrets! macro expansion, which
+# cargo-machete's static scan cannot see.
+[package.metadata.cargo-machete]
+ignored = ["secrecy", "secretspec", "serde"]

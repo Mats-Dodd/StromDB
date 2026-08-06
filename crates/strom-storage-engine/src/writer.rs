@@ -8,7 +8,7 @@ use strom_storage_domain::{
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::admission::{admit, decide_suffix_room};
+use crate::admission::{Admission, admit, decide_suffix_room};
 use crate::bootstrap::{AuthoredClaim, Ready, WriterSeed};
 use crate::checkpoint::{
     CheckpointInput, CheckpointOutcome, PublicationGate, WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER,
@@ -60,7 +60,8 @@ struct Writer {
 }
 
 struct PendingCommand {
-    fact: OperationFact,
+    /// `None` when the reply is idempotent and inherits an earlier fact's barrier.
+    fact: Option<OperationFact>,
     reply: StreamReply,
     waiter: oneshot::Sender<Result<StreamReply, AdmissionRefusal>>,
 }
@@ -237,34 +238,51 @@ impl Writer {
     }
 
     fn consider(&mut self, envelope: CommandEnvelope) {
+        assert!(
+            self.flight.is_some() || self.pending.is_empty(),
+            "when no flight is active, consider observes empty pending so admitted equals durable"
+        );
         let batch = self.next_batch;
         if self.pending.len() == WAL_RUN_FACTS_MAX {
             send_refusal(envelope.reply, AdmissionRefusal::Overloaded);
             return;
         }
-        if !decide_suffix_room(replay_batch(self.seal.replay()), batch) {
-            if self.checkpoint.is_none() {
-                self.checkpoint_requested = true;
-            }
-            send_refusal(envelope.reply, AdmissionRefusal::Overloaded);
-            return;
-        }
 
-        let admitted = match admit(&self.admitted, &envelope.command, batch) {
-            Ok(admitted) => admitted,
+        match admit(&self.admitted, &envelope.command, batch) {
+            Ok(Admission::Fact(admitted)) => {
+                // Only a fact consumes a WAL coordinate, so the suffix gate
+                // sheds new mutations while idempotent replies stay answerable.
+                if !decide_suffix_room(replay_batch(self.seal.replay()), batch) {
+                    if self.checkpoint.is_none() {
+                        self.checkpoint_requested = true;
+                    }
+                    send_refusal(envelope.reply, AdmissionRefusal::Overloaded);
+                    return;
+                }
+                self.admitted = admitted.forest;
+                self.pending.push(PendingCommand {
+                    fact: Some(admitted.fact),
+                    reply: admitted.reply,
+                    waiter: envelope.reply,
+                });
+                if self.flight.is_none() {
+                    self.promote_pending();
+                }
+            }
+            Ok(Admission::Idempotent(reply)) => {
+                if self.flight.is_none() {
+                    let _receiver_may_be_gone = envelope.reply.send(Ok(reply));
+                } else {
+                    self.pending.push(PendingCommand {
+                        fact: None,
+                        reply,
+                        waiter: envelope.reply,
+                    });
+                }
+            }
             Err(refusal) => {
                 send_refusal(envelope.reply, refusal);
-                return;
             }
-        };
-        self.admitted = admitted.forest;
-        self.pending.push(PendingCommand {
-            fact: admitted.fact,
-            reply: admitted.reply,
-            waiter: envelope.reply,
-        });
-        if self.flight.is_none() {
-            self.promote_pending();
         }
     }
 
@@ -273,15 +291,25 @@ impl Writer {
             self.flight.is_none(),
             "only one WAL create may be in flight"
         );
-        assert!(!self.pending.is_empty(), "only a nonempty RUN is promoted");
-        let batch = self.next_batch;
-        let commands = std::mem::replace(&mut self.pending, std::mem::take(&mut self.spare));
-        let facts = pending_facts(
-            commands
-                .iter()
-                .map(|command| command.fact.clone())
-                .collect(),
+        assert!(
+            !self.pending.is_empty(),
+            "only a nonempty pending set is promoted"
         );
+        let commands = std::mem::replace(&mut self.pending, std::mem::take(&mut self.spare));
+        let facts: Vec<OperationFact> = commands
+            .iter()
+            .filter_map(|command| command.fact.clone())
+            .collect();
+        if facts.is_empty() {
+            let mut commands = commands;
+            for command in commands.drain(..) {
+                let _receiver_may_be_gone = command.waiter.send(Ok(command.reply));
+            }
+            self.spare = commands;
+            return;
+        }
+        let batch = self.next_batch;
+        let facts = pending_facts(facts);
         let encoded = EncodedWal::new(&WalObject::new(
             self.partition,
             batch,
@@ -481,9 +509,12 @@ impl Writer {
 
     fn commit(&mut self, mut flight: Flight) {
         for command in &flight.commands {
+            let Some(fact) = &command.fact else {
+                continue;
+            };
             assert_eq!(
                 Ok(Applied),
-                self.durable.strict_fold(flight.batch, &command.fact),
+                self.durable.strict_fold(flight.batch, fact),
                 "durable fold repeats facts already proven against admitted state"
             );
         }
@@ -538,9 +569,11 @@ fn pending_facts(facts: Vec<OperationFact>) -> WalFacts {
 
 #[cfg(test)]
 mod tests {
-    use strom_domain::{ExpiryPolicy, StreamContentType};
+    use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
     use strom_object_store::ObjectStoreAdapter;
-    use strom_storage_domain::{DirectoryEntry, DirectoryKey, StreamUid, WalIdentity};
+    use strom_storage_domain::{
+        DirectoryEntry, DirectoryKey, StreamUid, WAL_SUFFIX_COORDINATES_MAX_V2, WalIdentity,
+    };
 
     use super::*;
     use crate::bootstrap::bootstrap;
@@ -1000,7 +1033,9 @@ mod tests {
         command: &StreamCommand,
         batch: BatchId,
     ) -> Result<TestAdmission, Box<dyn std::error::Error>> {
-        let admitted = admit(&writer.admitted, command, batch)?;
+        let Admission::Fact(admitted) = admit(&writer.admitted, command, batch)? else {
+            return Err("test admission helper requires a new fact".into());
+        };
         writer.admitted = admitted.forest;
         let candidate = EncodedWal::new(&WalObject::new(
             writer.partition,
@@ -1011,7 +1046,7 @@ mod tests {
         let (waiter, receiver) = oneshot::channel();
         Ok(TestAdmission {
             command: PendingCommand {
-                fact: admitted.fact,
+                fact: Some(admitted.fact),
                 reply: admitted.reply,
                 waiter,
             },
@@ -1053,7 +1088,91 @@ mod tests {
             path: DirectoryKey::try_from(Box::<[u8]>::from(raw.as_bytes()))?,
             content_type: StreamContentType::octet_stream(),
             expiry: ExpiryPolicy::None,
+            lifecycle: StreamLifecycle::Open,
         })
+    }
+
+    #[tokio::test]
+    async fn idempotent_duplicate_behind_flight_waits_for_that_run()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adapter = ObjectStoreAdapter::in_memory();
+        let (mut writer, _view) = writer(adapter.clone()).await?;
+        let batch_2 = writer.next_batch;
+        let initial = create_command("events/a")?;
+        let initial = admitted_command(&mut writer, &initial, batch_2)?;
+        assert_eq!(
+            CreateEvidence::Direct,
+            writer.wal_store.create_wal(&initial.candidate).await?
+        );
+        install_flight(
+            &mut writer,
+            batch_2,
+            initial.command,
+            initial.candidate,
+            CreateEvidence::DurableMatch,
+        );
+        let _initial_reply = initial.reply;
+
+        let mut duplicate = consider(&mut writer, create_command("events/a")?);
+        assert_eq!(
+            1,
+            writer.pending.len(),
+            "the idempotent duplicate queues behind the active flight"
+        );
+        assert!(
+            duplicate.try_recv().is_err(),
+            "an idempotent reply depending on an uncommitted fact inherits that fact's barrier"
+        );
+
+        let (sender, ingress) = mpsc::channel(WRITER_INGRESS_COMMANDS_MAX);
+        drop(sender);
+        assert_eq!(WriterExit::Shutdown, writer.run(ingress).await);
+        assert_eq!(
+            StreamReply::AlreadyCreated {
+                uid: StreamUid::try_from(1)?
+            },
+            duplicate.await??
+        );
+
+        let grouped = WalStore::new(adapter)
+            .read_wal(WalIdentity::new(partition(), BatchId::try_from(3)?))
+            .await?;
+        assert!(
+            grouped.is_none(),
+            "an idempotent-only pending set creates no second WAL coordinate"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn suffix_exhaustion_sheds_new_facts_but_answers_idempotent_retries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (mut writer, _view) = writer(ObjectStoreAdapter::in_memory()).await?;
+        let created = consider(&mut writer, create_command("events/a")?);
+        complete_active_wal(&mut writer).await?;
+        assert!(matches!(created.await?, Ok(StreamReply::Created { .. })));
+
+        writer.next_batch = BatchId::try_from(WAL_SUFFIX_COORDINATES_MAX_V2)?;
+        let shed = consider(&mut writer, create_command("events/b")?);
+        assert_eq!(
+            Err(AdmissionRefusal::Overloaded),
+            shed.await?,
+            "a new fact needs a WAL coordinate the exhausted suffix cannot grant"
+        );
+        assert!(
+            writer.checkpoint_requested,
+            "shedding at the suffix bound requests the recovering checkpoint"
+        );
+
+        let duplicate = consider(&mut writer, create_command("events/a")?);
+        assert_eq!(
+            Ok(StreamReply::AlreadyCreated {
+                uid: StreamUid::try_from(1)?
+            }),
+            duplicate.await?,
+            "an idempotent retry consumes no WAL coordinate and stays answerable"
+        );
+        Ok(())
     }
 
     fn partition() -> PartitionId {

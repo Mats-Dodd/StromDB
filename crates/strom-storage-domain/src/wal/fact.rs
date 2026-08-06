@@ -1,8 +1,8 @@
 //! Already-decided stream mutation facts.
 
-use strom_domain::{ExpiryPolicy, StreamContentType};
+use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
 
-use crate::archive::{ContentTypeAsString, ExpiryAsArchive};
+use crate::archive::{ContentTypeAsString, ExpiryAsArchive, LifecycleAsArchive};
 use crate::{DirectoryKey, StreamUid};
 
 #[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
@@ -18,6 +18,8 @@ pub enum OperationFact {
         content_type: StreamContentType,
         #[rkyv(with = ExpiryAsArchive)]
         expiry: ExpiryPolicy,
+        #[rkyv(with = LifecycleAsArchive)]
+        lifecycle: StreamLifecycle,
     },
     StreamClosed {
         path: DirectoryKey,

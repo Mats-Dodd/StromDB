@@ -4,13 +4,16 @@ members = [
     "crates/strom-common",
     "crates/strom-domain",
     "crates/strom-object-store",
+    "crates/strom-server",
     "crates/strom-storage-domain",
     "crates/strom-storage-engine",
     "crates/stromdb",
 ]
 
 [workspace.dependencies]
+axum = "0.8"
 bytes = "1"
+clap = "4"
 futures = "0.3"
 imbl = "6"
 jiff = "0.2"
@@ -29,9 +32,16 @@ rkyv = {
         "pointer_width_32",
     ],
 }
-serde = "1"
+secrecy = { version = "0.10.3", features = ["serde"] }
+secretspec = { version = "0.18", default-features = false, features = ["keyring"] }
+secretspec-derive = "0.18"
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["time"] }
+tower = "0.5"
+tower-http = "0.6"
+tracing = "0.1"
+tracing-subscriber = "0.3"
 
 [profile.release]
 overflow-checks = true

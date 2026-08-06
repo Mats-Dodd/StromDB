@@ -18,9 +18,9 @@ const WAL_ARCHIVE_FIXTURE: &[u8] = &[
     101, 118, 101, 110, 116, 115, 47, 97, 98, 99, 97, 112, 112, 108, 105, 99, 97, 116, 105, 111,
     110, 47, 106, 115, 111, 110, 59, 32, 99, 104, 97, 114, 115, 101, 116, 61, 117, 116, 102, 45,
     56, 0, 214, 255, 255, 255, 10, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 159, 0, 0, 0, 208, 255, 255,
-    255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 17, 34, 51, 68, 85, 102, 119, 136,
-    153, 170, 187, 204, 221, 238, 255, 9, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 181, 255,
-    255, 255, 1, 0, 0, 0,
+    255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 17, 34, 51, 68, 85, 102, 119,
+    136, 153, 170, 187, 204, 221, 238, 255, 9, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 180,
+    255, 255, 255, 1, 0, 0, 0,
 ];
 
 const CONTENT_TYPE_SUBTYPE_LEN: usize = 243;
@@ -96,6 +96,7 @@ fn every_wal_fact_variant_roundtrips() -> Result<(), Box<dyn std::error::Error>>
                 uid,
                 content_type: "application/json".parse()?,
                 expiry: ExpiryPolicy::None,
+                lifecycle: strom_domain::StreamLifecycle::Closed,
             },
             OperationFact::StreamClosed {
                 path: path.clone(),
@@ -222,6 +223,7 @@ fn canonical_content_type_boundary_roundtrips_through_wal() -> Result<(), Box<dy
             uid: uid(1)?,
             content_type,
             expiry: ExpiryPolicy::None,
+            lifecycle: strom_domain::StreamLifecycle::Open,
         }])?),
     );
     let encoded = encode_wal(&object)?;
@@ -294,6 +296,7 @@ fn one_fact_run() -> Result<WalObject, Box<dyn std::error::Error>> {
         uid: uid(7)?,
         content_type: "application/json; charset=utf-8".parse()?,
         expiry: ExpiryPolicy::None,
+        lifecycle: strom_domain::StreamLifecycle::Open,
     };
     Ok(WalObject::new(
         partition()?,

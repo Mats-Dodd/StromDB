@@ -3,6 +3,13 @@ all-features = true
 
 [advisories]
 yanked = "deny"
+ignore = [
+    # rsa (Marvin Attack, no fixed release) is an unconditional dependency of
+    # secretspec's provider machinery. strom-server loads secrets once at
+    # process start on the operator's host; no RSA operation is exposed to
+    # network-observable timing. Remove when secretspec gates or drops rsa.
+    "RUSTSEC-2023-0071",
+]
 
 [licenses]
 version = 2

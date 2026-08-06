@@ -9,7 +9,9 @@
 //! ```
 //! use std::sync::Arc;
 //!
-//! use stromdb::{Db, ExpiryPolicy, StreamContentType, StreamStatus};
+//! use stromdb::{
+//!     CreateOutcome, Db, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamStatus,
+//! };
 //!
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! let store = Arc::new(stromdb::object_store::memory::InMemory::new());
@@ -17,8 +19,16 @@
 //! let db = Db::open(store, partition).await?;
 //!
 //! let id: stromdb::StreamId = "events/a".parse()?;
-//! db.create_stream(&id, StreamContentType::octet_stream(), ExpiryPolicy::None)
-//!     .await?;
+//! assert_eq!(
+//!     CreateOutcome::Created,
+//!     db.create_stream(
+//!         &id,
+//!         StreamContentType::octet_stream(),
+//!         ExpiryPolicy::None,
+//!         StreamLifecycle::Open,
+//!     )
+//!     .await?
+//! );
 //! assert!(matches!(db.stream(&id)?, StreamStatus::Live { .. }));
 //!
 //! db.close().await;
@@ -72,7 +82,11 @@ impl Db {
         }
     }
 
-    /// Create one stream at `id`.
+    /// Create one stream at `id`, or confirm it already exists at the same configuration.
+    ///
+    /// A same-configuration retry returns [`CreateOutcome::AlreadyExists`]
+    /// (protocol §5.1). A path that is occupied with a different content type,
+    /// expiry, or lifecycle is refused as [`StreamError::Occupied`].
     ///
     /// # Errors
     ///
@@ -83,26 +97,35 @@ impl Db {
         id: &StreamId,
         content_type: StreamContentType,
         expiry: ExpiryPolicy,
-    ) -> Result<(), StreamError> {
-        self.command(StreamCommand::Create {
-            path: DirectoryKey::from(id),
-            content_type,
-            expiry,
-        })
-        .await
+        lifecycle: StreamLifecycle,
+    ) -> Result<CreateOutcome, StreamError> {
+        let reply = self
+            .send(StreamCommand::Create {
+                path: DirectoryKey::from(id),
+                content_type,
+                expiry,
+                lifecycle,
+            })
+            .await?;
+        Ok(create_outcome(reply))
     }
 
     /// Close the live stream at `id` to further appends.
+    ///
+    /// A close on an already-closed stream returns
+    /// [`CloseStreamOutcome::AlreadyClosed`] (protocol §5.1).
     ///
     /// # Errors
     ///
     /// Returns [`StreamError`] when the command is refused, shed, or left
     /// without a determinate durable outcome.
-    pub async fn close_stream(&self, id: &StreamId) -> Result<(), StreamError> {
-        self.command(StreamCommand::Close {
-            path: DirectoryKey::from(id),
-        })
-        .await
+    pub async fn close_stream(&self, id: &StreamId) -> Result<CloseStreamOutcome, StreamError> {
+        let reply = self
+            .send(StreamCommand::Close {
+                path: DirectoryKey::from(id),
+            })
+            .await?;
+        Ok(close_outcome_for_reply(reply))
     }
 
     /// Delete the stream at `id`; the path stays permanently occupied.
@@ -112,10 +135,13 @@ impl Db {
     /// Returns [`StreamError`] when the command is refused, shed, or left
     /// without a determinate durable outcome.
     pub async fn delete_stream(&self, id: &StreamId) -> Result<(), StreamError> {
-        self.command(StreamCommand::Delete {
-            path: DirectoryKey::from(id),
-        })
-        .await
+        let reply = self
+            .send(StreamCommand::Delete {
+                path: DirectoryKey::from(id),
+            })
+            .await?;
+        delete_outcome(reply);
+        Ok(())
     }
 
     /// Report the current status of the stream at `id`.
@@ -141,14 +167,72 @@ impl Db {
         close_outcome(self.handle.shutdown().await)
     }
 
-    async fn command(&self, command: StreamCommand) -> Result<(), StreamError> {
+    async fn send(&self, command: StreamCommand) -> Result<StreamReply, StreamError> {
         match self.handle.command(command).await {
-            Ok(StreamReply::Created { uid: _ } | StreamReply::Closed | StreamReply::Deleted) => {
-                Ok(())
-            }
+            Ok(reply) => Ok(reply),
             Err(error) => Err(stream_error(error)),
         }
     }
+}
+
+#[expect(
+    clippy::panic,
+    reason = "command/reply pairing is an in-process writer invariant"
+)]
+const fn create_outcome(reply: StreamReply) -> CreateOutcome {
+    match reply {
+        StreamReply::Created { uid: _ } => CreateOutcome::Created,
+        StreamReply::AlreadyCreated { uid: _ } => CreateOutcome::AlreadyExists,
+        StreamReply::Closed | StreamReply::AlreadyClosed | StreamReply::Deleted => {
+            panic!("create admits only Created or AlreadyCreated")
+        }
+    }
+}
+
+#[expect(
+    clippy::panic,
+    reason = "command/reply pairing is an in-process writer invariant"
+)]
+const fn close_outcome_for_reply(reply: StreamReply) -> CloseStreamOutcome {
+    match reply {
+        StreamReply::Closed => CloseStreamOutcome::Closed,
+        StreamReply::AlreadyClosed => CloseStreamOutcome::AlreadyClosed,
+        StreamReply::Created { uid: _ }
+        | StreamReply::AlreadyCreated { uid: _ }
+        | StreamReply::Deleted => {
+            panic!("close admits only Closed or AlreadyClosed")
+        }
+    }
+}
+
+#[expect(
+    clippy::panic,
+    reason = "command/reply pairing is an in-process writer invariant"
+)]
+const fn delete_outcome(reply: StreamReply) {
+    match reply {
+        StreamReply::Deleted => {}
+        StreamReply::Created { uid: _ }
+        | StreamReply::AlreadyCreated { uid: _ }
+        | StreamReply::Closed
+        | StreamReply::AlreadyClosed => {
+            panic!("delete admits only Deleted")
+        }
+    }
+}
+
+/// Whether create found the stream already durable at the same configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateOutcome {
+    Created,
+    AlreadyExists,
+}
+
+/// Whether close found the stream already closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseStreamOutcome {
+    Closed,
+    AlreadyClosed,
 }
 
 /// The current protocol-visible state of one stream path.
@@ -186,8 +270,6 @@ pub enum StreamError {
     CapacityExhausted,
     #[error("stream path is not live")]
     NotLive,
-    #[error("stream is already closed")]
-    AlreadyClosed,
     #[error("partition is at a bounded capacity limit; retry later")]
     Overloaded,
     #[error("partition is no longer serving")]
@@ -246,7 +328,6 @@ const fn stream_error(error: CommandError) -> StreamError {
             AdmissionRefusal::PathOccupied => StreamError::Occupied,
             AdmissionRefusal::PathCapacityExhausted => StreamError::CapacityExhausted,
             AdmissionRefusal::PathNotLive => StreamError::NotLive,
-            AdmissionRefusal::StreamAlreadyClosed => StreamError::AlreadyClosed,
             AdmissionRefusal::Overloaded => StreamError::Overloaded,
         },
         CommandError::Unavailable => StreamError::Unavailable,

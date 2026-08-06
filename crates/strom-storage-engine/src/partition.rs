@@ -160,7 +160,7 @@ pub enum CommandError {
 
 #[cfg(test)]
 mod tests {
-    use strom_domain::{ExpiryPolicy, StreamContentType};
+    use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
     use strom_storage_domain::{BatchId, OwnerToken, WalBody, WalObject};
 
     use super::*;
@@ -178,6 +178,7 @@ mod tests {
                 path: path.clone(),
                 content_type: StreamContentType::octet_stream(),
                 expiry: ExpiryPolicy::None,
+                lifecycle: StreamLifecycle::Open,
             })
             .await?;
         let StreamReply::Created { uid } = reply else {
@@ -197,6 +198,62 @@ mod tests {
             "bootstrap replay reconstructs an acknowledged write"
         );
         assert_eq!(WriterExit::Shutdown, reopened.shutdown().await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_create_is_idempotent_and_consumes_no_second_wal_coordinate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let adapter = ObjectStoreAdapter::in_memory();
+        let partition = partition();
+        let path = directory_key("events/dup")?;
+        let handle = Partition::start(adapter.clone(), partition).await?;
+        let first = handle
+            .command(StreamCommand::Create {
+                path: path.clone(),
+                content_type: StreamContentType::octet_stream(),
+                expiry: ExpiryPolicy::None,
+                lifecycle: StreamLifecycle::Open,
+            })
+            .await?;
+        let StreamReply::Created { uid } = first else {
+            return Err("first create must return Created".into());
+        };
+        let after_create = handle.snapshot()?;
+        assert_eq!(
+            Ok(StreamReply::AlreadyCreated { uid }),
+            handle
+                .command(StreamCommand::Create {
+                    path: path.clone(),
+                    content_type: StreamContentType::octet_stream(),
+                    expiry: ExpiryPolicy::None,
+                    lifecycle: StreamLifecycle::Open,
+                })
+                .await
+        );
+        assert_eq!(
+            after_create.resolve(&path),
+            handle.snapshot()?.resolve(&path),
+            "idempotent create does not change the published view"
+        );
+        let wal = WalStore::new(adapter);
+        let first_run = BatchId::try_from(2)?;
+        assert!(
+            wal.read_wal(strom_storage_domain::WalIdentity::new(partition, first_run))
+                .await?
+                .is_some(),
+            "the original create occupies the first RUN coordinate"
+        );
+        assert!(
+            wal.read_wal(strom_storage_domain::WalIdentity::new(
+                partition,
+                first_run.successor()?
+            ))
+            .await?
+            .is_none(),
+            "an idempotent create consumes no second WAL coordinate"
+        );
+        assert_eq!(WriterExit::Shutdown, handle.shutdown().await);
         Ok(())
     }
 
@@ -245,6 +302,7 @@ mod tests {
                     path,
                     content_type: StreamContentType::octet_stream(),
                     expiry: ExpiryPolicy::None,
+                    lifecycle: StreamLifecycle::Open,
                 })
                 .await
         );

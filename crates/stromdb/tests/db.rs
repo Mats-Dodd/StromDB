@@ -7,8 +7,8 @@ use std::sync::Arc;
 use stromdb::object_store::ObjectStore;
 use stromdb::object_store::memory::InMemory;
 use stromdb::{
-    CloseOutcome, Db, ExpiryPolicy, PartitionId, StreamContentType, StreamError, StreamId,
-    StreamLifecycle, StreamStatus,
+    CloseOutcome, CloseStreamOutcome, CreateOutcome, Db, ExpiryPolicy, PartitionId,
+    StreamContentType, StreamError, StreamId, StreamLifecycle, StreamStatus,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -21,8 +21,16 @@ async fn every_verb_is_visible_by_status_and_survives_reopen() -> TestResult {
 
     let db = Db::open(Arc::clone(&store), partition).await?;
     assert_eq!(StreamStatus::Missing, db.stream(&id)?);
-    db.create_stream(&id, StreamContentType::octet_stream(), ExpiryPolicy::None)
-        .await?;
+    assert_eq!(
+        CreateOutcome::Created,
+        db.create_stream(
+            &id,
+            StreamContentType::octet_stream(),
+            ExpiryPolicy::None,
+            StreamLifecycle::Open,
+        )
+        .await?
+    );
     assert_eq!(
         StreamStatus::Live {
             content_type: StreamContentType::octet_stream(),
@@ -39,7 +47,10 @@ async fn every_verb_is_visible_by_status_and_survives_reopen() -> TestResult {
         matches!(reopened.stream(&id)?, StreamStatus::Live { .. }),
         "bootstrap replay reconstructs an acknowledged create"
     );
-    reopened.close_stream(&id).await?;
+    assert_eq!(
+        CloseStreamOutcome::Closed,
+        reopened.close_stream(&id).await?
+    );
     assert!(
         matches!(
             reopened.stream(&id)?,
@@ -59,7 +70,12 @@ async fn every_verb_is_visible_by_status_and_survives_reopen() -> TestResult {
     assert_eq!(
         Err(StreamError::Occupied),
         reopened
-            .create_stream(&id, StreamContentType::octet_stream(), ExpiryPolicy::None)
+            .create_stream(
+                &id,
+                StreamContentType::octet_stream(),
+                ExpiryPolicy::None,
+                StreamLifecycle::Open,
+            )
             .await,
         "a deleted path refuses re-creation"
     );
@@ -73,6 +89,123 @@ async fn typed_refusal_does_not_change_stream_status() -> TestResult {
     let missing: StreamId = "events/missing".parse()?;
     assert_eq!(Err(StreamError::NotLive), db.delete_stream(&missing).await);
     assert_eq!(StreamStatus::Missing, db.stream(&missing)?);
+    assert_eq!(CloseOutcome::Shutdown, db.close().await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn duplicate_create_returns_already_exists() -> TestResult {
+    let db = Db::open(Arc::new(InMemory::new()), partition()).await?;
+    let id: StreamId = "events/a".parse()?;
+    assert_eq!(
+        CreateOutcome::Created,
+        db.create_stream(
+            &id,
+            StreamContentType::octet_stream(),
+            ExpiryPolicy::None,
+            StreamLifecycle::Open,
+        )
+        .await?
+    );
+    assert_eq!(
+        CreateOutcome::AlreadyExists,
+        db.create_stream(
+            &id,
+            StreamContentType::octet_stream(),
+            ExpiryPolicy::None,
+            StreamLifecycle::Open,
+        )
+        .await?,
+        "same-configuration create is idempotent"
+    );
+    assert_eq!(CloseOutcome::Shutdown, db.close().await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn config_mismatch_create_refuses_occupied() -> TestResult {
+    let db = Db::open(Arc::new(InMemory::new()), partition()).await?;
+    let id: StreamId = "events/a".parse()?;
+    db.create_stream(
+        &id,
+        StreamContentType::octet_stream(),
+        ExpiryPolicy::None,
+        StreamLifecycle::Open,
+    )
+    .await?;
+    assert_eq!(
+        Err(StreamError::Occupied),
+        db.create_stream(
+            &id,
+            "text/plain".parse()?,
+            ExpiryPolicy::None,
+            StreamLifecycle::Open,
+        )
+        .await,
+        "content-type mismatch is not idempotent success"
+    );
+    assert_eq!(CloseOutcome::Shutdown, db.close().await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_closed_is_visible_and_survives_reopen() -> TestResult {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let partition = partition();
+    let id: StreamId = "events/closed".parse()?;
+
+    let db = Db::open(Arc::clone(&store), partition).await?;
+    assert_eq!(
+        CreateOutcome::Created,
+        db.create_stream(
+            &id,
+            StreamContentType::octet_stream(),
+            ExpiryPolicy::None,
+            StreamLifecycle::Closed,
+        )
+        .await?
+    );
+    assert_eq!(
+        StreamStatus::Live {
+            content_type: StreamContentType::octet_stream(),
+            expiry: ExpiryPolicy::None,
+            lifecycle: StreamLifecycle::Closed,
+        },
+        db.stream(&id)?
+    );
+    assert_eq!(CloseOutcome::Shutdown, db.close().await);
+
+    let reopened = Db::open(store, partition).await?;
+    assert_eq!(
+        StreamStatus::Live {
+            content_type: StreamContentType::octet_stream(),
+            expiry: ExpiryPolicy::None,
+            lifecycle: StreamLifecycle::Closed,
+        },
+        reopened.stream(&id)?,
+        "create-closed remains Closed after bootstrap replay"
+    );
+    assert_eq!(CloseOutcome::Shutdown, reopened.close().await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn duplicate_close_returns_already_closed() -> TestResult {
+    let db = Db::open(Arc::new(InMemory::new()), partition()).await?;
+    let id: StreamId = "events/a".parse()?;
+    db.create_stream(
+        &id,
+        StreamContentType::octet_stream(),
+        ExpiryPolicy::None,
+        StreamLifecycle::Open,
+    )
+    .await?;
+    assert_eq!(CloseStreamOutcome::Closed, db.close_stream(&id).await?);
+    assert_eq!(
+        CloseStreamOutcome::AlreadyClosed,
+        db.close_stream(&id).await?,
+        "close on an already-closed stream is idempotent"
+    );
     assert_eq!(CloseOutcome::Shutdown, db.close().await);
     Ok(())
 }

@@ -166,6 +166,7 @@ impl Forest {
                 uid,
                 content_type,
                 expiry,
+                lifecycle,
             } => {
                 if self.directory.get(path).is_some() {
                     return Err(FoldContradiction::PathOccupied);
@@ -178,7 +179,7 @@ impl Forest {
                 self.directory.insert_live(path.clone(), *uid);
                 self.ledger.insert(
                     *uid,
-                    StreamRecord::new(content_type.clone(), *expiry, StreamLifecycle::Open, batch),
+                    StreamRecord::new(content_type.clone(), *expiry, *lifecycle, batch),
                 );
                 Ok(Applied)
             }

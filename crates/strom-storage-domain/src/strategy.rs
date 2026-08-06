@@ -87,15 +87,17 @@ pub fn operation_fact() -> impl Strategy<Value = OperationFact> {
             stream_uid(),
             strom_domain::strategy::stream_content_type(),
             strom_domain::strategy::expiry_policy(),
+            strom_domain::strategy::stream_lifecycle(),
         )
-            .prop_map(
-                |(path, uid, content_type, expiry)| OperationFact::StreamCreated {
+            .prop_map(|(path, uid, content_type, expiry, lifecycle)| {
+                OperationFact::StreamCreated {
                     path,
                     uid,
                     content_type,
                     expiry,
+                    lifecycle,
                 }
-            ),
+            }),
         (directory_key(), stream_uid())
             .prop_map(|(path, uid)| OperationFact::StreamClosed { path, uid }),
         (directory_key(), stream_uid())

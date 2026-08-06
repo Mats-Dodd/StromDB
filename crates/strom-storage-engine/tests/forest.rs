@@ -42,6 +42,7 @@ impl ReferenceForest {
                 uid,
                 content_type,
                 expiry,
+                lifecycle,
             } => {
                 if self.directory.contains_key(path) {
                     return Err(FoldContradiction::PathOccupied);
@@ -60,7 +61,7 @@ impl ReferenceForest {
                     .insert(path.clone(), DirectoryEntry::Live(*uid));
                 self.ledger.insert(
                     *uid,
-                    StreamRecord::new(content_type.clone(), *expiry, StreamLifecycle::Open, batch),
+                    StreamRecord::new(content_type.clone(), *expiry, *lifecycle, batch),
                 );
                 Ok(())
             }
@@ -126,6 +127,7 @@ enum PlannedStep {
         path: DirectoryKey,
         content_type: StreamContentType,
         expiry: ExpiryPolicy,
+        lifecycle: StreamLifecycle,
     },
     CloseLive {
         index: u32,
@@ -639,12 +641,13 @@ fn invalid_fact_for(model: ReferenceForest) -> BoxedStrategy<OperationFact> {
             strom_domain::strategy::stream_id().prop_map(|id| DirectoryKey::from(&id)),
             strom_domain::strategy::stream_content_type(),
             strom_domain::strategy::expiry_policy(),
+            strom_domain::strategy::stream_lifecycle(),
             Just(gap_uid),
             Just(occupied.clone()),
         )
             .prop_filter_map(
                 "create with a uid gap on an unoccupied path",
-                |(path, content_type, expiry, uid, occupied)| {
+                |(path, content_type, expiry, lifecycle, uid, occupied)| {
                     if occupied.contains(&path) {
                         return None;
                     }
@@ -653,6 +656,7 @@ fn invalid_fact_for(model: ReferenceForest) -> BoxedStrategy<OperationFact> {
                         uid,
                         content_type,
                         expiry,
+                        lifecycle,
                     })
                 },
             )
@@ -698,13 +702,15 @@ fn invalid_fact_for(model: ReferenceForest) -> BoxedStrategy<OperationFact> {
                         Just(successor_uid),
                         strom_domain::strategy::stream_content_type(),
                         strom_domain::strategy::expiry_policy(),
+                        strom_domain::strategy::stream_lifecycle(),
                     )
-                        .prop_map(|(path, uid, content_type, expiry)| {
+                        .prop_map(|(path, uid, content_type, expiry, lifecycle)| {
                             OperationFact::StreamCreated {
                                 path,
                                 uid,
                                 content_type,
                                 expiry,
+                                lifecycle,
                             }
                         })
                         .boxed(),
@@ -745,13 +751,15 @@ fn invalid_fact_for(model: ReferenceForest) -> BoxedStrategy<OperationFact> {
                         Just(successor_uid),
                         strom_domain::strategy::stream_content_type(),
                         strom_domain::strategy::expiry_policy(),
+                        strom_domain::strategy::stream_lifecycle(),
                     )
-                        .prop_map(|(path, uid, content_type, expiry)| {
+                        .prop_map(|(path, uid, content_type, expiry, lifecycle)| {
                             OperationFact::StreamCreated {
                                 path,
                                 uid,
                                 content_type,
                                 expiry,
+                                lifecycle,
                             }
                         })
                         .boxed(),
@@ -881,6 +889,7 @@ fn materialize_valid_history(steps: Vec<PlannedStep>) -> Vec<(BatchId, Operation
                 path,
                 content_type,
                 expiry,
+                lifecycle,
             } => {
                 if !occupied.insert(path.clone()) {
                     continue;
@@ -902,9 +911,12 @@ fn materialize_valid_history(steps: Vec<PlannedStep>) -> Vec<(BatchId, Operation
                         uid,
                         content_type,
                         expiry,
+                        lifecycle,
                     },
                 ));
-                live_open.push((path.clone(), uid));
+                if lifecycle == StreamLifecycle::Open {
+                    live_open.push((path.clone(), uid));
+                }
                 live.push((path, uid));
             }
             PlannedStep::CloseLive { index } => {
@@ -951,12 +963,16 @@ fn planned_step() -> impl Strategy<Value = PlannedStep> {
             strom_domain::strategy::stream_id().prop_map(|id| DirectoryKey::from(&id)),
             strom_domain::strategy::stream_content_type(),
             strom_domain::strategy::expiry_policy(),
+            strom_domain::strategy::stream_lifecycle(),
         )
-            .prop_map(|(path, content_type, expiry)| PlannedStep::CreateFresh {
-                path,
-                content_type,
-                expiry,
-            }),
+            .prop_map(
+                |(path, content_type, expiry, lifecycle)| PlannedStep::CreateFresh {
+                    path,
+                    content_type,
+                    expiry,
+                    lifecycle,
+                },
+            ),
         any::<u32>().prop_map(|index| PlannedStep::CloseLive { index }),
         any::<u32>().prop_map(|index| PlannedStep::DeleteLive { index }),
     ]
@@ -991,5 +1007,6 @@ const fn create_fact(
         uid,
         content_type,
         expiry,
+        lifecycle: StreamLifecycle::Open,
     }
 }

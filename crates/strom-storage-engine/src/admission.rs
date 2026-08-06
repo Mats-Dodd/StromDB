@@ -2,7 +2,7 @@
 
 use std::num::NonZeroU64;
 
-use strom_domain::{ExpiryPolicy, StreamContentType};
+use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
 use strom_storage_domain::{
     BatchId, DirectoryEntry, DirectoryKey, OperationFact, PARTITION_PATH_OCCUPANCIES_MAX_V2,
     StreamUid, WAL_SUFFIX_COORDINATES_MAX_V2,
@@ -17,6 +17,7 @@ pub enum StreamCommand {
         path: DirectoryKey,
         content_type: StreamContentType,
         expiry: ExpiryPolicy,
+        lifecycle: StreamLifecycle,
     },
     Close {
         path: DirectoryKey,
@@ -26,11 +27,13 @@ pub enum StreamCommand {
     },
 }
 
-/// The durable result corresponding to one admitted command.
+/// The durable result corresponding to one admitted or idempotent command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamReply {
     Created { uid: StreamUid },
+    AlreadyCreated { uid: StreamUid },
     Closed,
+    AlreadyClosed,
     Deleted,
 }
 
@@ -43,8 +46,6 @@ pub enum AdmissionRefusal {
     PathCapacityExhausted,
     #[error("stream path is not live")]
     PathNotLive,
-    #[error("stream is already closed")]
-    StreamAlreadyClosed,
     #[error("partition writer is at a bounded capacity limit")]
     Overloaded,
 }
@@ -56,53 +57,82 @@ pub(crate) struct AdmittedCommand {
     pub(crate) reply: StreamReply,
 }
 
-/// Admit one command by constructing and applying its exact durable fact.
+/// Three-way admission: a new fact, an idempotent reply, or a refusal.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Admission {
+    Fact(AdmittedCommand),
+    Idempotent(StreamReply),
+}
+
+/// Admit one command by constructing and applying its exact durable fact, or
+/// return an idempotent reply when the command is already true of admitted state.
 pub(crate) fn admit(
     admitted: &Forest,
     command: &StreamCommand,
     batch: BatchId,
-) -> Result<AdmittedCommand, AdmissionRefusal> {
-    let fact = match command {
+) -> Result<Admission, AdmissionRefusal> {
+    match command {
         StreamCommand::Create {
             path,
             content_type,
             expiry,
-        } => {
-            if admitted.resolve(path).is_some() {
-                return Err(AdmissionRefusal::PathOccupied);
+            lifecycle,
+        } => match admitted.resolve(path) {
+            Some(DirectoryEntry::Tombstone(_)) => Err(AdmissionRefusal::PathOccupied),
+            Some(DirectoryEntry::Live(uid)) => {
+                let record = admitted
+                    .record(uid)
+                    .expect("a Live directory row has exactly one Ledger record");
+                if record.content_type() == content_type
+                    && record.expiry() == *expiry
+                    && record.lifecycle() == *lifecycle
+                {
+                    Ok(Admission::Idempotent(StreamReply::AlreadyCreated { uid }))
+                } else {
+                    Err(AdmissionRefusal::PathOccupied)
+                }
             }
-            let uid = decide_successor_uid(admitted.path_count()).map_err(|contradiction| {
-                contradiction
-                    .admission_refusal()
-                    .expect("successor allocation only returns a caller-facing capacity refusal")
-            })?;
-            OperationFact::StreamCreated {
-                path: path.clone(),
-                uid,
-                content_type: content_type.clone(),
-                expiry: *expiry,
+            None => {
+                let uid = decide_successor_uid(admitted.path_count()).map_err(|contradiction| {
+                    contradiction.admission_refusal().expect(
+                        "successor allocation only returns a caller-facing capacity refusal",
+                    )
+                })?;
+                let fact = OperationFact::StreamCreated {
+                    path: path.clone(),
+                    uid,
+                    content_type: content_type.clone(),
+                    expiry: *expiry,
+                    lifecycle: *lifecycle,
+                };
+                apply_fact(admitted, batch, fact)
             }
+        },
+        StreamCommand::Close { path } => {
+            let uid = resolve_live_uid(admitted, path)?;
+            let record = admitted
+                .record(uid)
+                .expect("a Live directory row has exactly one Ledger record");
+            if record.lifecycle().is_closed() {
+                return Ok(Admission::Idempotent(StreamReply::AlreadyClosed));
+            }
+            apply_fact(
+                admitted,
+                batch,
+                OperationFact::StreamClosed {
+                    path: path.clone(),
+                    uid,
+                },
+            )
         }
-        StreamCommand::Close { path } => OperationFact::StreamClosed {
-            path: path.clone(),
-            uid: resolve_live_uid(admitted, path)?,
-        },
-        StreamCommand::Delete { path } => OperationFact::StreamDeleted {
-            path: path.clone(),
-            uid: resolve_live_uid(admitted, path)?,
-        },
-    };
-
-    let mut candidate = admitted.clone();
-    match candidate.strict_fold(batch, &fact) {
-        Ok(Applied) => Ok(AdmittedCommand {
-            forest: candidate,
-            reply: reply_for_fact(&fact),
-            fact,
-        }),
-        Err(contradiction) => Err(contradiction
-            .admission_refusal()
-            .expect("admission constructs the dense uid and exact path uid carried by its fact")),
+        StreamCommand::Delete { path } => apply_fact(
+            admitted,
+            batch,
+            OperationFact::StreamDeleted {
+                path: path.clone(),
+                uid: resolve_live_uid(admitted, path)?,
+            },
+        ),
     }
 }
 
@@ -117,6 +147,24 @@ pub(crate) fn decide_successor_uid(path_count: u64) -> Result<StreamUid, FoldCon
         .and_then(NonZeroU64::new)
         .expect("path_count below the V2 occupancy bound has a nonzero successor");
     Ok(StreamUid::from(successor))
+}
+
+fn apply_fact(
+    admitted: &Forest,
+    batch: BatchId,
+    fact: OperationFact,
+) -> Result<Admission, AdmissionRefusal> {
+    let mut candidate = admitted.clone();
+    match candidate.strict_fold(batch, &fact) {
+        Ok(Applied) => Ok(Admission::Fact(AdmittedCommand {
+            forest: candidate,
+            reply: reply_for_fact(&fact),
+            fact,
+        })),
+        Err(contradiction) => Err(contradiction
+            .admission_refusal()
+            .expect("admission constructs the dense uid and exact path uid carried by its fact")),
+    }
 }
 
 /// Whether one proposed RUN and the reserved next claimant FENCE stay inside
@@ -137,8 +185,7 @@ impl FoldContradiction {
             Self::PathOccupied => Some(AdmissionRefusal::PathOccupied),
             Self::PathCapacityExhausted => Some(AdmissionRefusal::PathCapacityExhausted),
             Self::PathNotLive => Some(AdmissionRefusal::PathNotLive),
-            Self::StreamAlreadyClosed => Some(AdmissionRefusal::StreamAlreadyClosed),
-            Self::UidNotDenseSuccessor | Self::PathUidMismatch => None,
+            Self::StreamAlreadyClosed | Self::UidNotDenseSuccessor | Self::PathUidMismatch => None,
         }
     }
 }
@@ -160,7 +207,9 @@ const fn reply_for_fact(fact: &OperationFact) -> StreamReply {
 
 #[cfg(test)]
 mod tests {
-    use strom_domain::StreamContentType;
+    use std::num::NonZeroU64;
+
+    use strom_domain::{StreamContentType, StreamTtl};
 
     use super::*;
 
@@ -240,22 +289,42 @@ mod tests {
             path: path.clone(),
             content_type: StreamContentType::octet_stream(),
             expiry: ExpiryPolicy::None,
+            lifecycle: StreamLifecycle::Open,
         };
-        let admitted = admit(&Forest::empty(), &create, batch)?;
+        let Admission::Fact(admitted) = admit(&Forest::empty(), &create, batch)? else {
+            return Err("first create must produce a fact".into());
+        };
         let mut forest = admitted.forest;
         let before = forest.clone();
+        let mismatched = StreamCommand::Create {
+            path: path.clone(),
+            content_type: "text/plain".parse()?,
+            expiry: ExpiryPolicy::None,
+            lifecycle: StreamLifecycle::Open,
+        };
         assert_eq!(
             Err(AdmissionRefusal::PathOccupied),
-            admit(&forest, &create, batch)
+            admit(&forest, &mismatched, batch)
         );
         assert_eq!(before.path_count(), forest.path_count());
         assert_eq!(before.resolve(&path), forest.resolve(&path));
 
+        let Admission::Idempotent(StreamReply::AlreadyCreated { uid }) =
+            admit(&forest, &create, batch)?
+        else {
+            return Err("same-config duplicate create is idempotent".into());
+        };
+        assert_eq!(StreamUid::try_from(1)?, uid);
+        assert_eq!(before.path_count(), forest.path_count());
+
         let close = StreamCommand::Close { path: path.clone() };
-        forest = admit(&forest, &close, batch)?.forest;
+        let Admission::Fact(closed) = admit(&forest, &close, batch)? else {
+            return Err("first close must produce a fact".into());
+        };
+        forest = closed.forest;
         let record_before = forest.record(StreamUid::try_from(1)?).cloned();
         assert_eq!(
-            Err(AdmissionRefusal::StreamAlreadyClosed),
+            Ok(Admission::Idempotent(StreamReply::AlreadyClosed)),
             admit(&forest, &close, batch)
         );
         assert_eq!(
@@ -274,6 +343,112 @@ mod tests {
     }
 
     #[test]
+    fn create_closed_installs_closed_lifecycle_and_is_idempotent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = DirectoryKey::try_from(Box::<[u8]>::from(b"events/closed".as_slice()))?;
+        let batch = BatchId::try_from(1)?;
+        let create_closed = StreamCommand::Create {
+            path: path.clone(),
+            content_type: StreamContentType::octet_stream(),
+            expiry: ExpiryPolicy::None,
+            lifecycle: StreamLifecycle::Closed,
+        };
+        let Admission::Fact(admitted) = admit(&Forest::empty(), &create_closed, batch)? else {
+            return Err("create-closed must produce a fact".into());
+        };
+        let uid = StreamUid::try_from(1)?;
+        assert_eq!(
+            Some(StreamLifecycle::Closed),
+            admitted
+                .forest
+                .record(uid)
+                .map(strom_storage_domain::StreamRecord::lifecycle),
+            "one StreamCreated fact carries Closed into the ledger"
+        );
+        assert_eq!(
+            Ok(Admission::Idempotent(StreamReply::AlreadyCreated { uid })),
+            admit(&admitted.forest, &create_closed, batch)
+        );
+        assert_eq!(
+            Err(AdmissionRefusal::PathOccupied),
+            admit(
+                &admitted.forest,
+                &StreamCommand::Create {
+                    path,
+                    content_type: StreamContentType::octet_stream(),
+                    expiry: ExpiryPolicy::None,
+                    lifecycle: StreamLifecycle::Open,
+                },
+                batch
+            ),
+            "open-create on a create-closed stream is a config mismatch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn create_refuses_each_config_mismatch_axis() -> Result<(), Box<dyn std::error::Error>> {
+        let path = DirectoryKey::try_from(Box::<[u8]>::from(b"events/match".as_slice()))?;
+        let batch = BatchId::try_from(1)?;
+        let create = StreamCommand::Create {
+            path: path.clone(),
+            content_type: StreamContentType::octet_stream(),
+            expiry: ExpiryPolicy::None,
+            lifecycle: StreamLifecycle::Open,
+        };
+        let Admission::Fact(admitted) = admit(&Forest::empty(), &create, batch)? else {
+            return Err("first create must produce a fact".into());
+        };
+        let forest = admitted.forest;
+
+        assert_eq!(
+            Err(AdmissionRefusal::PathOccupied),
+            admit(
+                &forest,
+                &StreamCommand::Create {
+                    path: path.clone(),
+                    content_type: "text/plain".parse()?,
+                    expiry: ExpiryPolicy::None,
+                    lifecycle: StreamLifecycle::Open,
+                },
+                batch
+            ),
+            "content type mismatch refuses"
+        );
+        assert_eq!(
+            Err(AdmissionRefusal::PathOccupied),
+            admit(
+                &forest,
+                &StreamCommand::Create {
+                    path: path.clone(),
+                    content_type: StreamContentType::octet_stream(),
+                    expiry: ExpiryPolicy::SlidingTtl(StreamTtl::from(
+                        NonZeroU64::new(60).expect("sixty is nonzero")
+                    )),
+                    lifecycle: StreamLifecycle::Open,
+                },
+                batch
+            ),
+            "expiry mismatch refuses"
+        );
+        assert_eq!(
+            Err(AdmissionRefusal::PathOccupied),
+            admit(
+                &forest,
+                &StreamCommand::Create {
+                    path,
+                    content_type: StreamContentType::octet_stream(),
+                    expiry: ExpiryPolicy::None,
+                    lifecycle: StreamLifecycle::Closed,
+                },
+                batch
+            ),
+            "lifecycle mismatch refuses"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn delete_preserves_path_occupancy_and_the_next_create_gets_the_dense_successor()
     -> Result<(), Box<dyn std::error::Error>> {
         let first = DirectoryKey::try_from(Box::<[u8]>::from(b"events/a".as_slice()))?;
@@ -283,21 +458,30 @@ mod tests {
             path,
             content_type: StreamContentType::octet_stream(),
             expiry: ExpiryPolicy::None,
+            lifecycle: StreamLifecycle::Open,
         };
-        let forest = admit(&Forest::empty(), &create(first.clone()), batch)?.forest;
-        let forest = admit(
-            &forest,
+        let Admission::Fact(first_create) = admit(&Forest::empty(), &create(first.clone()), batch)?
+        else {
+            return Err("first create must produce a fact".into());
+        };
+        let Admission::Fact(deleted) = admit(
+            &first_create.forest,
             &StreamCommand::Delete {
                 path: first.clone(),
             },
             batch,
         )?
-        .forest;
+        else {
+            return Err("delete must produce a fact".into());
+        };
+        let forest = deleted.forest;
         assert_eq!(
             Err(AdmissionRefusal::PathOccupied),
             admit(&forest, &create(first), batch)
         );
-        let admitted = admit(&forest, &create(second), batch)?;
+        let Admission::Fact(admitted) = admit(&forest, &create(second), batch)? else {
+            return Err("create on a free path must produce a fact".into());
+        };
         assert_eq!(
             StreamReply::Created {
                 uid: StreamUid::try_from(2)?

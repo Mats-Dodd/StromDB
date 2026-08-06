@@ -74,11 +74,13 @@ fn decode_fact(fact: &ArchivedOperationFact) -> Result<OperationFact, DecodeErro
             uid,
             content_type,
             expiry,
+            lifecycle,
         } => Ok(OperationFact::StreamCreated {
             path: DirectoryKey::try_from(path)?,
             uid: StreamUid::from(uid),
             content_type: decode_content_type(content_type)?,
             expiry: strom_domain::ExpiryPolicy::try_from(expiry)?,
+            lifecycle: strom_domain::StreamLifecycle::from(lifecycle),
         }),
         ArchivedOperationFact::StreamClosed { path, uid } => Ok(OperationFact::StreamClosed {
             path: DirectoryKey::try_from(path)?,
@@ -93,7 +95,7 @@ fn decode_fact(fact: &ArchivedOperationFact) -> Result<OperationFact, DecodeErro
 
 #[cfg(test)]
 mod tests {
-    use strom_domain::{ExpiryPolicy, StreamContentType};
+    use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
 
     use super::*;
     use crate::SealGeneration;
@@ -158,6 +160,7 @@ mod tests {
                 uid,
                 content_type: content_type.clone(),
                 expiry: ExpiryPolicy::None,
+                lifecycle: StreamLifecycle::Open,
             })
             .collect();
         let object = WalObject::new(
