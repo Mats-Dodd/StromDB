@@ -1,7 +1,9 @@
 //! The `StromDB` database engine.
 
+mod forest;
 mod store;
 
+pub use forest::{Applied, FoldContradiction, Forest};
 pub use store::{
     AuthorizedWalRunDelete, EncodedSeal, EncodedWal, ObservedWal, SealStore, SealStoreError,
     WalDeleteRefusal, WalStore, WalStoreError,

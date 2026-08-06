@@ -1824,6 +1824,8 @@ dependencies = [
 name = "stromdb"
 version = "0.1.0"
 dependencies = [
+ "proptest",
+ "strom-domain",
  "strom-object-store",
  "strom-storage-domain",
  "thiserror",
