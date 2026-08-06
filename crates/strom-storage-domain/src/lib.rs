@@ -33,7 +33,7 @@ pub use seal::{
     Seal, SealError, SealIdentity, SortedRun, TableRef, TreeVersion, WalReplayPoint, decode_seal,
     encode_seal,
 };
-pub use spelling::{KeySpellingError, SealKey, TableKey, WalKey};
+pub use spelling::{KeySpellingError, SealKey, SealNamespace, TableKey, WalKey, WalNamespace};
 pub use sst::{
     SstDecodeError, SstEncodeError, decode_directory_sst, decode_ledger_sst, encode_directory_sst,
     encode_ledger_sst,

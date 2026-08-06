@@ -5,9 +5,9 @@ use proptest::prelude::*;
 use strom_domain::StreamId;
 use strom_storage_domain::{
     AttemptId, BatchId, CoordinateExhausted, DirectoryKey, FreshIdentity, KeySpellingError,
-    OperationFact, PartitionId, PartitionIdError, SealGeneration, SealIdentity, SealKey, StoreKind,
-    StreamUid, TableKey, TableObjectId, WAL_RUN_FACTS_MAX, WalFacts, WalFactsError, WalIdentity,
-    WalKey,
+    OperationFact, PartitionId, PartitionIdError, SealGeneration, SealIdentity, SealKey,
+    SealNamespace, StoreKind, StreamUid, TableKey, TableObjectId, WAL_RUN_FACTS_MAX, WalFacts,
+    WalFactsError, WalIdentity, WalKey, WalNamespace,
 };
 
 #[test]
@@ -78,6 +78,52 @@ fn wal_facts_crosses_both_count_boundaries() -> Result<(), Box<dyn std::error::E
             facts_actual: WAL_RUN_FACTS_MAX.saturating_add(1),
         }),
         "the first over-bound count is rejected"
+    );
+    Ok(())
+}
+
+#[test]
+fn seal_and_wal_namespace_prefixes_have_independent_golden_vectors()
+-> Result<(), Box<dyn std::error::Error>> {
+    const SEAL_NAMESPACE: &[u8] = b"partition/00112233-4455-6677-8899-aabbccddeeff/seal/v1";
+    const WAL_NAMESPACE: &[u8] = b"partition/00112233-4455-6677-8899-aabbccddeeff/wal/v1";
+
+    let partition: PartitionId = "00112233-4455-6677-8899-aabbccddeeff".parse()?;
+    let seal_namespace = SealNamespace::from(partition);
+    let wal_namespace = WalNamespace::from(partition);
+    assert_eq!(
+        seal_namespace.to_string().as_bytes(),
+        SEAL_NAMESPACE,
+        "Seal namespace spelling is the published LIST prefix"
+    );
+    assert_eq!(
+        wal_namespace.to_string().as_bytes(),
+        WAL_NAMESPACE,
+        "WAL namespace spelling is the published LIST prefix"
+    );
+
+    let seal_key =
+        SealKey::from(SealIdentity::new(partition, SealGeneration::genesis())).to_string();
+    let wal_key = WalKey::from(WalIdentity::new(partition, BatchId::try_from(1)?)).to_string();
+    assert!(
+        seal_key.as_bytes().starts_with(SEAL_NAMESPACE)
+            && seal_key.as_bytes().get(SEAL_NAMESPACE.len()) == Some(&b'/'),
+        "the Seal namespace is a strict prefix of a full Seal key"
+    );
+    assert!(
+        wal_key.as_bytes().starts_with(WAL_NAMESPACE)
+            && wal_key.as_bytes().get(WAL_NAMESPACE.len()) == Some(&b'/'),
+        "the WAL namespace is a strict prefix of a full WAL key"
+    );
+    assert_eq!(
+        seal_namespace.to_string().parse::<SealNamespace>()?,
+        seal_namespace,
+        "the Seal namespace parser recovers its typed partition"
+    );
+    assert_eq!(
+        wal_namespace.to_string().parse::<WalNamespace>()?,
+        wal_namespace,
+        "the WAL namespace parser recovers its typed partition"
     );
     Ok(())
 }

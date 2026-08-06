@@ -17,6 +17,49 @@ const TABLE_SEGMENT: &str = "table";
 const WAL_SEGMENT: &str = "wal";
 const NAMESPACE_VERSION: &str = "v1";
 
+/// Ascending LIST prefix for one partition's Seal namespace.
+///
+/// Keys embed reverse ordinals, so `MaxKeys=1` under this prefix surfaces the
+/// newest generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SealNamespace(PartitionId);
+
+impl SealNamespace {
+    #[must_use]
+    pub const fn new(partition: PartitionId) -> Self {
+        Self(partition)
+    }
+
+    #[must_use]
+    pub const fn partition(self) -> PartitionId {
+        self.0
+    }
+}
+
+impl From<PartitionId> for SealNamespace {
+    fn from(partition: PartitionId) -> Self {
+        Self(partition)
+    }
+}
+
+impl FromStr for SealNamespace {
+    type Err = KeySpellingError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        Ok(Self(parse_namespace(input, SEAL_SEGMENT)?))
+    }
+}
+
+impl fmt::Display for SealNamespace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{PARTITION_SEGMENT}/{}/{SEAL_SEGMENT}/{NAMESPACE_VERSION}",
+            self.0
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SealKey(SealIdentity);
 
@@ -51,6 +94,49 @@ impl fmt::Display for SealKey {
             "{PARTITION_SEGMENT}/{}/{SEAL_SEGMENT}/{NAMESPACE_VERSION}/{}",
             self.0.partition(),
             ReverseOrdinal(self.0.generation().get())
+        )
+    }
+}
+
+/// Ascending LIST prefix for one partition's WAL namespace.
+///
+/// Keys embed reverse ordinals, so `MaxKeys=1` under this prefix surfaces the
+/// newest surviving batch coordinate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WalNamespace(PartitionId);
+
+impl WalNamespace {
+    #[must_use]
+    pub const fn new(partition: PartitionId) -> Self {
+        Self(partition)
+    }
+
+    #[must_use]
+    pub const fn partition(self) -> PartitionId {
+        self.0
+    }
+}
+
+impl From<PartitionId> for WalNamespace {
+    fn from(partition: PartitionId) -> Self {
+        Self(partition)
+    }
+}
+
+impl FromStr for WalNamespace {
+    type Err = KeySpellingError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        Ok(Self(parse_namespace(input, WAL_SEGMENT)?))
+    }
+}
+
+impl fmt::Display for WalNamespace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{PARTITION_SEGMENT}/{}/{WAL_SEGMENT}/{NAMESPACE_VERSION}",
+            self.0
         )
     }
 }
@@ -190,6 +276,24 @@ impl fmt::Display for ReverseOrdinal {
             .expect("durable coordinates never exceed u64::MAX");
         write!(formatter, "{reversed:020}")
     }
+}
+
+fn parse_namespace(input: &str, expected_kind: &str) -> Result<PartitionId, KeySpellingError> {
+    let mut segments = input.split('/');
+    if segments.next() != Some(PARTITION_SEGMENT) {
+        return Err(KeySpellingError::Shape);
+    }
+    let partition = segments.next().ok_or(KeySpellingError::Shape)?;
+    if segments.next() != Some(expected_kind) {
+        return Err(KeySpellingError::Shape);
+    }
+    if segments.next() != Some(NAMESPACE_VERSION) {
+        return Err(KeySpellingError::UnsupportedNamespace);
+    }
+    if segments.next().is_some() {
+        return Err(KeySpellingError::Shape);
+    }
+    partition.parse().map_err(KeySpellingError::Partition)
 }
 
 fn parse_key(input: &str, expected_kind: &str) -> Result<(PartitionId, u64), KeySpellingError> {

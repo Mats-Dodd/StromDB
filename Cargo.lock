@@ -1823,6 +1823,12 @@ dependencies = [
 [[package]]
 name = "stromdb"
 version = "0.1.0"
+dependencies = [
+ "strom-object-store",
+ "strom-storage-domain",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "subtle"
