@@ -6,9 +6,9 @@ use std::num::NonZeroU64;
 use proptest::prelude::{Just, Strategy, prop_oneof};
 
 use crate::{
-    BatchId, BoundedNonEmptyVec, DirectoryEntry, DirectoryKey, LedgerCell, OperationFact,
-    OwnerToken, PartitionId, Seal, SealGeneration, StreamRecord, StreamUid, TreeVersion, WalFence,
-    WalObject, WalReplayPoint, WalRun,
+    BatchId, DirectoryEntry, DirectoryKey, LedgerCell, OperationFact, OwnerToken, PartitionId,
+    Seal, SealGeneration, StreamRecord, StreamUid, TreeVersion, WalBody, WalFacts, WalObject,
+    WalReplayPoint,
 };
 
 pub fn partition_id() -> impl Strategy<Value = PartitionId> {
@@ -86,11 +86,11 @@ pub fn wal_object() -> impl Strategy<Value = WalObject> {
         proptest::collection::vec(operation_fact(), 1..=16),
     )
         .prop_flat_map(|(partition, batch, owner, facts)| {
-            let facts = BoundedNonEmptyVec::try_from(facts)
+            let facts = WalFacts::try_from(facts)
                 .expect("the generated fact count is inside the WAL bound");
             prop_oneof![
-                Just(WalObject::Run(WalRun::new(partition, batch, owner, facts,))),
-                Just(WalObject::Fence(WalFence::new(partition, batch, owner))),
+                Just(WalObject::new(partition, batch, owner, WalBody::Run(facts))),
+                Just(WalObject::new(partition, batch, owner, WalBody::Fence)),
             ]
         })
 }

@@ -2,14 +2,11 @@
 
 use rkyv::rancor::Failure;
 
-use super::{
-    SST_OBJECT_BYTES_MAX_USIZE, SstDecodeError, SstEncodeError, check_decode_bound,
-    check_encode_rows,
-};
+use super::{SstDecodeError, SstEncodeError, check_decode_bound, check_encode_rows};
 use crate::archive;
 use crate::bounds::{
     DIRECTORY_KEY_BYTES_MAX, DIRECTORY_ROW_LOGICAL_BYTES_MAX, PARTITION_PATH_OCCUPANCIES_MAX_V2,
-    PARTITION_RESIDENT_LOGICAL_BYTES_MAX_V2,
+    PARTITION_RESIDENT_LOGICAL_BYTES_MAX_V2, SST_OBJECT_BYTES_MAX_USIZE,
 };
 use crate::{DirectoryEntry, DirectoryKey, FreshIdentity, PartitionId, StoreKind, TableKey};
 
@@ -37,6 +34,9 @@ pub fn encode_directory_sst(
     if expected.object().store() != StoreKind::Directory {
         return Err(SstEncodeError::StoreMismatch);
     }
+    if rows.is_empty() {
+        return Err(SstEncodeError::EmptyTable);
+    }
     check_encode_rows::<(DirectoryKey, DirectoryEntry)>(rows.len())?;
     let mut previous = None;
     for (key, _entry) in rows {
@@ -44,9 +44,6 @@ pub fn encode_directory_sst(
             return Err(SstEncodeError::RowsNotStrictlyOrdered);
         }
         previous = Some(key.as_bytes());
-    }
-    if rows.is_empty() {
-        return Err(SstEncodeError::EmptyTable);
     }
 
     let root = DirectorySstArchive {

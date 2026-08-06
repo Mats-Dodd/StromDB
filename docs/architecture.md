@@ -486,22 +486,16 @@ can never be superseded.
 A WAL coordinate contains one of two disjoint canonical bodies:
 
 ```rust
-enum WalObject {
-    Run(WalRun),
-    Fence(WalFence),
-}
-
-struct WalRun {
+struct WalObject {
     partition: PartitionId,
     batch: BatchId,
     owner: OwnerToken,
-    facts: BoundedNonEmptyVec<OperationFact>,
+    body: WalBody,
 }
 
-struct WalFence {
-    partition: PartitionId,
-    batch: BatchId,
-    owner: OwnerToken,
+enum WalBody {
+    Run(WalFacts),
+    Fence,
 }
 ```
 

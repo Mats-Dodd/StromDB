@@ -1,7 +1,8 @@
-//! Ordered raw spelling of a canonical stream path.
+//! Directory-store keys and entries.
 
 use strom_domain::StreamId;
 
+use crate::StreamUid;
 use crate::archive::DecodeError as ArchiveDecodeError;
 
 /// The key is immutable after construction, so a boxed slice drops the
@@ -60,4 +61,19 @@ pub enum DirectoryKeyError {
     InvalidUtf8,
     #[error("Directory key is not a canonical stream id: {0}")]
     StreamId(#[source] strom_domain::StreamIdError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
+pub enum DirectoryEntry {
+    Live(StreamUid),
+    Tombstone(StreamUid),
+}
+
+impl From<&ArchivedDirectoryEntry> for DirectoryEntry {
+    fn from(entry: &ArchivedDirectoryEntry) -> Self {
+        match entry {
+            ArchivedDirectoryEntry::Live(uid) => Self::Live(StreamUid::from(uid)),
+            ArchivedDirectoryEntry::Tombstone(uid) => Self::Tombstone(StreamUid::from(uid)),
+        }
+    }
 }

@@ -5,19 +5,13 @@ mod ledger;
 
 use rkyv::{Archive, Archived};
 
-use crate::archive::{DecodeError, EncodeError};
-use crate::bounds::PARTITION_PATH_OCCUPANCIES_MAX_V2;
-use crate::bounds::SST_OBJECT_BYTES_MAX;
+use crate::archive::EncodeError;
+use crate::bounds::{
+    PARTITION_PATH_OCCUPANCIES_MAX_V2, SST_OBJECT_BYTES_MAX, SST_OBJECT_BYTES_MAX_USIZE,
+};
 
 pub use directory::{decode_directory_sst, encode_directory_sst};
 pub use ledger::{decode_ledger_sst, encode_ledger_sst};
-
-pub(super) const SST_OBJECT_BYTES_MAX_USIZE: usize = 128 * 1024 * 1024;
-
-const _: () = assert!(
-    SST_OBJECT_BYTES_MAX == 128 * 1024 * 1024,
-    "the rkyv byte gate and durable SST bound must agree"
-);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SstEncodeError {
@@ -70,20 +64,11 @@ pub enum SstDecodeError {
 }
 
 pub(super) fn check_decode_bound(bytes: &[u8]) -> Result<(), SstDecodeError> {
-    match crate::archive::decode_bound(bytes, SST_OBJECT_BYTES_MAX_USIZE) {
-        Ok(()) => Ok(()),
-        Err(DecodeError::EncodedBytesOverMax {
-            bytes_max: _,
-            bytes_actual,
-        }) => Err(SstDecodeError::EncodedBytesOverMax {
-            bytes_actual: u64::try_from(bytes_actual).unwrap_or(u64::MAX),
-        }),
-        Err(
-            DecodeError::MalformedArchive
-            | DecodeError::InvalidBody
-            | DecodeError::IdentityMismatch,
-        ) => Err(SstDecodeError::InvalidBody),
-    }
+    crate::archive::decode_bound(bytes, SST_OBJECT_BYTES_MAX_USIZE).map_err(|error| {
+        SstDecodeError::EncodedBytesOverMax {
+            bytes_actual: u64::try_from(error.bytes_actual).unwrap_or(u64::MAX),
+        }
+    })
 }
 
 #[cfg(test)]

@@ -2,11 +2,11 @@ use std::num::NonZeroU64;
 
 use strom_domain::{ExpiryPolicy, StreamContentType, StreamId};
 use strom_storage_domain::{
-    AttemptId, BatchId, BoundedNonEmptyVec, DecodeError, DirectoryKey, FreshIdentity,
-    OperationFact, OwnerToken, PartitionId, RangeVersion, SEAL_ENCODED_BYTES_MAX, Seal,
-    SealGeneration, SealIdentity, SortedRun, StoreKind, StreamUid, TableObjectId, TableRef,
-    TreeVersion, WAL_ENCODED_BYTES_MAX, WalFence, WalIdentity, WalObject, WalReplayPoint, WalRun,
-    decode_seal, decode_wal, encode_seal, encode_wal,
+    AttemptId, BatchId, DecodeError, DirectoryKey, FreshIdentity, OperationFact, OwnerToken,
+    PartitionId, RangeVersion, SEAL_ENCODED_BYTES_MAX, Seal, SealGeneration, SealIdentity,
+    SortedRun, StoreKind, StreamUid, TableObjectId, TableRef, TreeVersion, WAL_ENCODED_BYTES_MAX,
+    WalBody, WalFacts, WalIdentity, WalObject, WalReplayPoint, decode_seal, decode_wal,
+    encode_seal, encode_wal,
 };
 
 fn partition() -> Result<PartitionId, strom_storage_domain::PartitionIdError> {
@@ -76,20 +76,21 @@ fn one_fact_run() -> Result<WalObject, Box<dyn std::error::Error>> {
         content_type: "application/json; charset=utf-8".parse()?,
         expiry: ExpiryPolicy::None,
     };
-    Ok(WalObject::Run(WalRun::new(
+    Ok(WalObject::new(
         partition()?,
         BatchId::try_from(9)?,
         OwnerToken::from(SealGeneration::try_from(2)?),
-        BoundedNonEmptyVec::try_from(vec![fact])?,
-    )))
+        WalBody::Run(WalFacts::try_from(vec![fact])?),
+    ))
 }
 
 fn fence() -> Result<WalObject, Box<dyn std::error::Error>> {
-    Ok(WalObject::Fence(WalFence::new(
+    Ok(WalObject::new(
         partition()?,
         BatchId::try_from(10)?,
         OwnerToken::from(SealGeneration::try_from(4)?),
-    )))
+        WalBody::Fence,
+    ))
 }
 
 #[test]
@@ -137,9 +138,9 @@ fn wal_archive_fixture_anchors_the_root() -> Result<(), Box<dyn std::error::Erro
         101, 118, 101, 110, 116, 115, 47, 97, 98, 99, 97, 112, 112, 108, 105, 99, 97, 116, 105,
         111, 110, 47, 106, 115, 111, 110, 59, 32, 99, 104, 97, 114, 115, 101, 116, 61, 117, 116,
         102, 45, 56, 0, 214, 255, 255, 255, 10, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 159, 0, 0, 0, 208,
-        255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 17, 34, 51, 68, 85,
+        255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 17, 34, 51, 68, 85,
         102, 119, 136, 153, 170, 187, 204, 221, 238, 255, 9, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0,
-        0, 0, 181, 255, 255, 255, 1, 0, 0, 0,
+        0, 0, 0, 181, 255, 255, 255, 1, 0, 0, 0,
     ];
     let encoded = encode_wal(&object)?;
     assert_eq!(encoded.len(), expected.len(), "WAL fixture length changed");
@@ -163,11 +164,11 @@ fn nonempty_seal_manifest_roundtrips() -> Result<(), Box<dyn std::error::Error>>
 fn every_wal_fact_variant_roundtrips() -> Result<(), Box<dyn std::error::Error>> {
     let path = directory_key("events/abc")?;
     let uid = uid(7)?;
-    let object = WalObject::Run(WalRun::new(
+    let object = WalObject::new(
         partition()?,
         BatchId::try_from(9)?,
         OwnerToken::from(SealGeneration::try_from(2)?),
-        BoundedNonEmptyVec::try_from(vec![
+        WalBody::Run(WalFacts::try_from(vec![
             OperationFact::StreamCreated {
                 path: path.clone(),
                 uid,
@@ -179,8 +180,8 @@ fn every_wal_fact_variant_roundtrips() -> Result<(), Box<dyn std::error::Error>>
                 uid,
             },
             OperationFact::StreamDeleted { path, uid },
-        ])?,
-    ));
+        ])?),
+    );
     assert_eq!(
         decode_wal(&object.identity(), &encode_wal(&object)?)?,
         object
@@ -290,17 +291,17 @@ fn canonical_content_type_boundary_roundtrips_through_wal() -> Result<(), Box<dy
         strom_domain::CONTENT_TYPE_BYTES_MAX,
         "the accepted boundary value has an in-bound canonical spelling"
     );
-    let object = WalObject::Run(WalRun::new(
+    let object = WalObject::new(
         partition()?,
         BatchId::try_from(1)?,
         OwnerToken::from(SealGeneration::genesis()),
-        BoundedNonEmptyVec::try_from(vec![OperationFact::StreamCreated {
+        WalBody::Run(WalFacts::try_from(vec![OperationFact::StreamCreated {
             path: directory_key("events/abc")?,
             uid: uid(1)?,
             content_type,
             expiry: ExpiryPolicy::None,
-        }])?,
-    ));
+        }])?),
+    );
     let encoded = encode_wal(&object)?;
     assert_eq!(
         decode_wal(&object.identity(), &encoded)?,

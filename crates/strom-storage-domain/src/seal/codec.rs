@@ -4,15 +4,15 @@ use rkyv::rancor::Failure;
 
 use super::{
     ArchivedKeyBound, ArchivedRangeVersion, ArchivedSeal, ArchivedSortedRun, ArchivedTableRef,
-    ArchivedTreeVersion, ArchivedWalReplayPoint, KeyBound, RangeVersion, Seal, SealGeneration,
-    SealIdentity, SortedRun, TableObjectId, TableRef, TreeVersion, WalReplayPoint,
+    ArchivedTreeVersion, ArchivedWalReplayPoint, KeyBound, RangeVersion, Seal, SealIdentity,
+    SortedRun, TableRef, TreeVersion, WalReplayPoint,
 };
 use crate::archive::{DecodeError, EncodeError, decode_bound, encode};
 use crate::bounds::{
     DIRECTORY_KEY_BYTES_MAX, RUN_TABLES_MAX, SEAL_ENCODED_BYTES_MAX, TREE_RANGES_MAX_V2,
     TREE_RUNS_MAX,
 };
-use crate::{BatchId, OwnerToken, PartitionId};
+use crate::{BatchId, OwnerToken, PartitionId, SealGeneration, TableObjectId};
 
 /// # Errors
 ///

@@ -145,10 +145,11 @@ impl FromStr for TableKey {
         }
         let owner = parse_fixed_u64(owner, GENERATION_DIGITS)?;
         let counter = parse_fixed_u64(counter, GENERATION_DIGITS)?;
-        let ordinal = parse_fixed_u32(
+        let ordinal = u32::try_from(parse_fixed_u64(
             segments.next().ok_or(KeySpellingError::Shape)?,
             TABLE_ORDINAL_DIGITS,
-        )?;
+        )?)
+        .map_err(|_detail| KeySpellingError::TableCoordinate)?;
         if segments.next().is_some() {
             return Err(KeySpellingError::Shape);
         }
@@ -225,15 +226,6 @@ fn parse_reverse_ordinal(input: &str) -> Result<u64, KeySpellingError> {
 }
 
 fn parse_fixed_u64(input: &str, digits: usize) -> Result<u64, KeySpellingError> {
-    if input.len() != digits || !input.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(KeySpellingError::TableCoordinate);
-    }
-    input
-        .parse()
-        .map_err(|_detail| KeySpellingError::TableCoordinate)
-}
-
-fn parse_fixed_u32(input: &str, digits: usize) -> Result<u32, KeySpellingError> {
     if input.len() != digits || !input.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(KeySpellingError::TableCoordinate);
     }

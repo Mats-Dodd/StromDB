@@ -3,6 +3,7 @@
 mod archive;
 mod bounds;
 mod coordinate;
+mod directory;
 mod ledger;
 mod owner;
 mod partition;
@@ -11,7 +12,7 @@ mod spelling;
 mod sst;
 #[cfg(feature = "proptest")]
 pub mod strategy;
-mod stream_uid;
+mod table;
 mod wal;
 
 pub use archive::{DecodeError, EncodeError};
@@ -23,22 +24,21 @@ pub use bounds::{
     SST_OBJECT_BYTES_MAX, TREE_RANGES_MAX_V2, TREE_RUNS_MAX, WAL_ENCODED_BYTES_MAX,
     WAL_RUN_FACTS_MAX, WAL_SUFFIX_COORDINATES_MAX_V2,
 };
-pub use coordinate::{CoordinateExhausted, ZeroCoordinate};
-pub use ledger::{DirectoryEntry, DirectoryKey, DirectoryKeyError, LedgerCell, StreamRecord};
+pub use coordinate::{BatchId, CoordinateExhausted, SealGeneration, StreamUid, ZeroCoordinate};
+pub use directory::{DirectoryEntry, DirectoryKey, DirectoryKeyError};
+pub use ledger::{LedgerCell, StreamRecord};
 pub use owner::OwnerToken;
 pub use partition::{PartitionId, PartitionIdError};
 pub use seal::{
-    AttemptId, FreshIdentity, KeyBound, RangeVersion, Seal, SealError, SealGeneration,
-    SealIdentity, SortedRun, StoreKind, TableObjectId, TableRef, TreeVersion, WalReplayPoint,
-    decode_seal, encode_seal,
+    KeyBound, RangeVersion, Seal, SealError, SealIdentity, SortedRun, TableRef, TreeVersion,
+    WalReplayPoint, decode_seal, encode_seal,
 };
 pub use spelling::{KeySpellingError, SealKey, TableKey, WalKey};
 pub use sst::{
     SstDecodeError, SstEncodeError, decode_directory_sst, decode_ledger_sst, encode_directory_sst,
     encode_ledger_sst,
 };
-pub use stream_uid::StreamUid;
+pub use table::{AttemptId, FreshIdentity, StoreKind, TableIdentityError, TableObjectId};
 pub use wal::{
-    BatchId, BoundedNonEmptyVec, BoundedNonEmptyVecError, OperationFact, WalFence, WalIdentity,
-    WalObject, WalRun, decode_wal, encode_wal,
+    OperationFact, WalBody, WalFacts, WalFactsError, WalIdentity, WalObject, decode_wal, encode_wal,
 };

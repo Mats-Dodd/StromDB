@@ -1,6 +1,6 @@
 //! WAL replay owner token.
 
-use crate::seal::SealGeneration;
+use crate::coordinate::SealGeneration;
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, rkyv::Archive, rkyv::Serialize,

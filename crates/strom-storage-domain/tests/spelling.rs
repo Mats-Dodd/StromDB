@@ -4,9 +4,9 @@ use std::num::NonZeroU64;
 use proptest::prelude::*;
 use strom_domain::StreamId;
 use strom_storage_domain::{
-    AttemptId, BatchId, BoundedNonEmptyVec, BoundedNonEmptyVecError, CoordinateExhausted,
-    DirectoryKey, FreshIdentity, KeySpellingError, PartitionId, PartitionIdError, SealGeneration,
-    SealIdentity, SealKey, StoreKind, TableKey, TableObjectId, WAL_RUN_FACTS_MAX, WalIdentity,
+    AttemptId, BatchId, CoordinateExhausted, DirectoryKey, FreshIdentity, KeySpellingError,
+    OperationFact, PartitionId, PartitionIdError, SealGeneration, SealIdentity, SealKey, StoreKind,
+    StreamUid, TableKey, TableObjectId, WAL_RUN_FACTS_MAX, WalFacts, WalFactsError, WalIdentity,
     WalKey,
 };
 
@@ -58,23 +58,28 @@ fn nonzero_coordinates_have_checked_successors() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
-fn bounded_non_empty_vec_crosses_both_count_boundaries() {
+fn wal_facts_crosses_both_count_boundaries() -> Result<(), Box<dyn std::error::Error>> {
+    let uid = StreamUid::try_from(1)?;
+    let path = DirectoryKey::from(&"events/abc".parse::<StreamId>()?);
+    let deleted = OperationFact::StreamDeleted { path, uid };
+
     assert_eq!(
-        BoundedNonEmptyVec::<u8>::try_from(Vec::new()),
-        Err(BoundedNonEmptyVecError::Empty),
+        WalFacts::try_from(Vec::new()),
+        Err(WalFactsError::Empty),
         "a WAL run cannot represent no mutation"
     );
     assert!(
-        BoundedNonEmptyVec::try_from(vec![0u8; WAL_RUN_FACTS_MAX]).is_ok(),
+        WalFacts::try_from(vec![deleted.clone(); WAL_RUN_FACTS_MAX]).is_ok(),
         "the published fact-count bound itself is accepted"
     );
     assert_eq!(
-        BoundedNonEmptyVec::try_from(vec![0u8; WAL_RUN_FACTS_MAX.saturating_add(1)]),
-        Err(BoundedNonEmptyVecError::OverMax {
+        WalFacts::try_from(vec![deleted; WAL_RUN_FACTS_MAX.saturating_add(1)]),
+        Err(WalFactsError::OverMax {
             facts_actual: WAL_RUN_FACTS_MAX.saturating_add(1),
         }),
         "the first over-bound count is rejected"
     );
+    Ok(())
 }
 
 #[test]

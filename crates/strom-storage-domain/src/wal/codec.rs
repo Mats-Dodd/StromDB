@@ -4,12 +4,11 @@ use rkyv::rancor::Failure;
 
 use super::fact::ArchivedOperationFact;
 use super::{
-    ArchivedWalFence, ArchivedWalObject, ArchivedWalRun, BatchId, BoundedNonEmptyVec,
-    OperationFact, WalFence, WalIdentity, WalObject, WalRun,
+    ArchivedWalBody, ArchivedWalObject, OperationFact, WalBody, WalFacts, WalIdentity, WalObject,
 };
 use crate::archive::{DecodeError, EncodeError, decode_bound, decode_content_type, encode};
 use crate::bounds::{WAL_ENCODED_BYTES_MAX, WAL_RUN_FACTS_MAX};
-use crate::{DirectoryKey, OwnerToken, PartitionId, StreamUid};
+use crate::{BatchId, DirectoryKey, OwnerToken, PartitionId, StreamUid};
 
 /// # Errors
 ///
@@ -27,39 +26,34 @@ pub fn decode_wal(identity: &WalIdentity, bytes: &[u8]) -> Result<WalObject, Dec
     decode_bound(bytes, WAL_ENCODED_BYTES_MAX)?;
     let archived = rkyv::access::<ArchivedWalObject, Failure>(bytes)
         .map_err(|_archive_error| DecodeError::MalformedArchive)?;
-    match archived {
-        ArchivedWalObject::Run(run) => decode_run(identity, run).map(WalObject::Run),
-        ArchivedWalObject::Fence(fence) => decode_fence(identity, fence).map(WalObject::Fence),
-    }
+
+    let partition = PartitionId::try_from(&archived.partition)?;
+    let batch = BatchId::from(&archived.batch);
+    check_identity(identity, partition, batch)?;
+    let owner = OwnerToken::from(&archived.owner);
+    let body = decode_body(&archived.body)?;
+    Ok(WalObject::new(partition, batch, owner, body))
 }
 
-fn decode_run(identity: &WalIdentity, run: &ArchivedWalRun) -> Result<WalRun, DecodeError> {
-    let partition = PartitionId::try_from(&run.partition)?;
-    let batch = BatchId::from(&run.batch);
-    check_identity(identity, partition, batch)?;
+fn decode_body(body: &ArchivedWalBody) -> Result<WalBody, DecodeError> {
+    match body {
+        ArchivedWalBody::Run(facts) => {
+            let facts_archived = facts.facts.as_slice();
+            let facts_count = facts_archived.len();
+            if facts_count == 0 || facts_count > WAL_RUN_FACTS_MAX {
+                return Err(DecodeError::InvalidBody);
+            }
 
-    let owner = OwnerToken::from(&run.owner);
-    let facts_archived = run.facts.values.as_slice();
-    let facts_count = facts_archived.len();
-    if facts_count == 0 || facts_count > WAL_RUN_FACTS_MAX {
-        return Err(DecodeError::InvalidBody);
+            let mut decoded_facts = Vec::with_capacity(facts_count);
+            for fact in facts_archived {
+                decoded_facts.push(decode_fact(fact)?);
+            }
+            let facts = WalFacts::try_from(decoded_facts)
+                .map_err(|_domain_error| DecodeError::InvalidBody)?;
+            Ok(WalBody::Run(facts))
+        }
+        ArchivedWalBody::Fence => Ok(WalBody::Fence),
     }
-
-    let mut facts = Vec::with_capacity(facts_count);
-    for fact in facts_archived {
-        facts.push(decode_fact(fact)?);
-    }
-    let facts =
-        BoundedNonEmptyVec::try_from(facts).map_err(|_domain_error| DecodeError::InvalidBody)?;
-    Ok(WalRun::new(partition, batch, owner, facts))
-}
-
-fn decode_fence(identity: &WalIdentity, fence: &ArchivedWalFence) -> Result<WalFence, DecodeError> {
-    let partition = PartitionId::try_from(&fence.partition)?;
-    let batch = BatchId::from(&fence.batch);
-    check_identity(identity, partition, batch)?;
-    let owner = OwnerToken::from(&fence.owner);
-    Ok(WalFence::new(partition, batch, owner))
 }
 
 fn decode_fact(fact: &ArchivedOperationFact) -> Result<OperationFact, DecodeError> {
@@ -109,12 +103,12 @@ mod tests {
         let identity = WalIdentity::new(partition, BatchId::try_from(1)?);
         let owner = OwnerToken::from(SealGeneration::genesis());
 
-        let empty = WalObject::Run(WalRun {
+        let empty = WalObject::new(
             partition,
-            batch: identity.batch(),
+            identity.batch(),
             owner,
-            facts: BoundedNonEmptyVec { values: Vec::new() },
-        });
+            WalBody::Run(WalFacts { facts: Vec::new() }),
+        );
         assert_eq!(
             decode_wal(&identity, &encode(&empty, WAL_ENCODED_BYTES_MAX)?),
             Err(DecodeError::InvalidBody),
@@ -123,10 +117,10 @@ mod tests {
 
         let at_max = run_with_deleted_facts(partition, identity.batch(), owner, WAL_RUN_FACTS_MAX)?;
         let decoded = decode_wal(&identity, &encode_wal(&at_max)?)?;
-        let WalObject::Run(decoded) = decoded else {
+        let WalBody::Run(decoded_facts) = decoded.body() else {
             return Err("a run archive must decode as a run".into());
         };
-        assert_eq!(decoded.facts().len(), WAL_RUN_FACTS_MAX);
+        assert_eq!(decoded_facts.as_slice().len(), WAL_RUN_FACTS_MAX);
 
         let over_max = run_with_deleted_facts(
             partition,
@@ -150,18 +144,18 @@ mod tests {
     ) -> Result<WalObject, Box<dyn std::error::Error>> {
         let uid = StreamUid::try_from(1)?;
         let path = "events/abc".parse::<strom_domain::StreamId>()?;
-        let values = (0..facts_count)
+        let facts = (0..facts_count)
             .map(|_ordinal| OperationFact::StreamDeleted {
                 path: DirectoryKey::from(&path),
                 uid,
             })
             .collect();
-        Ok(WalObject::Run(WalRun {
+        Ok(WalObject::new(
             partition,
             batch,
             owner,
-            facts: BoundedNonEmptyVec { values },
-        }))
+            WalBody::Run(WalFacts { facts }),
+        ))
     }
 
     fn partition() -> Result<PartitionId, crate::PartitionIdError> {

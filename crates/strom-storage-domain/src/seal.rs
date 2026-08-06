@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 
 use crate::bounds::{RUN_TABLES_MAX, SST_OBJECT_BYTES_MAX, TREE_RANGES_MAX_V2, TREE_RUNS_MAX};
-use crate::{CoordinateExhausted, OwnerToken, PartitionId, ZeroCoordinate};
+use crate::{BatchId, OwnerToken, PartitionId, SealGeneration, StoreKind, TableObjectId};
 
 pub use codec::{decode_seal, encode_seal};
 
@@ -140,79 +140,10 @@ impl SealIdentity {
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, rkyv::Archive, rkyv::Serialize,
-)]
-pub struct SealGeneration(NonZeroU64);
-
-impl SealGeneration {
-    #[must_use]
-    pub const fn genesis() -> Self {
-        Self(NonZeroU64::MIN)
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0.get()
-    }
-
-    /// # Errors
-    ///
-    /// Returns [`CoordinateExhausted`] when this generation is `u64::MAX`.
-    pub fn successor(self) -> Result<Self, CoordinateExhausted> {
-        self.get()
-            .checked_add(1)
-            .and_then(NonZeroU64::new)
-            .map(Self)
-            .ok_or(CoordinateExhausted)
-    }
-}
-
-impl From<NonZeroU64> for SealGeneration {
-    fn from(generation: NonZeroU64) -> Self {
-        Self(generation)
-    }
-}
-
-impl TryFrom<u64> for SealGeneration {
-    type Error = ZeroCoordinate;
-
-    fn try_from(generation: u64) -> Result<Self, Self::Error> {
-        NonZeroU64::new(generation).map(Self).ok_or(ZeroCoordinate)
-    }
-}
-
-impl From<&ArchivedSealGeneration> for SealGeneration {
-    fn from(generation: &ArchivedSealGeneration) -> Self {
-        Self(generation.0.to_native())
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
 pub enum WalReplayPoint {
     Genesis,
-    Through {
-        batch: crate::BatchId,
-        owner: OwnerToken,
-    },
-}
-
-impl WalReplayPoint {
-    #[must_use]
-    pub const fn batch(self) -> Option<crate::BatchId> {
-        match self {
-            Self::Genesis => None,
-            Self::Through { batch, owner: _ } => Some(batch),
-        }
-    }
-
-    #[must_use]
-    pub const fn owner(self) -> Option<OwnerToken> {
-        match self {
-            Self::Genesis => None,
-            Self::Through { batch: _, owner } => Some(owner),
-        }
-    }
+    Through { batch: BatchId, owner: OwnerToken },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
@@ -371,157 +302,6 @@ impl TableRef {
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, rkyv::Archive, rkyv::Serialize,
-)]
-pub struct TableObjectId {
-    fresh: FreshIdentity,
-    store: StoreKind,
-}
-
-impl TableObjectId {
-    #[must_use]
-    pub const fn new(fresh: FreshIdentity, store: StoreKind) -> Self {
-        Self { fresh, store }
-    }
-
-    #[must_use]
-    pub const fn fresh(self) -> FreshIdentity {
-        self.fresh
-    }
-
-    #[must_use]
-    pub const fn store(self) -> StoreKind {
-        self.store
-    }
-}
-
-impl TryFrom<&ArchivedTableObjectId> for TableObjectId {
-    type Error = crate::archive::DecodeError;
-
-    fn try_from(object: &ArchivedTableObjectId) -> Result<Self, Self::Error> {
-        Ok(Self::new(
-            FreshIdentity::try_from(&object.fresh)?,
-            StoreKind::from(&object.store),
-        ))
-    }
-}
-
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, rkyv::Archive, rkyv::Serialize,
-)]
-pub struct FreshIdentity {
-    birth_generation: SealGeneration,
-    attempt: AttemptId,
-    ordinal: u32,
-}
-
-impl FreshIdentity {
-    /// # Errors
-    ///
-    /// Returns [`SealError`] unless the owner claim predates the birth generation.
-    pub fn new(
-        birth_generation: SealGeneration,
-        attempt: AttemptId,
-        ordinal: u32,
-    ) -> Result<Self, SealError> {
-        if attempt.owner_claim() >= birth_generation {
-            return Err(SealError::OwnerNotBeforeBirth);
-        }
-        Ok(Self {
-            birth_generation,
-            attempt,
-            ordinal,
-        })
-    }
-
-    #[must_use]
-    pub const fn birth_generation(self) -> SealGeneration {
-        self.birth_generation
-    }
-
-    #[must_use]
-    pub const fn attempt(self) -> AttemptId {
-        self.attempt
-    }
-
-    #[must_use]
-    pub const fn ordinal(self) -> u32 {
-        self.ordinal
-    }
-}
-
-impl TryFrom<&ArchivedFreshIdentity> for FreshIdentity {
-    type Error = crate::archive::DecodeError;
-
-    fn try_from(fresh: &ArchivedFreshIdentity) -> Result<Self, Self::Error> {
-        Self::new(
-            SealGeneration::from(&fresh.birth_generation),
-            AttemptId::from(&fresh.attempt),
-            fresh.ordinal.to_native(),
-        )
-        .map_err(|_domain_error| crate::archive::DecodeError::InvalidBody)
-    }
-}
-
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, rkyv::Archive, rkyv::Serialize,
-)]
-pub struct AttemptId {
-    owner_claim: SealGeneration,
-    local_counter: u64,
-}
-
-impl AttemptId {
-    #[must_use]
-    pub const fn new(owner_claim: SealGeneration, local_counter: u64) -> Self {
-        Self {
-            owner_claim,
-            local_counter,
-        }
-    }
-
-    #[must_use]
-    pub const fn owner_claim(self) -> SealGeneration {
-        self.owner_claim
-    }
-
-    #[must_use]
-    pub const fn local_counter(self) -> u64 {
-        self.local_counter
-    }
-}
-
-impl From<&ArchivedAttemptId> for AttemptId {
-    fn from(attempt: &ArchivedAttemptId) -> Self {
-        Self::new(
-            SealGeneration::from(&attempt.owner_claim),
-            attempt.local_counter.to_native(),
-        )
-    }
-}
-
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, rkyv::Archive, rkyv::Serialize,
-)]
-pub enum StoreKind {
-    Directory,
-    Ledger,
-    Tally,
-    Annals,
-}
-
-impl From<&ArchivedStoreKind> for StoreKind {
-    fn from(store: &ArchivedStoreKind) -> Self {
-        match store {
-            ArchivedStoreKind::Directory => Self::Directory,
-            ArchivedStoreKind::Ledger => Self::Ledger,
-            ArchivedStoreKind::Tally => Self::Tally,
-            ArchivedStoreKind::Annals => Self::Annals,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SealError {
     #[error("V2 tree must contain exactly one range")]
@@ -540,8 +320,6 @@ pub enum SealError {
     StoreMismatch,
     #[error("table birth generation is newer than its enclosing Seal")]
     FutureTable,
-    #[error("table owner claim does not predate its birth generation")]
-    OwnerNotBeforeBirth,
     #[error("table object identity occurs more than once in the Seal")]
     DuplicateTableObject,
     #[error("Tally and Annals must be canonically empty in V2")]

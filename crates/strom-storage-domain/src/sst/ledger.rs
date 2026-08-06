@@ -2,14 +2,12 @@
 
 use rkyv::rancor::Failure;
 
-use super::{
-    SST_OBJECT_BYTES_MAX_USIZE, SstDecodeError, SstEncodeError, check_decode_bound,
-    check_encode_rows,
-};
+use super::{SstDecodeError, SstEncodeError, check_decode_bound, check_encode_rows};
 use crate::archive;
 use crate::bounds::{
     LEDGER_DELETE_ROW_LOGICAL_BYTES, LEDGER_VALUE_ROW_LOGICAL_BYTES_MAX,
     PARTITION_PATH_OCCUPANCIES_MAX_V2, PARTITION_RESIDENT_LOGICAL_BYTES_MAX_V2,
+    SST_OBJECT_BYTES_MAX_USIZE,
 };
 use crate::{FreshIdentity, LedgerCell, PartitionId, StoreKind, StreamUid, TableKey};
 
@@ -37,6 +35,9 @@ pub fn encode_ledger_sst(
     if expected.object().store() != StoreKind::Ledger {
         return Err(SstEncodeError::StoreMismatch);
     }
+    if rows.is_empty() {
+        return Err(SstEncodeError::EmptyTable);
+    }
     check_encode_rows::<(StreamUid, LedgerCell)>(rows.len())?;
     let mut previous = None;
     for (uid, _cell) in rows {
@@ -44,9 +45,6 @@ pub fn encode_ledger_sst(
             return Err(SstEncodeError::RowsNotStrictlyOrdered);
         }
         previous = Some(*uid);
-    }
-    if rows.is_empty() {
-        return Err(SstEncodeError::EmptyTable);
     }
 
     let root = LedgerSstArchive {

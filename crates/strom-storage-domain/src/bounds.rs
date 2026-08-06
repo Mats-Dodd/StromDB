@@ -21,6 +21,14 @@ pub const RUN_TABLES_MAX: usize = 4096;
 /// Largest complete SST object accepted or produced.
 pub const SST_OBJECT_BYTES_MAX: u64 = 128 * 1024 * 1024;
 
+/// Same SST object bound for rkyv gates that take `usize`.
+pub(crate) const SST_OBJECT_BYTES_MAX_USIZE: usize = 128 * 1024 * 1024;
+
+const _: () = assert!(
+    SST_OBJECT_BYTES_MAX == 128 * 1024 * 1024 && SST_OBJECT_BYTES_MAX_USIZE == 128 * 1024 * 1024,
+    "the rkyv byte gate and durable SST bound must agree"
+);
+
 /// Largest canonical Directory key.
 pub const DIRECTORY_KEY_BYTES_MAX: usize = 512;
 

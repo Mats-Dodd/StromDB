@@ -1,13 +1,16 @@
 //! Shared rkyv boundary for durable storage objects.
 
+mod adapter;
+
+use rkyv::Serialize;
 use rkyv::api::high::{HighSerializer, to_bytes_in_with_alloc};
-use rkyv::rancor::{Failure, Fallible, Source};
+use rkyv::rancor::Failure;
 use rkyv::ser::allocator::{Arena, ArenaHandle};
 use rkyv::ser::{Positional, Writer};
-use rkyv::string::{ArchivedString, StringResolver};
-use rkyv::with::{ArchiveWith, SerializeWith};
-use rkyv::{Archive, Archived, Place, Resolver, Serialize, SerializeUnsized};
-use strom_domain::{ExpiresAt, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamTtl};
+
+pub(crate) use adapter::{
+    ContentTypeAsString, ExpiryAsArchive, LifecycleAsArchive, decode_content_type,
+};
 
 /// A durable object could not be encoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -32,6 +35,22 @@ pub enum DecodeError {
     InvalidBody,
     #[error("body identity differs from the durable location")]
     IdentityMismatch,
+}
+
+/// Complete encoded bytes exceeded the named decode bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EncodedBytesOverMax {
+    pub(crate) bytes_max: usize,
+    pub(crate) bytes_actual: usize,
+}
+
+impl From<EncodedBytesOverMax> for DecodeError {
+    fn from(error: EncodedBytesOverMax) -> Self {
+        Self::EncodedBytesOverMax {
+            bytes_max: error.bytes_max,
+            bytes_actual: error.bytes_actual,
+        }
+    }
 }
 
 pub(crate) fn encode<Value>(value: &Value, bytes_max: usize) -> Result<Vec<u8>, EncodeError>
@@ -91,9 +110,12 @@ impl Writer<Failure> for BoundedWriter {
     }
 }
 
-pub(crate) const fn decode_bound(bytes: &[u8], bytes_max: usize) -> Result<(), DecodeError> {
+pub(crate) const fn decode_bound(
+    bytes: &[u8],
+    bytes_max: usize,
+) -> Result<(), EncodedBytesOverMax> {
     if bytes.len() > bytes_max {
-        return Err(DecodeError::EncodedBytesOverMax {
+        return Err(EncodedBytesOverMax {
             bytes_max,
             bytes_actual: bytes.len(),
         });
@@ -101,219 +123,25 @@ pub(crate) const fn decode_bound(bytes: &[u8], bytes_max: usize) -> Result<(), D
     Ok(())
 }
 
-pub(crate) fn decode_content_type(
-    content_type: &ArchivedString,
-) -> Result<StreamContentType, DecodeError> {
-    let archived = content_type.as_str();
-    StreamContentType::validate_canonical(archived)
-        .map_err(|_domain_error| DecodeError::InvalidBody)?;
-    let parsed: StreamContentType = archived
-        .parse()
-        .map_err(|_domain_error| DecodeError::InvalidBody)?;
-    Ok(parsed)
-}
-
-pub(crate) struct ContentTypeAsString;
-
-impl ArchiveWith<StreamContentType> for ContentTypeAsString {
-    type Archived = ArchivedString;
-    type Resolver = StringResolver;
-
-    fn resolve_with(
-        field: &StreamContentType,
-        resolver: Self::Resolver,
-        out: Place<Self::Archived>,
-    ) {
-        ArchivedString::resolve_from_str(field.as_str(), resolver, out);
-    }
-}
-
-impl<SerializerType> SerializeWith<StreamContentType, SerializerType> for ContentTypeAsString
-where
-    SerializerType: Fallible + ?Sized,
-    SerializerType::Error: Source,
-    str: SerializeUnsized<SerializerType>,
-{
-    fn serialize_with(
-        field: &StreamContentType,
-        serializer: &mut SerializerType,
-    ) -> Result<Self::Resolver, SerializerType::Error> {
-        ArchivedString::serialize_from_str(field.as_str(), serializer)
-    }
-}
-
-#[derive(Debug, Archive, Serialize)]
-pub(crate) enum ExpiryArchive {
-    None,
-    SlidingTtl(u64),
-    AbsoluteExpiry(i128),
-}
-
-impl From<ExpiryPolicy> for ExpiryArchive {
-    fn from(expiry: ExpiryPolicy) -> Self {
-        match expiry {
-            ExpiryPolicy::None => Self::None,
-            ExpiryPolicy::SlidingTtl(ttl) => Self::SlidingTtl(ttl.seconds().get()),
-            ExpiryPolicy::AbsoluteExpiry(expires_at) => {
-                Self::AbsoluteExpiry(i128::from(expires_at))
-            }
-        }
-    }
-}
-
-pub(crate) struct ExpiryAsArchive;
-
-impl ArchiveWith<ExpiryPolicy> for ExpiryAsArchive {
-    type Archived = Archived<ExpiryArchive>;
-    type Resolver = Resolver<ExpiryArchive>;
-
-    fn resolve_with(field: &ExpiryPolicy, resolver: Self::Resolver, out: Place<Self::Archived>) {
-        ExpiryArchive::from(*field).resolve(resolver, out);
-    }
-}
-
-impl<SerializerType> SerializeWith<ExpiryPolicy, SerializerType> for ExpiryAsArchive
-where
-    SerializerType: Fallible + ?Sized,
-    ExpiryArchive: Serialize<SerializerType>,
-{
-    fn serialize_with(
-        field: &ExpiryPolicy,
-        serializer: &mut SerializerType,
-    ) -> Result<Self::Resolver, SerializerType::Error> {
-        ExpiryArchive::from(*field).serialize(serializer)
-    }
-}
-
-impl TryFrom<&ArchivedExpiryArchive> for ExpiryPolicy {
-    type Error = DecodeError;
-
-    fn try_from(expiry: &ArchivedExpiryArchive) -> Result<Self, Self::Error> {
-        match expiry {
-            ArchivedExpiryArchive::None => Ok(Self::None),
-            ArchivedExpiryArchive::SlidingTtl(seconds) => {
-                std::num::NonZeroU64::new(seconds.to_native())
-                    .map(StreamTtl::from)
-                    .map(Self::SlidingTtl)
-                    .ok_or(DecodeError::InvalidBody)
-            }
-            ArchivedExpiryArchive::AbsoluteExpiry(unix_nanoseconds) => {
-                ExpiresAt::try_from(unix_nanoseconds.to_native())
-                    .map(Self::AbsoluteExpiry)
-                    .map_err(|_domain_error| DecodeError::InvalidBody)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Archive, Serialize)]
-pub(crate) enum LifecycleArchive {
-    Open,
-    Closed,
-}
-
-pub(crate) struct LifecycleAsArchive;
-
-impl ArchiveWith<StreamLifecycle> for LifecycleAsArchive {
-    type Archived = Archived<LifecycleArchive>;
-    type Resolver = Resolver<LifecycleArchive>;
-
-    fn resolve_with(field: &StreamLifecycle, resolver: Self::Resolver, out: Place<Self::Archived>) {
-        LifecycleArchive::from(*field).resolve(resolver, out);
-    }
-}
-
-impl<SerializerType> SerializeWith<StreamLifecycle, SerializerType> for LifecycleAsArchive
-where
-    SerializerType: Fallible + ?Sized,
-    LifecycleArchive: Serialize<SerializerType>,
-{
-    fn serialize_with(
-        field: &StreamLifecycle,
-        serializer: &mut SerializerType,
-    ) -> Result<Self::Resolver, SerializerType::Error> {
-        LifecycleArchive::from(*field).serialize(serializer)
-    }
-}
-
-impl From<StreamLifecycle> for LifecycleArchive {
-    fn from(lifecycle: StreamLifecycle) -> Self {
-        match lifecycle {
-            StreamLifecycle::Open => Self::Open,
-            StreamLifecycle::Closed => Self::Closed,
-        }
-    }
-}
-
-impl From<&ArchivedLifecycleArchive> for StreamLifecycle {
-    fn from(lifecycle: &ArchivedLifecycleArchive) -> Self {
-        match lifecycle {
-            ArchivedLifecycleArchive::Open => Self::Open,
-            ArchivedLifecycleArchive::Closed => Self::Closed,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use rkyv::{Archive, Serialize};
+
     use super::*;
 
     #[derive(Archive, Serialize)]
-    struct ProtocolFields {
-        #[rkyv(with = ContentTypeAsString)]
-        content_type: StreamContentType,
-        #[rkyv(with = ExpiryAsArchive)]
-        expiry: ExpiryPolicy,
-        #[rkyv(with = LifecycleAsArchive)]
-        lifecycle: StreamLifecycle,
-    }
-
-    #[test]
-    fn protocol_adapters_round_trip_through_canonical_domain_construction() {
-        let fields = ProtocolFields {
-            content_type: "text/plain; charset=utf-8"
-                .parse()
-                .expect("the fixture content type is canonical"),
-            expiry: ExpiryPolicy::AbsoluteExpiry(
-                ExpiresAt::try_from(1_725_000_000_123_456_789i128)
-                    .expect("the fixture expiry is representable"),
-            ),
-            lifecycle: StreamLifecycle::Closed,
-        };
-
-        let bytes = encode(&fields, 1_024).expect("the small fixture fits its archive bound");
-        let archived = rkyv::access::<ArchivedProtocolFields, Failure>(&bytes)
-            .expect("the encoder produces a checked archive");
-
-        assert_eq!(
-            decode_content_type(&archived.content_type),
-            Ok(fields.content_type),
-            "content type is reconstructed through its canonical parser"
-        );
-        assert_eq!(
-            ExpiryPolicy::try_from(&archived.expiry),
-            Ok(fields.expiry),
-            "expiry is reconstructed through its domain conversions"
-        );
-        assert_eq!(
-            StreamLifecycle::from(&archived.lifecycle),
-            fields.lifecycle,
-            "lifecycle variants map exhaustively"
-        );
+    struct BoundProbe {
+        marker: u64,
     }
 
     #[test]
     fn complete_archive_bound_is_shared_by_encode_and_decode() {
-        let fields = ProtocolFields {
-            content_type: StreamContentType::octet_stream(),
-            expiry: ExpiryPolicy::None,
-            lifecycle: StreamLifecycle::Open,
-        };
-        let bytes = encode(&fields, 1_024).expect("the small fixture fits its archive bound");
+        let probe = BoundProbe { marker: 1 };
+        let bytes = encode(&probe, 1_024).expect("the small fixture fits its archive bound");
         let first_crossing = bytes.len().saturating_sub(1);
 
         assert_eq!(
-            encode(&fields, first_crossing),
+            encode(&probe, first_crossing),
             Err(EncodeError::EncodedBytesOverMax {
                 bytes_max: first_crossing,
             }),
@@ -321,25 +149,11 @@ mod tests {
         );
         assert_eq!(
             decode_bound(&bytes, first_crossing),
-            Err(DecodeError::EncodedBytesOverMax {
+            Err(EncodedBytesOverMax {
                 bytes_max: first_crossing,
                 bytes_actual: bytes.len(),
             }),
             "decode rejects the same complete archive boundary"
-        );
-    }
-
-    #[test]
-    fn expiry_adapter_rejects_a_structurally_valid_zero_ttl() {
-        let invalid = ExpiryArchive::SlidingTtl(0);
-        let bytes = encode(&invalid, 1_024).expect("the invalid domain fixture still archives");
-        let archived = rkyv::access::<ArchivedExpiryArchive, Failure>(&bytes)
-            .expect("zero is structurally valid as an archived u64");
-
-        assert_eq!(
-            ExpiryPolicy::try_from(archived),
-            Err(DecodeError::InvalidBody),
-            "checked archive access does not replace protocol-domain validation"
         );
     }
 }
