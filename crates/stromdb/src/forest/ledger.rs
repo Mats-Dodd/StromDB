@@ -1,21 +1,25 @@
 //! Resident Ledger: stream records keyed by dense UID.
 
-use std::collections::BTreeMap;
-
+use imbl::OrdMap;
 use strom_storage_domain::{StreamRecord, StreamUid};
 
 /// In-memory Ledger values for strict fold.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ResidentLedger {
-    records: BTreeMap<StreamUid, StreamRecord>,
+    records: OrdMap<StreamUid, StreamRecord>,
 }
 
 impl ResidentLedger {
     #[must_use]
-    pub(super) const fn empty() -> Self {
+    pub(super) fn empty() -> Self {
         Self {
-            records: BTreeMap::new(),
+            records: OrdMap::new(),
         }
+    }
+
+    #[must_use]
+    pub(super) const fn from_records(records: OrdMap<StreamUid, StreamRecord>) -> Self {
+        Self { records }
     }
 
     #[must_use]

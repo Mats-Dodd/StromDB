@@ -93,6 +93,8 @@ fn decode_fact(fact: &ArchivedOperationFact) -> Result<OperationFact, DecodeErro
 
 #[cfg(test)]
 mod tests {
+    use strom_domain::{ExpiryPolicy, StreamContentType};
+
     use super::*;
     use crate::SealGeneration;
 
@@ -133,6 +135,39 @@ mod tests {
             decode_wal(&identity, &encode(&over_max, WAL_ENCODED_BYTES_MAX)?,),
             "an archived count above the named limit is rejected before result allocation"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn fact_count_and_field_bounds_imply_the_wal_byte_bound()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let partition = partition()?;
+        let batch = BatchId::try_from(1)?;
+        let owner = OwnerToken::from(SealGeneration::genesis());
+        let path = DirectoryKey::try_from(
+            "a".repeat(strom_domain::STREAM_ID_BYTES_MAX)
+                .into_bytes()
+                .into_boxed_slice(),
+        )?;
+        let content_type: StreamContentType =
+            format!("a/{}", "b".repeat(strom_domain::CONTENT_TYPE_BYTES_MAX - 2)).parse()?;
+        let uid = StreamUid::try_from(1)?;
+        let facts: Vec<_> = (0..WAL_RUN_FACTS_MAX)
+            .map(|_ordinal| OperationFact::StreamCreated {
+                path: path.clone(),
+                uid,
+                content_type: content_type.clone(),
+                expiry: ExpiryPolicy::None,
+            })
+            .collect();
+        let object = WalObject::new(
+            partition,
+            batch,
+            owner,
+            WalBody::Run(WalFacts::try_from(facts)?),
+        );
+        let encoded = encode_wal(&object)?;
+        assert!(encoded.len() <= WAL_ENCODED_BYTES_MAX);
         Ok(())
     }
 

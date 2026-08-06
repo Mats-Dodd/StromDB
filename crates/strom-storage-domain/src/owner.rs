@@ -7,6 +7,13 @@ use crate::coordinate::SealGeneration;
 )]
 pub struct OwnerToken(SealGeneration);
 
+impl OwnerToken {
+    #[must_use]
+    pub const fn generation(self) -> SealGeneration {
+        self.0
+    }
+}
+
 impl From<&ArchivedOwnerToken> for OwnerToken {
     fn from(token: &ArchivedOwnerToken) -> Self {
         Self(SealGeneration::from(&token.0))

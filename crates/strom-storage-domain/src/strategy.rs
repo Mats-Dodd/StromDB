@@ -114,6 +114,11 @@ pub fn directory_entry() -> impl Strategy<Value = DirectoryEntry> {
     ]
 }
 
+/// Generates only nonzero stream identities.
+///
+/// # Panics
+///
+/// The mapping asserts the strategy's lower bound remains one.
 pub fn stream_uid() -> impl Strategy<Value = StreamUid> {
     (1u64..).prop_map(|raw| {
         StreamUid::from(NonZeroU64::new(raw).expect("the uid strategy starts at one"))

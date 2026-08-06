@@ -109,6 +109,13 @@ impl TryFrom<u64> for BatchId {
 )]
 pub struct StreamUid(NonZeroU64);
 
+impl StreamUid {
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
 impl From<&ArchivedStreamUid> for StreamUid {
     fn from(uid: &ArchivedStreamUid) -> Self {
         Self(uid.0.to_native())

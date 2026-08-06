@@ -59,6 +59,7 @@ impl EncodedWal {
 pub struct ObservedWal {
     object: WalObject,
     validator: Etag,
+    bytes: FrozenBytes,
 }
 
 impl ObservedWal {
@@ -80,6 +81,11 @@ impl ObservedWal {
     #[must_use]
     pub const fn body(&self) -> &WalBody {
         self.object.body()
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        self.bytes.as_slice()
     }
 
     /// Consume this observation into a collector delete proof for a RUN.
@@ -264,9 +270,15 @@ impl WalStore {
                 "WAL body at {key} failed checked decode for {identity:?}: {source}"
             ))
         })?;
+        let bytes = FrozenBytes::try_from(observed.body().to_vec()).map_err(|source| {
+            WalStoreError::contradiction(format!(
+                "decoded WAL body at {key} cannot be retained for exact reconciliation: {source}"
+            ))
+        })?;
         Ok(Some(ObservedWal {
             object,
             validator: observed.etag().clone(),
+            bytes,
         }))
     }
 

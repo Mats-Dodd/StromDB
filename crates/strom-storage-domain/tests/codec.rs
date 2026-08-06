@@ -9,9 +9,9 @@ use strom_storage_domain::{
 };
 
 const SEAL_ARCHIVE_FIXTURE: &[u8] = &[
-    0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204, 221, 238, 255, 1, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 215, 255, 255, 255, 0, 0, 0, 0,
-    207, 255, 255, 255, 0, 0, 0, 0,
+    0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204, 221, 238, 255, 1, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 215, 255, 255, 255, 0, 0, 0, 0, 207, 255,
+    255, 255, 0, 0, 0, 0,
 ];
 
 const WAL_ARCHIVE_FIXTURE: &[u8] = &[
@@ -29,22 +29,20 @@ const CONTENT_TYPE_SUBTYPE_LEN: usize = 243;
 fn seal_archive_fixture_anchors_the_root() -> Result<(), Box<dyn std::error::Error>> {
     let seal = genesis_seal()?;
     let encoded = encode_seal(&seal)?;
-    let first_difference =
-        encoded
-            .iter()
-            .zip(SEAL_ARCHIVE_FIXTURE)
-            .enumerate()
-            .find_map(|(index, (actual, expected))| {
-                (actual != expected).then_some((index, *actual, *expected))
-            });
+    let first_difference = encoded
+        .iter()
+        .zip(SEAL_ARCHIVE_FIXTURE)
+        .enumerate()
+        .find_map(|(index, (actual, expected))| {
+            (actual != expected).then_some((index, *actual, *expected))
+        });
     assert_eq!(
         SEAL_ARCHIVE_FIXTURE.len(),
         encoded.len(),
         "Seal fixture length changed; first difference: {first_difference:?}"
     );
     assert_eq!(
-        None,
-        first_difference,
+        None, first_difference,
         "Seal bytes are a durable format anchor"
     );
     assert_eq!(
@@ -59,8 +57,16 @@ fn seal_archive_fixture_anchors_the_root() -> Result<(), Box<dyn std::error::Err
 fn wal_archive_fixture_anchors_the_root() -> Result<(), Box<dyn std::error::Error>> {
     let object = one_fact_run()?;
     let encoded = encode_wal(&object)?;
-    assert_eq!(WAL_ARCHIVE_FIXTURE.len(), encoded.len(), "WAL fixture length changed");
-    assert_eq!(WAL_ARCHIVE_FIXTURE, encoded.as_slice(), "WAL bytes are a durable format anchor");
+    assert_eq!(
+        WAL_ARCHIVE_FIXTURE.len(),
+        encoded.len(),
+        "WAL fixture length changed"
+    );
+    assert_eq!(
+        WAL_ARCHIVE_FIXTURE,
+        encoded.as_slice(),
+        "WAL bytes are a durable format anchor"
+    );
     assert_eq!(
         object,
         decode_wal(&object.identity(), WAL_ARCHIVE_FIXTURE)?,
@@ -98,7 +104,10 @@ fn every_wal_fact_variant_roundtrips() -> Result<(), Box<dyn std::error::Error>>
             OperationFact::StreamDeleted { path, uid },
         ])?),
     );
-    assert_eq!(object, decode_wal(&object.identity(), &encode_wal(&object)?)?);
+    assert_eq!(
+        object,
+        decode_wal(&object.identity(), &encode_wal(&object)?)?
+    );
     Ok(())
 }
 

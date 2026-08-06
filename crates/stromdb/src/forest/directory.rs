@@ -1,21 +1,25 @@
 //! Resident Directory: path occupancy for the pure forest.
 
-use std::collections::BTreeMap;
-
+use imbl::OrdMap;
 use strom_storage_domain::{DirectoryEntry, DirectoryKey, StreamUid};
 
 /// In-memory Directory rows for strict fold.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ResidentDirectory {
-    rows: BTreeMap<DirectoryKey, DirectoryEntry>,
+    rows: OrdMap<DirectoryKey, DirectoryEntry>,
 }
 
 impl ResidentDirectory {
     #[must_use]
-    pub(super) const fn empty() -> Self {
+    pub(super) fn empty() -> Self {
         Self {
-            rows: BTreeMap::new(),
+            rows: OrdMap::new(),
         }
+    }
+
+    #[must_use]
+    pub(super) const fn from_rows(rows: OrdMap<DirectoryKey, DirectoryEntry>) -> Self {
+        Self { rows }
     }
 
     #[must_use]
@@ -42,7 +46,7 @@ impl ResidentDirectory {
             .get_mut(path)
             .expect("delete folds a Live directory row");
         assert!(
-            matches!(*entry, DirectoryEntry::Live(live_uid) if live_uid == uid),
+            matches!(entry, DirectoryEntry::Live(live_uid) if *live_uid == uid),
             "delete folds the Live uid named by the fact"
         );
         *entry = DirectoryEntry::Tombstone(uid);

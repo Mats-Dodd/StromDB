@@ -1,6 +1,7 @@
 //! Typed Seal and WAL stores over the raw object-store adapter.
 
 mod seal;
+mod table;
 mod wal;
 
 use std::fmt;
@@ -9,6 +10,7 @@ use strom_object_store::{KeysBound, ObjectKey, PUT_BYTES_MAX, StoreError};
 use strom_storage_domain::{SEAL_ENCODED_BYTES_MAX, WAL_ENCODED_BYTES_MAX};
 
 pub use seal::{EncodedSeal, SealStore, SealStoreError};
+pub(crate) use table::{TableRows, TableStore, TableStoreError};
 pub use wal::{
     AuthorizedWalRunDelete, EncodedWal, ObservedWal, WalDeleteRefusal, WalStore, WalStoreError,
 };
@@ -23,6 +25,10 @@ pub use wal::{
 const _: () = assert!(
     (SEAL_ENCODED_BYTES_MAX as u64) <= PUT_BYTES_MAX,
     "SEAL_ENCODED_BYTES_MAX must fit inside PUT_BYTES_MAX"
+);
+const _: () = assert!(
+    strom_storage_domain::SST_OBJECT_BYTES_MAX <= PUT_BYTES_MAX,
+    "SST_OBJECT_BYTES_MAX must fit inside PUT_BYTES_MAX"
 );
 #[expect(
     clippy::as_conversions,
