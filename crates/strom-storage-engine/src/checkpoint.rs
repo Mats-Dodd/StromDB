@@ -133,16 +133,6 @@ impl PublicationGate {
         self.claim()
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_begin_publish(&self) -> bool {
-        self.begin_publish()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn test_is_claimed(&self) -> bool {
-        self.0.claimed.load(Ordering::Acquire)
-    }
-
     async fn claimed(&self) {
         loop {
             if self.0.claimed.load(Ordering::Acquire) {

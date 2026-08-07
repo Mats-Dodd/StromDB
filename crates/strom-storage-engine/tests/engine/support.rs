@@ -1,7 +1,7 @@
 use strom_common::{Entropy, Seed};
 use strom_domain::{CreateOutcome, ExpiryPolicy, StreamContentType, StreamId, StreamLifecycle};
 use strom_object_store::ObjectKey;
-use strom_storage_domain::{BatchId, WalKey};
+use strom_storage_domain::{BatchId, SealGeneration, SealKey, WalKey};
 use strom_storage_engine::{Engine, StreamError};
 
 pub(crate) type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -28,4 +28,12 @@ pub(crate) fn wal_key(batch: u64) -> ObjectKey {
         .to_string()
         .parse()
         .expect("WAL key spelling is a canonical object key")
+}
+
+pub(crate) fn seal_key(generation: u64) -> ObjectKey {
+    let generation = SealGeneration::try_from(generation).expect("test Seal generation is nonzero");
+    SealKey::from(generation)
+        .to_string()
+        .parse()
+        .expect("Seal key spelling is a canonical object key")
 }
