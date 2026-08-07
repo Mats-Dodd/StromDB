@@ -155,6 +155,165 @@ async fn unresolved_absent_writer_claim_reopens_from_genesis() -> TestResult {
 }
 
 #[tokio::test]
+async fn matching_claim_occupant_fences_without_granting_authority() -> TestResult {
+    let claim_key = seal_key(2);
+    let gate = Gate::new();
+    let store = FaultStore::new().gate(
+        Selection::create(Target::Key(claim_key.clone())),
+        gate.clone(),
+    )?;
+    let backend = store.backend();
+    let head = genesis(partition());
+    put_seal(&backend, &head).await?;
+
+    let opening = Engine::open(Arc::clone(&backend), entropy());
+    tokio::pin!(opening);
+    tokio::select! {
+        () = gate.wait_until_blocked() => {}
+        outcome = &mut opening => panic!("claim create passed its held gate: {outcome:?}"),
+    }
+    put_seal(&backend, &head.claim_successor()?).await?;
+    gate.release();
+
+    assert!(matches!(opening.await, Err(OpenError::Fenced)));
+    store.assert_called_once(Operation::Create, &claim_key)?;
+    store.assert_called_once(Operation::Read, &claim_key)?;
+    store.verify()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ambiguous_matching_fence_enters_replay_without_resend() -> TestResult {
+    let fence_key = wal_key(1);
+    let store = FaultStore::new().inject(Fault::CreateThenLoseResponse {
+        target: Target::Key(fence_key.clone()),
+    })?;
+
+    let engine = Engine::open(store.backend(), entropy()).await?;
+    assert_eq!(CloseOutcome::Shutdown, engine.shutdown().await);
+    store.assert_called_once(Operation::Create, &fence_key)?;
+    store.verify()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ambiguous_absent_fence_is_retryable_without_resend() -> TestResult {
+    let fence_key = wal_key(1);
+    let store = FaultStore::new().inject(Fault::FailBefore {
+        selection: Selection::create(Target::Key(fence_key.clone())),
+        failure: BackendFailure::Transport,
+    })?;
+
+    assert!(matches!(
+        Engine::open(store.backend(), entropy()).await,
+        Err(OpenError::Retryable { .. })
+    ));
+    store.assert_called_once(Operation::Create, &fence_key)?;
+    store.assert_called_once(Operation::Read, &fence_key)?;
+    store.verify()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn occupied_fence_candidate_relists_and_strictly_advances() -> TestResult {
+    let first_key = wal_key(1);
+    let next_key = wal_key(2);
+    let gate = Gate::new();
+    let store = FaultStore::new().gate(
+        Selection::create(Target::Key(first_key.clone())),
+        gate.clone(),
+    )?;
+    let backend = store.backend();
+    let partition = partition();
+    put_seal(&backend, &genesis(partition)).await?;
+
+    let opening = Engine::open(Arc::clone(&backend), entropy());
+    tokio::pin!(opening);
+    tokio::select! {
+        () = gate.wait_until_blocked() => {}
+        outcome = &mut opening => panic!("first FENCE create passed its held gate: {outcome:?}"),
+    }
+    put_wal(
+        &backend,
+        &WalObject::new(
+            partition,
+            BatchId::try_from(1)?,
+            OwnerToken::from(SealGeneration::genesis()),
+            WalBody::Fence,
+        ),
+    )
+    .await?;
+    gate.release();
+
+    let engine = opening.await?;
+    assert_eq!(CloseOutcome::Shutdown, engine.shutdown().await);
+    store.assert_called_once(Operation::Create, &first_key)?;
+    store.assert_called_once(Operation::Create, &next_key)?;
+    store.verify()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ambiguous_foreign_fence_reconciles_then_relists() -> TestResult {
+    let first_key = wal_key(1);
+    let next_key = wal_key(2);
+    let gate = Gate::new();
+    let store = FaultStore::new()
+        .inject(Fault::FailBefore {
+            selection: Selection::create(Target::Key(first_key.clone())),
+            failure: BackendFailure::Transport,
+        })?
+        .gate(
+            Selection::create(Target::Key(first_key.clone())),
+            gate.clone(),
+        )?;
+    let backend = store.backend();
+    let partition = partition();
+    put_seal(&backend, &genesis(partition)).await?;
+
+    let opening = Engine::open(Arc::clone(&backend), entropy());
+    tokio::pin!(opening);
+    tokio::select! {
+        () = gate.wait_until_blocked() => {}
+        outcome = &mut opening => panic!("ambiguous FENCE create passed its held gate: {outcome:?}"),
+    }
+    put_wal(
+        &backend,
+        &WalObject::new(
+            partition,
+            BatchId::try_from(1)?,
+            OwnerToken::from(SealGeneration::genesis()),
+            WalBody::Fence,
+        ),
+    )
+    .await?;
+    gate.release();
+
+    let engine = opening.await?;
+    assert_eq!(CloseOutcome::Shutdown, engine.shutdown().await);
+    store.assert_called_once(Operation::Create, &first_key)?;
+    store.assert_called_once(Operation::Create, &next_key)?;
+    store.verify()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejected_claim_maps_to_a_bootstrap_contradiction() -> TestResult {
+    let claim_key = seal_key(2);
+    let store = FaultStore::new().inject(Fault::FailBefore {
+        selection: Selection::create(Target::Key(claim_key)),
+        failure: BackendFailure::PermissionDenied,
+    })?;
+
+    assert!(matches!(
+        Engine::open(store.backend(), entropy()).await,
+        Err(OpenError::Contradiction { .. })
+    ));
+    store.verify()?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn seal_list_failure_is_retryable_and_reopens_from_empty() -> TestResult {
     let store = FaultStore::new().inject(Fault::FailBefore {
         selection: Selection::list(seal_namespace()),

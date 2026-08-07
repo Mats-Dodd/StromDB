@@ -87,11 +87,10 @@ mod tests {
     use strom_storage_domain::{
         AttemptId, DirectoryKey, FreshIdentity, OperationFact, OwnerToken, SealGeneration, SealKey,
         SortedRun, StoreKind, StreamUid, TableKey, TableObjectId, TableRef, TreeVersion, WalBody,
-        WalFacts, WalKey, WalObject, WalReplayPoint,
+        WalFacts, WalKey, WalObject, WalReplayPoint, encode_seal, encode_wal,
     };
 
     use super::*;
-    use crate::store::{EncodedSeal, EncodedWal, SealStore, WalStore};
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -227,23 +226,18 @@ mod tests {
             };
             let backend = store.backend();
             let adapter = ObjectStoreAdapter::new(Arc::clone(&backend));
-            let wal_store = WalStore::new(adapter.clone());
             for wal in state
                 .covered_runs
                 .iter()
                 .chain([&state.fence, &state.after_cut])
             {
-                assert_eq!(CreateEvidence::Direct, wal_store.create_wal(wal).await?);
+                plant_wal(&adapter, wal).await?;
             }
             for table in &state.tables {
                 plant_table(&adapter, table).await?;
             }
-            let seal_store = SealStore::new(adapter.clone());
             for seal in [&state.source, &state.successor] {
-                assert_eq!(
-                    CreateEvidence::Direct,
-                    seal_store.create_seal(&EncodedSeal::new(seal)?).await?
-                );
+                plant_seal(&adapter, seal).await?;
             }
 
             Ok(Self {
@@ -293,9 +287,9 @@ mod tests {
     struct CollectionState {
         source: Seal,
         successor: Seal,
-        covered_runs: Vec<EncodedWal>,
-        fence: EncodedWal,
-        after_cut: EncodedWal,
+        covered_runs: Vec<WalObject>,
+        fence: WalObject,
+        after_cut: WalObject,
         tables: Vec<TableRef>,
         dead: Vec<ObjectKey>,
         preserved: Vec<ObjectKey>,
@@ -368,15 +362,15 @@ mod tests {
             )?;
             let covered_runs = COVERED_RUN_BATCHES
                 .into_iter()
-                .map(|batch| encoded_run(partition, batch, owner))
+                .map(|batch| wal_run(partition, batch, owner))
                 .collect::<TestResult<Vec<_>>>()?;
-            let fence = EncodedWal::new(&WalObject::new(
+            let fence = WalObject::new(
                 partition,
                 BatchId::try_from(FENCE_BATCH)?,
                 owner,
                 WalBody::Fence,
-            ))?;
-            let after_cut = encoded_run(partition, AFTER_CUT_BATCH, owner)?;
+            );
+            let after_cut = wal_run(partition, AFTER_CUT_BATCH, owner)?;
             let tables = vec![
                 dropped_directory,
                 carried_directory,
@@ -486,11 +480,7 @@ mod tests {
         }
     }
 
-    fn encoded_run(
-        partition: PartitionId,
-        batch: u64,
-        owner: OwnerToken,
-    ) -> TestResult<EncodedWal> {
+    fn wal_run(partition: PartitionId, batch: u64, owner: OwnerToken) -> TestResult<WalObject> {
         let fact = OperationFact::StreamCreated {
             path: directory_key(&format!("collection/run-{batch}"))?,
             uid: StreamUid::try_from(batch)?,
@@ -498,12 +488,32 @@ mod tests {
             expiry: ExpiryPolicy::None,
             lifecycle: StreamLifecycle::Open,
         };
-        Ok(EncodedWal::new(&WalObject::new(
+        Ok(WalObject::new(
             partition,
             BatchId::try_from(batch)?,
             owner,
             WalBody::Run(WalFacts::try_from(vec![fact])?),
-        ))?)
+        ))
+    }
+
+    async fn plant_wal(adapter: &ObjectStoreAdapter, wal: &WalObject) -> TestResult {
+        let key = object_key(WalKey::from(wal.batch()));
+        let body = FrozenBytes::try_from(encode_wal(wal)?)?;
+        assert_eq!(
+            CreateEvidence::Direct,
+            adapter.create_if_absent(&key, body).await?
+        );
+        Ok(())
+    }
+
+    async fn plant_seal(adapter: &ObjectStoreAdapter, seal: &Seal) -> TestResult {
+        let key = object_key(SealKey::from(seal.generation()));
+        let body = FrozenBytes::try_from(encode_seal(seal)?)?;
+        assert_eq!(
+            CreateEvidence::Direct,
+            adapter.create_if_absent(&key, body).await?
+        );
+        Ok(())
     }
 
     async fn plant_table(adapter: &ObjectStoreAdapter, table: &TableRef) -> TestResult {

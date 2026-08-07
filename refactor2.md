@@ -1,6 +1,6 @@
 # Checkpoint locality and decided store outcomes
 
-Status: agreed design, not yet implemented.
+Status: implemented.
 Scope: `crates/strom-storage-engine`. One refactor, no behavior change (one
 benign interleave change, decision 3).
 Predecessor: `refactor.md` (the WriterState extract; implemented).

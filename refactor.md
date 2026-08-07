@@ -1,6 +1,8 @@
 # WriterState: extract the writer's pure protocol core
 
-Status: agreed design, not yet implemented.
+Status: implemented. Decision 2 was superseded by `refactor2.md`: durable
+evidence classification now lives in each typed store, and the writer shell
+receives decided outcomes.
 Scope: `crates/strom-storage-engine`. One refactor, no behavior change (one
 deliberate exception, decision 6).
 
@@ -58,10 +60,12 @@ Extract a pure `WriterState` module. The writer task keeps I/O only.
    legibility. If the writer grows more event sources (reads, subscriptions,
    timers), collapse the methods into `step` then; the middle cut keeps that
    move cheap.
-2. **Evidence classification stays in the shell.** `complete_flight`'s
+2. **Superseded: evidence classification stays in the shell.** `complete_flight`'s
    Direct/DurableMatch/NotOurs/Unresolved table performs a reconcile read
    (I/O), never touches the forests, and has strong integration coverage
-   through the fault store. Moving it adds interface without adding reach.
+   through the fault store. `refactor2.md` subsequently moved the send-once
+   classification and exact reconciliation into the typed stores so each
+   durable kind owns its complete evidence protocol.
 3. **Concrete `Completion`, no generics.** The reply tokens (`Completion`,
    pairing the decided outcome with its oneshot sender) move into the state
    module as inert data. The state never calls `send`; it returns settled

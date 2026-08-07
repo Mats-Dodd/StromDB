@@ -49,10 +49,17 @@ impl EncodedTable {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CandidateTableEvidence {
+enum CandidateTableEvidence {
     Match,
     Foreign,
     Absent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TableEstablishment {
+    Established,
+    Abandoned,
+    Contradiction { detail: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +78,37 @@ impl TableStore {
         Self { adapter }
     }
 
-    pub(crate) async fn create_table(
+    pub(crate) async fn establish_table(&self, candidate: &EncodedTable) -> TableEstablishment {
+        match self.create_table(candidate).await {
+            Ok(CreateEvidence::Direct | CreateEvidence::DurableMatch) => {
+                TableEstablishment::Established
+            }
+            Ok(CreateEvidence::NotOurs) => TableEstablishment::Contradiction {
+                detail: "foreign bytes occupy a fresh checkpoint table identity".into(),
+            },
+            Ok(CreateEvidence::Unresolved) => match self.reconcile_table(candidate).await {
+                Ok(CandidateTableEvidence::Match) => TableEstablishment::Established,
+                Ok(CandidateTableEvidence::Foreign) => TableEstablishment::Contradiction {
+                    detail: "an unresolved fresh checkpoint table contains foreign bytes".into(),
+                },
+                Ok(CandidateTableEvidence::Absent)
+                | Err(TypedStoreError::Retryable { .. } | TypedStoreError::Rejected { .. }) => {
+                    TableEstablishment::Abandoned
+                }
+                Err(TypedStoreError::Contradiction { detail }) => {
+                    TableEstablishment::Contradiction { detail }
+                }
+            },
+            Err(TypedStoreError::Retryable { .. } | TypedStoreError::Rejected { .. }) => {
+                TableEstablishment::Abandoned
+            }
+            Err(TypedStoreError::Contradiction { detail }) => {
+                TableEstablishment::Contradiction { detail }
+            }
+        }
+    }
+
+    async fn create_table(
         &self,
         candidate: &EncodedTable,
     ) -> Result<CreateEvidence, TypedStoreError> {
@@ -82,7 +119,7 @@ impl TableStore {
             .map_err(TypedStoreError::from_store)
     }
 
-    pub(crate) async fn reconcile_table(
+    async fn reconcile_table(
         &self,
         candidate: &EncodedTable,
     ) -> Result<CandidateTableEvidence, TypedStoreError> {
@@ -203,7 +240,10 @@ fn seal_tables(seal: &Seal) -> impl Iterator<Item = TableObjectId> + '_ {
 mod tests {
     use std::num::NonZeroU64;
 
+    use object_store::path::Path;
+    use object_store::{ObjectStoreExt as _, PutPayload};
     use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
+    use strom_object_store::test_support::{BackendFailure, Fault, FaultStore, Selection, Target};
     use strom_object_store::{CreateEvidence, FrozenBytes};
     use strom_storage_domain::{
         AttemptId, FreshIdentity, SealGeneration, StreamRecord, StreamUid, TableObjectId,
@@ -211,6 +251,128 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn table_establishment_decides_direct_match_and_foreign_evidence() {
+        let adapter = ObjectStoreAdapter::in_memory();
+        let store = TableStore::new(adapter);
+        let candidate = candidate_table(vec![1]);
+        assert_eq!(
+            TableEstablishment::Established,
+            store.establish_table(&candidate).await,
+            "a direct content create establishes the table"
+        );
+        assert_eq!(
+            TableEstablishment::Established,
+            store.establish_table(&candidate).await,
+            "matching durable content establishes the table"
+        );
+        let foreign = candidate_table(vec![2]);
+        assert!(
+            matches!(
+                store.establish_table(&foreign).await,
+                TableEstablishment::Contradiction { .. }
+            ),
+            "foreign bytes at a fresh table identity are contradictory"
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_table_establishment_reconciles_match_foreign_and_absence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let candidate = candidate_table(vec![1]);
+        let key = object_key(candidate.key);
+        let matching_fault = FaultStore::new().inject(Fault::CreateThenLoseResponse {
+            target: Target::Key(key.clone()),
+        })?;
+        let matching = TableStore::new(ObjectStoreAdapter::new(matching_fault.backend()));
+        assert_eq!(
+            TableEstablishment::Established,
+            matching.establish_table(&candidate).await
+        );
+        matching_fault.verify()?;
+
+        let foreign_fault = FaultStore::new().inject(Fault::FailBefore {
+            selection: Selection::create(Target::Key(key.clone())),
+            failure: BackendFailure::Transport,
+        })?;
+        let foreign_backend = foreign_fault.backend();
+        foreign_backend
+            .put(&Path::from(key.as_str()), PutPayload::from_static(&[2]))
+            .await?;
+        let foreign = TableStore::new(ObjectStoreAdapter::new(foreign_backend));
+        assert!(matches!(
+            foreign.establish_table(&candidate).await,
+            TableEstablishment::Contradiction { .. }
+        ));
+        foreign_fault.verify()?;
+
+        let absent_fault = FaultStore::new().inject(Fault::FailBefore {
+            selection: Selection::create(Target::Key(key)),
+            failure: BackendFailure::Transport,
+        })?;
+        let absent = TableStore::new(ObjectStoreAdapter::new(absent_fault.backend()));
+        assert_eq!(
+            TableEstablishment::Abandoned,
+            absent.establish_table(&candidate).await
+        );
+        absent_fault.verify()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn table_store_failures_map_to_abandon_or_contradiction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let candidate = candidate_table(vec![1]);
+        let key = object_key(candidate.key);
+        for failure in [
+            BackendFailure::PermissionDenied,
+            BackendFailure::Unauthenticated,
+        ] {
+            let fault_store = FaultStore::new().inject(Fault::FailBefore {
+                selection: Selection::create(Target::Key(key.clone())),
+                failure,
+            })?;
+            let store = TableStore::new(ObjectStoreAdapter::new(fault_store.backend()));
+            assert_eq!(
+                TableEstablishment::Abandoned,
+                store.establish_table(&candidate).await
+            );
+            fault_store.verify()?;
+        }
+
+        let retryable_fault = FaultStore::new()
+            .inject(Fault::FailBefore {
+                selection: Selection::create(Target::Key(key.clone())),
+                failure: BackendFailure::Transport,
+            })?
+            .inject(Fault::FailBefore {
+                selection: Selection::read(Target::Key(key.clone())),
+                failure: BackendFailure::Transport,
+            })?;
+        let retryable = TableStore::new(ObjectStoreAdapter::new(retryable_fault.backend()));
+        assert_eq!(
+            TableEstablishment::Abandoned,
+            retryable.establish_table(&candidate).await
+        );
+        retryable_fault.verify()?;
+
+        let contradiction_fault = FaultStore::new().inject(Fault::FailBefore {
+            selection: Selection::create(Target::Key(key.clone())),
+            failure: BackendFailure::Transport,
+        })?;
+        let backend = contradiction_fault.backend();
+        backend
+            .put(&Path::from(key.as_str()), PutPayload::from_static(&[1, 2]))
+            .await?;
+        let store = TableStore::new(ObjectStoreAdapter::new(backend));
+        assert!(matches!(
+            store.establish_table(&candidate).await,
+            TableEstablishment::Contradiction { .. }
+        ));
+        contradiction_fault.verify()?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn exact_length_directory_table_round_trips() -> Result<(), Box<dyn std::error::Error>> {
@@ -377,6 +539,13 @@ mod tests {
             key.object(),
             NonZeroU64::new(bytes).expect("encoded SSTs are nonempty"),
         )?)
+    }
+
+    fn candidate_table(bytes: Vec<u8>) -> EncodedTable {
+        EncodedTable::new(
+            table_key(StoreKind::Directory).expect("test table identity is valid"),
+            bytes,
+        )
     }
 
     fn table_key(store: StoreKind) -> Result<TableKey, Box<dyn std::error::Error>> {

@@ -10,7 +10,7 @@ use strom_storage_domain::{
 };
 
 use crate::forest::{Forest, ForestDelta};
-use crate::store::{EncodedSeal, EncodedTable};
+use crate::store::{EncodedAuthoritySeal, EncodedTable};
 
 use super::{CheckpointInput, PreparedCheckpoint};
 
@@ -33,7 +33,7 @@ struct ChunkAccounting {
 }
 
 #[derive(Debug)]
-enum CheckpointPlan {
+enum PlanShape {
     Delta,
     Full,
 }
@@ -66,7 +66,7 @@ pub(super) fn prepare_checkpoint(
     let plan = plan_checkpoint(&source, &snapshot, &delta);
     let mut ordinal = 0u32;
     let (directory, ledger) = match plan {
-        CheckpointPlan::Delta => {
+        PlanShape::Delta => {
             let ForestDelta {
                 directory: directory_rows,
                 ledger: ledger_rows,
@@ -95,7 +95,7 @@ pub(super) fn prepare_checkpoint(
             };
             (directory, ledger)
         }
-        CheckpointPlan::Full => {
+        PlanShape::Full => {
             let directory_rows = snapshot
                 .directory_rows()
                 .iter()
@@ -145,7 +145,7 @@ pub(super) fn prepare_checkpoint(
     })))
 }
 
-fn plan_checkpoint(source: &Seal, snapshot: &Forest, delta: &ForestDelta) -> CheckpointPlan {
+fn plan_checkpoint(source: &Seal, snapshot: &Forest, delta: &ForestDelta) -> PlanShape {
     if let Some(plan) = plan_delta(source, delta) {
         return plan;
     }
@@ -162,10 +162,10 @@ fn plan_checkpoint(source: &Seal, snapshot: &Forest, delta: &ForestDelta) -> Che
             .map(|_row| LEDGER_VALUE_ROW_ENCODED_BYTES_MAX),
     );
     assert_full_plan(directory, ledger);
-    CheckpointPlan::Full
+    PlanShape::Full
 }
 
-fn plan_delta(source: &Seal, delta: &ForestDelta) -> Option<CheckpointPlan> {
+fn plan_delta(source: &Seal, delta: &ForestDelta) -> Option<PlanShape> {
     let directory = account_rows(
         delta
             .directory
@@ -234,7 +234,7 @@ fn select_delta(
     source: &Seal,
     directory: ChunkAccounting,
     ledger: ChunkAccounting,
-) -> Option<CheckpointPlan> {
+) -> Option<PlanShape> {
     let directory_runs = source
         .directory()
         .runs()
@@ -259,7 +259,7 @@ fn select_delta(
         && carried_bytes
             .checked_add(fresh_bytes)
             .is_some_and(|bytes| bytes <= PARTITION_BOOTSTRAP_BYTES_MAX_V2))
-    .then_some(CheckpointPlan::Delta)
+    .then_some(PlanShape::Delta)
 }
 
 fn seal_tables(seal: &Seal) -> impl Iterator<Item = &TableRef> {
@@ -439,7 +439,7 @@ fn assemble_checkpoint_seal(
     owner: OwnerToken,
     directory: TreeVersion,
     ledger: TreeVersion,
-) -> (Seal, EncodedSeal) {
+) -> (Seal, EncodedAuthoritySeal) {
     let successor = Seal::new(
         partition,
         generation,
@@ -448,7 +448,7 @@ fn assemble_checkpoint_seal(
         ledger,
     )
     .expect("checkpoint planning constructs a valid exact-successor Seal");
-    let encoded = EncodedSeal::new(&successor)
+    let encoded = EncodedAuthoritySeal::new(&successor)
         .expect("a planned checkpoint Seal fits the durable encoding bound");
     (successor, encoded)
 }

@@ -16,6 +16,7 @@ use super::{TypedStoreError, newest_keys_bound, object_key};
 /// One WAL candidate, encoded exactly once. Key and body agree by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EncodedWal {
+    partition: PartitionId,
     batch: BatchId,
     bytes: FrozenBytes,
 }
@@ -29,13 +30,18 @@ impl EncodedWal {
     /// [`WAL_ENCODED_BYTES_MAX`].
     pub(crate) fn new(object: &WalObject) -> Result<Self, EncodeError> {
         let bytes = encode_wal(object)?;
-        Ok(Self::from_encoded(object.batch(), bytes))
+        Ok(Self::from_encoded(
+            object.partition(),
+            object.batch(),
+            bytes,
+        ))
     }
 
-    fn from_encoded(batch: BatchId, bytes: Vec<u8>) -> Self {
+    fn from_encoded(partition: PartitionId, batch: BatchId, bytes: Vec<u8>) -> Self {
         let frozen = FrozenBytes::try_from(bytes)
             .expect("encode_wal yields a non-empty body within PUT_BYTES_MAX");
         Self {
+            partition,
             batch,
             bytes: frozen,
         }
@@ -49,7 +55,7 @@ impl EncodedWal {
     /// Exact frozen bytes of this candidate. After an ambiguous create, reconcile
     /// with one bounded GET compared against these bytes—never re-encode.
     #[must_use]
-    pub(crate) fn as_slice(&self) -> &[u8] {
+    fn as_slice(&self) -> &[u8] {
         self.bytes.as_slice()
     }
 }
@@ -81,7 +87,7 @@ impl ObservedWal {
     }
 
     #[must_use]
-    pub(crate) fn as_slice(&self) -> &[u8] {
+    fn as_slice(&self) -> &[u8] {
         self.bytes.as_slice()
     }
 
@@ -136,27 +142,46 @@ pub(crate) struct WalStore {
     adapter: ObjectStoreAdapter,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalEstablishment {
+    Durable,
+    Occupied,
+    UnresolvedAbsent,
+}
+
 impl WalStore {
     #[must_use]
     pub(crate) const fn new(adapter: ObjectStoreAdapter) -> Self {
         Self { adapter }
     }
 
-    /// Send the candidate exactly once; the evidence passes through unchanged.
-    ///
-    /// An authority-bearing create is send-once: the caller must not call
-    /// create again for the same candidate. After
-    /// [`CreateEvidence::Unresolved`], the caller reconciles with a bounded
-    /// exact GET compared against [`EncodedWal::as_slice`].
+    /// Send the candidate exactly once and reconcile one ambiguous response
+    /// with at most one bounded exact GET of the frozen candidate coordinate.
     ///
     /// # Errors
     ///
     /// Returns [`TypedStoreError`] when the adapter reports a retryable,
     /// rejected, or contradictory outcome.
-    pub(crate) async fn create_wal(
+    pub(crate) async fn establish_wal(
         &self,
         candidate: &EncodedWal,
-    ) -> Result<CreateEvidence, TypedStoreError> {
+    ) -> Result<WalEstablishment, TypedStoreError> {
+        match self.create_wal(candidate).await? {
+            CreateEvidence::Direct | CreateEvidence::DurableMatch => Ok(WalEstablishment::Durable),
+            CreateEvidence::NotOurs => Ok(WalEstablishment::Occupied),
+            CreateEvidence::Unresolved => {
+                match self.read_wal(candidate.partition, candidate.batch).await? {
+                    Some(observed) if observed.as_slice() == candidate.as_slice() => {
+                        Ok(WalEstablishment::Durable)
+                    }
+                    Some(_foreign) => Ok(WalEstablishment::Occupied),
+                    None => Ok(WalEstablishment::UnresolvedAbsent),
+                }
+            }
+        }
+    }
+
+    async fn create_wal(&self, candidate: &EncodedWal) -> Result<CreateEvidence, TypedStoreError> {
         let key = object_key(WalKey::from(candidate.batch));
         self.adapter
             .create_if_absent(&key, candidate.bytes.clone())
@@ -267,12 +292,99 @@ fn wal_read_bound() -> ByteBound {
 
 #[cfg(test)]
 mod tests {
+    use object_store::path::Path;
+    use object_store::{ObjectStoreExt as _, PutPayload};
     use strom_object_store::ObjectKey;
+    use strom_object_store::test_support::{
+        BackendFailure, Fault, FaultStore, Operation, Selection, Target,
+    };
     use strom_storage_domain::{
         DirectoryKey, OperationFact, OwnerToken, SealGeneration, StreamUid, WalFacts,
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn wal_establishment_decides_direct_match_and_occupied_evidence() {
+        let store = WalStore::new(ObjectStoreAdapter::in_memory());
+        let candidate = EncodedWal::new(&run_at(batch(1))).expect("run encodes");
+        assert_eq!(
+            WalEstablishment::Durable,
+            store
+                .establish_wal(&candidate)
+                .await
+                .expect("direct create is decided")
+        );
+        assert_eq!(
+            WalEstablishment::Durable,
+            store
+                .establish_wal(&candidate)
+                .await
+                .expect("matching occupant is decided")
+        );
+        let foreign = EncodedWal::new(&fence_at(batch(1))).expect("fence encodes");
+        assert_eq!(
+            WalEstablishment::Occupied,
+            store
+                .establish_wal(&foreign)
+                .await
+                .expect("foreign occupant is decided")
+        );
+    }
+
+    #[tokio::test]
+    async fn unresolved_wal_establishment_performs_one_exact_reconciliation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let candidate = EncodedWal::new(&run_at(batch(1)))?;
+        let key = object_key(WalKey::from(candidate.batch()));
+
+        let matching_fault = FaultStore::new().inject(Fault::CreateThenLoseResponse {
+            target: Target::Key(key.clone()),
+        })?;
+        let matching = WalStore::new(ObjectStoreAdapter::new(matching_fault.backend()));
+        assert_eq!(
+            WalEstablishment::Durable,
+            matching.establish_wal(&candidate).await?
+        );
+        matching_fault.assert_called_once(Operation::Create, &key)?;
+        matching_fault.assert_called_once(Operation::Read, &key)?;
+        matching_fault.verify()?;
+
+        let foreign_fault = FaultStore::new().inject(Fault::FailBefore {
+            selection: Selection::create(Target::Key(key.clone())),
+            failure: BackendFailure::Transport,
+        })?;
+        let foreign_backend = foreign_fault.backend();
+        let foreign = EncodedWal::new(&fence_at(candidate.batch()))?;
+        foreign_backend
+            .put(
+                &Path::from(key.as_str()),
+                PutPayload::from(foreign.as_slice().to_vec()),
+            )
+            .await?;
+        let foreign_store = WalStore::new(ObjectStoreAdapter::new(foreign_backend));
+        assert_eq!(
+            WalEstablishment::Occupied,
+            foreign_store.establish_wal(&candidate).await?
+        );
+        foreign_fault.assert_called_once(Operation::Create, &key)?;
+        foreign_fault.assert_called_once(Operation::Read, &key)?;
+        foreign_fault.verify()?;
+
+        let absent_fault = FaultStore::new().inject(Fault::FailBefore {
+            selection: Selection::create(Target::Key(key.clone())),
+            failure: BackendFailure::Transport,
+        })?;
+        let absent = WalStore::new(ObjectStoreAdapter::new(absent_fault.backend()));
+        assert_eq!(
+            WalEstablishment::UnresolvedAbsent,
+            absent.establish_wal(&candidate).await?
+        );
+        absent_fault.assert_called_once(Operation::Create, &key)?;
+        absent_fault.assert_called_once(Operation::Read, &key)?;
+        absent_fault.verify()?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn created_wal_reads_back_equal_with_a_stable_validator() {

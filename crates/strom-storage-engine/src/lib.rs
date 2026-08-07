@@ -3,7 +3,6 @@
 
 mod bootstrap;
 mod checkpoint;
-mod collection;
 mod engine;
 mod forest;
 mod store;

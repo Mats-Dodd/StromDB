@@ -9,11 +9,13 @@ use std::fmt;
 use strom_object_store::{KeysBound, ObjectKey, PUT_BYTES_MAX, StoreError};
 use strom_storage_domain::{SEAL_ENCODED_BYTES_MAX, WAL_ENCODED_BYTES_MAX};
 
-pub(crate) use seal::{EncodedSeal, SealStore};
-pub(crate) use table::{
-    CandidateTableEvidence, EncodedTable, TableRows, TableStore, targeted_table_deletes,
+pub(crate) use seal::{
+    EncodedAuthoritySeal, EncodedGenesisSeal, GenesisEstablishment, SealPublication, SealStore,
 };
-pub(crate) use wal::{EncodedWal, WalStore};
+pub(crate) use table::{
+    EncodedTable, TableEstablishment, TableRows, TableStore, targeted_table_deletes,
+};
+pub(crate) use wal::{EncodedWal, WalEstablishment, WalStore};
 
 /// Failures of typed store operations, shaped for writer and bootstrap exits.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

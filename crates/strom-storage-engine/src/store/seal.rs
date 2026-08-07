@@ -14,7 +14,7 @@ use super::{TypedStoreError, newest_keys_bound, object_key};
 
 /// One Seal candidate, encoded exactly once. Key and body agree by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EncodedSeal {
+struct EncodedSeal {
     generation: SealGeneration,
     bytes: FrozenBytes,
 }
@@ -26,7 +26,7 @@ impl EncodedSeal {
     ///
     /// Returns [`EncodeError`] when serialization fails or the archive exceeds
     /// [`SEAL_ENCODED_BYTES_MAX`].
-    pub(crate) fn new(seal: &Seal) -> Result<Self, EncodeError> {
+    fn new(seal: &Seal) -> Result<Self, EncodeError> {
         let bytes = encode_seal(seal)?;
         Ok(Self::from_encoded(seal.generation(), bytes))
     }
@@ -42,7 +42,7 @@ impl EncodedSeal {
 
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn generation(&self) -> SealGeneration {
+    const fn generation(&self) -> SealGeneration {
         self.generation
     }
 
@@ -50,9 +50,52 @@ impl EncodedSeal {
     /// with one bounded GET compared against these bytes—never re-encode.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn as_slice(&self) -> &[u8] {
+    fn as_slice(&self) -> &[u8] {
         self.bytes.as_slice()
     }
+}
+
+/// A canonical generation-zero Seal candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EncodedGenesisSeal(EncodedSeal);
+
+impl EncodedGenesisSeal {
+    pub(crate) fn new(seal: &Seal) -> Result<Self, EncodeError> {
+        assert_eq!(
+            SealGeneration::genesis(),
+            seal.generation(),
+            "a genesis candidate has the canonical genesis coordinate"
+        );
+        EncodedSeal::new(seal).map(Self)
+    }
+}
+
+/// A non-genesis Seal candidate whose direct creation grants writer authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EncodedAuthoritySeal(EncodedSeal);
+
+impl EncodedAuthoritySeal {
+    pub(crate) fn new(seal: &Seal) -> Result<Self, EncodeError> {
+        assert!(
+            seal.generation() > SealGeneration::genesis(),
+            "an authority candidate advances beyond the genesis coordinate"
+        );
+        EncodedSeal::new(seal).map(Self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GenesisEstablishment {
+    Established,
+    LostRace,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SealPublication {
+    Authored,
+    NoAuthority,
+    Unresolved,
 }
 
 /// Typed Seal namespace over the raw object-store adapter.
@@ -67,18 +110,33 @@ impl SealStore {
         Self { adapter }
     }
 
-    /// Send the candidate exactly once; the evidence passes through unchanged.
-    ///
-    /// An authority-bearing create is send-once: the caller must not call
-    /// create again for the same candidate. After
-    /// [`CreateEvidence::Unresolved`], the caller reconciles with a bounded
-    /// exact GET compared against [`EncodedSeal::as_slice`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TypedStoreError`] when the adapter reports a retryable,
-    /// rejected, or contradictory outcome.
-    pub(crate) async fn create_seal(
+    pub(crate) async fn establish_genesis(
+        &self,
+        candidate: &EncodedGenesisSeal,
+    ) -> Result<GenesisEstablishment, TypedStoreError> {
+        match self.create_seal(&candidate.0).await? {
+            CreateEvidence::Direct | CreateEvidence::DurableMatch => {
+                Ok(GenesisEstablishment::Established)
+            }
+            CreateEvidence::NotOurs => Ok(GenesisEstablishment::LostRace),
+            CreateEvidence::Unresolved => Ok(GenesisEstablishment::Unresolved),
+        }
+    }
+
+    pub(crate) async fn publish_authority(
+        &self,
+        candidate: &EncodedAuthoritySeal,
+    ) -> Result<SealPublication, TypedStoreError> {
+        match self.create_seal(&candidate.0).await? {
+            CreateEvidence::Direct => Ok(SealPublication::Authored),
+            CreateEvidence::DurableMatch | CreateEvidence::NotOurs => {
+                Ok(SealPublication::NoAuthority)
+            }
+            CreateEvidence::Unresolved => Ok(SealPublication::Unresolved),
+        }
+    }
+
+    async fn create_seal(
         &self,
         candidate: &EncodedSeal,
     ) -> Result<CreateEvidence, TypedStoreError> {
@@ -157,7 +215,112 @@ fn seal_read_bound() -> ByteBound {
 mod tests {
     use super::*;
     use strom_object_store::ObjectKey;
+    use strom_object_store::test_support::{
+        BackendFailure, Fault, FaultStore, Operation, Selection, Target,
+    };
     use strom_storage_domain::{PartitionId, TreeVersion, WalReplayPoint};
+
+    #[tokio::test]
+    async fn genesis_establishment_decides_every_evidence_class()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let genesis = seal_at(SealGeneration::genesis());
+        let candidate = EncodedGenesisSeal::new(&genesis)?;
+        let store = SealStore::new(ObjectStoreAdapter::in_memory());
+        assert_eq!(
+            GenesisEstablishment::Established,
+            store.establish_genesis(&candidate).await?
+        );
+        assert_eq!(
+            GenesisEstablishment::Established,
+            store.establish_genesis(&candidate).await?
+        );
+
+        let foreign_partition = "11112222-3333-4444-8888-9999aaaabbbb".parse()?;
+        let foreign = Seal::new(
+            foreign_partition,
+            SealGeneration::genesis(),
+            WalReplayPoint::Genesis,
+            TreeVersion::empty(),
+            TreeVersion::empty(),
+        )?;
+        let occupied_store = SealStore::new(ObjectStoreAdapter::in_memory());
+        occupied_store
+            .establish_genesis(&EncodedGenesisSeal::new(&foreign)?)
+            .await?;
+        assert_eq!(
+            GenesisEstablishment::LostRace,
+            occupied_store.establish_genesis(&candidate).await?
+        );
+
+        let key = object_key(SealKey::from(SealGeneration::genesis()));
+        let fault_store = FaultStore::new()
+            .inject(Fault::FailBefore {
+                selection: Selection::create(Target::Key(key.clone())),
+                failure: BackendFailure::Transport,
+            })?
+            .inject(Fault::FailBefore {
+                selection: Selection::read(Target::Key(key.clone())),
+                failure: BackendFailure::Transport,
+            })?;
+        let ambiguous = SealStore::new(ObjectStoreAdapter::new(fault_store.backend()));
+        assert_eq!(
+            GenesisEstablishment::Unresolved,
+            ambiguous.establish_genesis(&candidate).await?
+        );
+        assert_create_without_reconcile(&fault_store, &key)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authority_publication_requires_direct_authorship()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let generation = SealGeneration::genesis().successor()?;
+        let candidate = EncodedAuthoritySeal::new(&seal_at(generation))?;
+        let store = SealStore::new(ObjectStoreAdapter::in_memory());
+        assert_eq!(
+            SealPublication::Authored,
+            store.publish_authority(&candidate).await?
+        );
+        assert_eq!(
+            SealPublication::NoAuthority,
+            store.publish_authority(&candidate).await?
+        );
+
+        let foreign_partition = "11112222-3333-4444-8888-9999aaaabbbb".parse()?;
+        let foreign = Seal::new(
+            foreign_partition,
+            generation,
+            WalReplayPoint::Genesis,
+            TreeVersion::empty(),
+            TreeVersion::empty(),
+        )?;
+        let occupied_store = SealStore::new(ObjectStoreAdapter::in_memory());
+        occupied_store
+            .publish_authority(&EncodedAuthoritySeal::new(&foreign)?)
+            .await?;
+        assert_eq!(
+            SealPublication::NoAuthority,
+            occupied_store.publish_authority(&candidate).await?
+        );
+
+        let key = object_key(SealKey::from(generation));
+        let fault_store = FaultStore::new()
+            .inject(Fault::FailBefore {
+                selection: Selection::create(Target::Key(key.clone())),
+                failure: BackendFailure::Transport,
+            })?
+            .inject(Fault::FailBefore {
+                selection: Selection::read(Target::Key(key.clone())),
+                failure: BackendFailure::Transport,
+            })?;
+        let ambiguous = SealStore::new(ObjectStoreAdapter::new(fault_store.backend()));
+        assert_eq!(
+            SealPublication::Unresolved,
+            ambiguous.publish_authority(&candidate).await?
+        );
+        assert_create_without_reconcile(&fault_store, &key)?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn created_seal_reads_back_equal_at_its_exact_identity() {
@@ -269,6 +432,22 @@ mod tests {
             matches!(outcome, Err(TypedStoreError::Contradiction { .. })),
             "IdentityMismatch at the read identity is Contradiction, got {outcome:?}"
         );
+    }
+
+    fn assert_create_without_reconcile(
+        store: &FaultStore,
+        key: &ObjectKey,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        store.assert_called_once(Operation::Create, key)?;
+        let diagnostic = store
+            .verify()
+            .expect_err("the read trap remains unused when Seal publication does not reconcile");
+        let detail = diagnostic.to_string();
+        assert!(
+            detail.contains("unused fault") && detail.contains(&format!("Read {key}")),
+            "only the explicit read trap remains unused: {detail}"
+        );
+        Ok(())
     }
 
     fn seal_at(generation: SealGeneration) -> Seal {

@@ -170,6 +170,26 @@ async fn failed_wal_reconciliation_poisoned_without_resend() -> TestResult {
 }
 
 #[tokio::test]
+async fn rejected_wal_create_poisoned_without_resend() -> TestResult {
+    let wal_key = wal_key(2);
+    let store = FaultStore::new().inject(Fault::FailBefore {
+        selection: Selection::create(Target::Key(wal_key.clone())),
+        failure: BackendFailure::PermissionDenied,
+    })?;
+    let id: StreamId = "events/rejected".parse()?;
+
+    let engine = Engine::open(store.backend(), entropy()).await?;
+    assert_eq!(Err(StreamError::Indeterminate), create(&engine, &id).await);
+    assert!(matches!(
+        engine.shutdown().await,
+        CloseOutcome::Poisoned { .. }
+    ));
+    store.assert_called_once(Operation::Create, &wal_key)?;
+    store.verify()?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn wal_commit_is_published_before_the_success_reply_is_released() -> TestResult {
     let wal_key = wal_key(2);
     let gate = Gate::new();

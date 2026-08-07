@@ -3,7 +3,7 @@
 use imbl::OrdMap;
 use rand::RngCore as _;
 use strom_common::Entropy;
-use strom_object_store::{CreateEvidence, ObjectStoreAdapter};
+use strom_object_store::ObjectStoreAdapter;
 use strom_storage_domain::{
     BatchId, DIRECTORY_ROW_LOGICAL_BYTES_MAX, DirectoryKey, LEDGER_VALUE_ROW_LOGICAL_BYTES_MAX,
     LedgerCell, OperationFact, OwnerToken, PARTITION_BOOTSTRAP_BYTES_MAX_V2,
@@ -15,7 +15,8 @@ use strom_storage_domain::{
 use crate::forest::Forest;
 use crate::forest::ForestContradiction;
 use crate::store::{
-    EncodedSeal, EncodedWal, SealStore, TableRows, TableStore, TypedStoreError, WalStore,
+    EncodedAuthoritySeal, EncodedGenesisSeal, EncodedWal, GenesisEstablishment, SealPublication,
+    SealStore, TableRows, TableStore, TypedStoreError, WalEstablishment, WalStore,
 };
 use crate::writer::WriterState;
 
@@ -96,7 +97,7 @@ enum BootstrapPhase {
     },
     PublishClaim {
         candidate: Seal,
-        encoded: EncodedSeal,
+        encoded: EncodedAuthoritySeal,
         plan: BootstrapPlan,
     },
     LoadAdmissionBase {
@@ -177,7 +178,7 @@ pub(crate) async fn bootstrap(
                 } else {
                     let minted = mint_partition_id(&mut genesis_entropy);
                     match provision_genesis(&seal_store, minted).await? {
-                        GenesisProvision::Created => SealGeneration::genesis(),
+                        GenesisProvision::Established => SealGeneration::genesis(),
                         GenesisProvision::LostRace => {
                             phase = BootstrapPhase::DiscoverHead;
                             continue;
@@ -203,7 +204,7 @@ pub(crate) async fn bootstrap(
                                 "newest Seal cannot form an exact claim successor: {source}"
                             ),
                         })?;
-                let encoded = EncodedSeal::new(&candidate).map_err(|source| {
+                let encoded = EncodedAuthoritySeal::new(&candidate).map_err(|source| {
                     BootstrapExit::Contradiction {
                         detail: format!("claim Seal could not be encoded: {source}"),
                     }
@@ -219,11 +220,11 @@ pub(crate) async fn bootstrap(
                 encoded,
                 plan,
             } => match seal_store
-                .create_seal(&encoded)
+                .publish_authority(&encoded)
                 .await
                 .map_err(map_typed_store_error)?
             {
-                CreateEvidence::Direct => {
+                SealPublication::Authored => {
                     let generation = candidate.generation();
                     BootstrapPhase::LoadAdmissionBase {
                         claim: AuthoredClaim::new(generation),
@@ -231,12 +232,12 @@ pub(crate) async fn bootstrap(
                         plan,
                     }
                 }
-                CreateEvidence::DurableMatch | CreateEvidence::NotOurs => {
+                SealPublication::NoAuthority => {
                     return Err(BootstrapExit::Fenced {
                         observed: candidate.generation(),
                     });
                 }
-                CreateEvidence::Unresolved => {
+                SealPublication::Unresolved => {
                     return Err(BootstrapExit::Retryable {
                         detail: format!(
                             "claim create at {:?} is unresolved",
@@ -293,25 +294,19 @@ pub(crate) async fn bootstrap(
                     EncodedWal::new(&object).map_err(|source| BootstrapExit::Contradiction {
                         detail: format!("takeover FENCE could not be encoded: {source}"),
                     })?;
-                let evidence = wal_store
-                    .create_wal(&encoded)
+                let establishment = wal_store
+                    .establish_wal(&encoded)
                     .await
                     .map_err(map_typed_store_error)?;
-                let established = match evidence {
-                    CreateEvidence::Direct | CreateEvidence::DurableMatch => true,
-                    CreateEvidence::NotOurs => false,
-                    CreateEvidence::Unresolved => {
-                        match wal_store.read_wal(partition, encoded.batch()).await {
-                            Ok(Some(observed)) => observed.as_slice() == encoded.as_slice(),
-                            Ok(None) => {
-                                return Err(BootstrapExit::Retryable {
-                                    detail: format!(
-                                        "takeover FENCE create at {candidate:?} is unresolved and absent on reconciliation"
-                                    ),
-                                });
-                            }
-                            Err(error) => return Err(map_typed_store_error(error)),
-                        }
+                let established = match establishment {
+                    WalEstablishment::Durable => true,
+                    WalEstablishment::Occupied => false,
+                    WalEstablishment::UnresolvedAbsent => {
+                        return Err(BootstrapExit::Retryable {
+                            detail: format!(
+                                "takeover FENCE create at {candidate:?} is unresolved and absent on reconciliation"
+                            ),
+                        });
                     }
                 };
                 if established {
@@ -329,20 +324,12 @@ pub(crate) async fn bootstrap(
                         .newest_surviving_batch()
                         .await
                         .map_err(map_typed_store_error)?;
-                    let next_candidate = plan_fence_candidate(replay.batch(), listed_tail)?;
-                    if next_candidate <= candidate {
-                        return Err(BootstrapExit::Contradiction {
-                            detail: format!(
-                                "WAL list did not advance past occupied FENCE candidate {candidate:?}"
-                            ),
-                        });
-                    }
                     BootstrapPhase::PlaceFence {
                         claim,
                         seal,
                         base,
                         forest,
-                        fence: bound_fence(replay.batch(), next_candidate)?,
+                        fence: replan_fence(replay.batch(), candidate, listed_tail)?,
                         listed_tail,
                     }
                 }
@@ -662,6 +649,20 @@ fn merge_ledger_table(
     Ok(last)
 }
 
+fn replan_fence(
+    cut: Option<BatchId>,
+    occupied: BatchId,
+    listed_tail: Option<BatchId>,
+) -> Result<BoundedFence, BootstrapExit> {
+    let candidate = plan_fence_candidate(cut, listed_tail)?;
+    if candidate <= occupied {
+        return Err(BootstrapExit::Contradiction {
+            detail: format!("WAL list did not advance past occupied FENCE candidate {occupied:?}"),
+        });
+    }
+    bound_fence(cut, candidate)
+}
+
 fn plan_fence_candidate(
     cut: Option<BatchId>,
     listed_tail: Option<BatchId>,
@@ -740,7 +741,7 @@ fn bound_fence(cut: Option<BatchId>, fence: BatchId) -> Result<BoundedFence, Boo
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GenesisProvision {
-    Created,
+    Established,
     LostRace,
 }
 
@@ -757,17 +758,18 @@ async fn provision_genesis(
         strom_storage_domain::TreeVersion::empty(),
     )
     .expect("canonical empty genesis satisfies every Seal invariant");
-    let encoded = EncodedSeal::new(&genesis).map_err(|source| BootstrapExit::Contradiction {
-        detail: format!("canonical genesis could not be encoded: {source}"),
-    })?;
+    let encoded =
+        EncodedGenesisSeal::new(&genesis).map_err(|source| BootstrapExit::Contradiction {
+            detail: format!("canonical genesis could not be encoded: {source}"),
+        })?;
     match store
-        .create_seal(&encoded)
+        .establish_genesis(&encoded)
         .await
         .map_err(map_typed_store_error)?
     {
-        CreateEvidence::Direct | CreateEvidence::DurableMatch => Ok(GenesisProvision::Created),
-        CreateEvidence::NotOurs => Ok(GenesisProvision::LostRace),
-        CreateEvidence::Unresolved => Err(BootstrapExit::Retryable {
+        GenesisEstablishment::Established => Ok(GenesisProvision::Established),
+        GenesisEstablishment::LostRace => Ok(GenesisProvision::LostRace),
+        GenesisEstablishment::Unresolved => Err(BootstrapExit::Retryable {
             detail: "canonical genesis create is unresolved".into(),
         }),
     }
@@ -856,9 +858,10 @@ mod tests {
     use std::num::NonZeroU64;
 
     use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
+    use strom_object_store::{CreateEvidence, FrozenBytes, ObjectKey};
     use strom_storage_domain::{
         AttemptId, FreshIdentity, LedgerCell, SortedRun, StoreKind, StreamRecord, TableObjectId,
-        TreeVersion,
+        TreeVersion, WalKey, encode_wal,
     };
 
     use super::*;
@@ -881,23 +884,38 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn occupied_fence_replanning_rejects_a_nonadvancing_list()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert!(matches!(
+            replan_fence(None, BatchId::try_from(1)?, None),
+            Err(BootstrapExit::Contradiction { .. })
+        ));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn stale_claimant_stops_before_appending_a_decreasing_owner_fence()
     -> Result<(), Box<dyn std::error::Error>> {
         let adapter = ObjectStoreAdapter::in_memory();
-        let store = WalStore::new(adapter);
+        let store = WalStore::new(adapter.clone());
         let partition = partition();
         let stale_generation = SealGeneration::genesis().successor()?;
         let newer_generation = stale_generation.successor()?;
-        let newer_fence = EncodedWal::new(&WalObject::new(
+        let newer_fence = WalObject::new(
             partition,
             BatchId::try_from(1)?,
             OwnerToken::from(newer_generation),
             WalBody::Fence,
-        ))?;
+        );
         assert_eq!(
             CreateEvidence::Direct,
-            store.create_wal(&newer_fence).await?
+            adapter
+                .create_if_absent(
+                    &ObjectKey::try_from(WalKey::from(newer_fence.batch()).to_string())?,
+                    FrozenBytes::try_from(encode_wal(&newer_fence)?)?,
+                )
+                .await?
         );
 
         assert!(matches!(

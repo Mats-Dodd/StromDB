@@ -971,8 +971,10 @@ struct WalStore { adapter: ObjectStoreAdapter }
 struct TableStore { adapter: ObjectStoreAdapter }
 
 impl SealStore {
-    async fn create_seal(&self, candidate: &EncodedSeal)
-        -> Result<CreateEvidence, TypedStoreError>;
+    async fn establish_genesis(&self, candidate: &EncodedGenesisSeal)
+        -> Result<GenesisEstablishment, TypedStoreError>;
+    async fn publish_authority(&self, candidate: &EncodedAuthoritySeal)
+        -> Result<SealPublication, TypedStoreError>;
     async fn newest_generation(&self)
         -> Result<Option<SealGeneration>, TypedStoreError>;
     async fn read_seal(&self, generation: SealGeneration)
@@ -980,9 +982,9 @@ impl SealStore {
 }
 
 impl WalStore {
-    async fn create_wal(&self, candidate: &EncodedWal)
-        -> Result<CreateEvidence, TypedStoreError>;
-    async fn read_wal(&self, batch: BatchId)
+    async fn establish_wal(&self, candidate: &EncodedWal)
+        -> Result<WalEstablishment, TypedStoreError>;
+    async fn read_wal(&self, partition: PartitionId, batch: BatchId)
         -> Result<Option<ObservedWal>, TypedStoreError>;
     async fn newest_surviving_batch(&self)
         -> Result<Option<BatchId>, TypedStoreError>;
@@ -991,20 +993,26 @@ impl WalStore {
 }
 
 impl TableStore {
-    async fn create_table(&self, candidate: &EncodedTable)
-        -> Result<CreateEvidence, TypedStoreError>;
-    async fn reconcile_table(&self, candidate: &EncodedTable)
-        -> Result<CandidateTableEvidence, TypedStoreError>;
-    async fn read_table(&self, key: TableKey)
-        -> Result<Option<TableRows>, TypedStoreError>;
-    async fn delete_tables(&self, keys: &[TableKey])
+    async fn establish_table(&self, candidate: &EncodedTable)
+        -> TableEstablishment;
+    async fn read_table(&self, partition: PartitionId, table: &TableRef)
+        -> Result<TableRows, TypedStoreError>;
+    async fn delete_table(&self, proof: AuthorizedTableDelete)
         -> Result<(), TypedStoreError>;
 }
 ```
 
+Raw create operations are private. Each store owns the evidence table for its
+durable kind: WAL establishment performs one create and at most one exact
+reconciliation read; genesis establishment treats a lost race as ordinary;
+authority publication grants authorship only for a direct create; and table
+establishment absorbs retryable content failures into abandonment. The
+role-specific encoded Seal candidates prevent genesis and authority rules
+from being mixed at a call site.
+
 All three stores share one `TypedStoreError` shape: retryable, rejected, or
-contradiction. Newest-head listing, exact WAL deletion, and typed table
-decode rules stay inside these concrete types so callers cannot bypass them.
+contradiction. Newest-head listing, exact WAL deletion, and typed table decode
+rules stay inside these concrete types so callers cannot bypass them.
 
 
 ## failure, fencing, routing, and shutdown

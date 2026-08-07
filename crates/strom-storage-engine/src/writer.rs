@@ -2,16 +2,16 @@
 
 mod state;
 
-use strom_object_store::CreateEvidence;
 use strom_storage_domain::BatchId;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::bootstrap::Ready;
-use crate::checkpoint::{CheckpointOutcome, PublicationGate, execute_checkpoint};
-use crate::collection::collect_advance;
+use crate::checkpoint::{
+    CheckpointCompletion, PublicationGate, collect_advance, execute_checkpoint,
+};
 use crate::engine::PublishedView;
-use crate::store::{EncodedWal, TypedStoreError, WalStore};
+use crate::store::{TypedStoreError, WalEstablishment, WalStore};
 
 use state::{AdmissionDecision, CheckpointPlan, CheckpointTicket, Completion, FlightDecision};
 pub(crate) use state::{AdmissionRefusal, CommandEnvelope, CreateStream, WriterState};
@@ -39,20 +39,25 @@ struct Writer {
 }
 
 struct Flight {
-    encoded: EncodedWal,
-    task: JoinHandle<Result<CreateEvidence, TypedStoreError>>,
+    batch: BatchId,
+    task: JoinHandle<Result<WalEstablishment, TypedStoreError>>,
 }
 
 struct CheckpointFlight {
     ticket: CheckpointTicket,
     publication: PublicationGate,
-    task: JoinHandle<CheckpointOutcome>,
+    task: JoinHandle<CheckpointCompletion>,
 }
 
 enum WriterEvent {
-    Flight(Result<Result<CreateEvidence, TypedStoreError>, tokio::task::JoinError>),
-    Checkpoint(Result<CheckpointOutcome, tokio::task::JoinError>),
+    Flight(Result<Result<WalEstablishment, TypedStoreError>, tokio::task::JoinError>),
+    Checkpoint(Result<CheckpointCompletion, tokio::task::JoinError>),
     Command(Option<CommandEnvelope>),
+}
+
+enum FlightCompletion {
+    Continue,
+    Exit(WriterExit),
 }
 
 pub(crate) fn spawn_writer(
@@ -138,7 +143,7 @@ impl Writer {
                                 .flight
                                 .take()
                                 .expect("a WAL completion retains its shell flight");
-                            let batch = flight.encoded.batch();
+                            let batch = flight.batch;
                             self.state.discard_wal_flight(batch);
                             let exit = WriterExit::Contradiction {
                                 batch,
@@ -147,8 +152,9 @@ impl Writer {
                             return self.terminate(exit).await;
                         }
                     };
-                    if let Err(exit) = self.complete_flight(evidence).await {
-                        return self.terminate(exit).await;
+                    match self.complete_flight(evidence) {
+                        FlightCompletion::Continue => {}
+                        FlightCompletion::Exit(exit) => return self.terminate(exit).await,
                     }
                 }
                 WriterEvent::Checkpoint(completion) => {
@@ -193,9 +199,9 @@ impl Writer {
                     "a state WAL run has no existing shell flight"
                 );
                 let store = self.wal_store.clone();
-                let candidate = encoded.clone();
-                let task = tokio::spawn(async move { store.create_wal(&candidate).await });
-                self.flight = Some(Flight { encoded, task });
+                let batch = encoded.batch();
+                let task = tokio::spawn(async move { store.establish_wal(&encoded).await });
+                self.flight = Some(Flight { batch, task });
             }
             FlightDecision::Replies(replies) => send_replies(replies),
             FlightDecision::Idle => {}
@@ -207,57 +213,34 @@ impl Writer {
         );
     }
 
-    async fn complete_flight(
+    fn complete_flight(
         &mut self,
-        evidence: Result<CreateEvidence, TypedStoreError>,
-    ) -> Result<(), WriterExit> {
+        establishment: Result<WalEstablishment, TypedStoreError>,
+    ) -> FlightCompletion {
         let flight = self
             .flight
             .take()
             .expect("only an active shell WAL flight can complete");
-        let batch = flight.encoded.batch();
-        let outcome = match evidence {
-            Ok(CreateEvidence::Direct | CreateEvidence::DurableMatch) => {
+        let batch = flight.batch;
+        let exit = match establishment {
+            Ok(WalEstablishment::Durable) => {
                 self.record_wal_durable(batch);
-                Ok(())
+                return FlightCompletion::Continue;
             }
-            Ok(CreateEvidence::NotOurs) => Err(WriterExit::Fenced { batch }),
-            Ok(CreateEvidence::Unresolved) => {
-                let observed = self.wal_store.read_wal(self.state.partition(), batch).await;
-                match observed {
-                    Ok(Some(observed)) if observed.as_slice() == flight.encoded.as_slice() => {
-                        self.record_wal_durable(batch);
-                        Ok(())
-                    }
-                    Ok(Some(_foreign)) => Err(WriterExit::Fenced { batch }),
-                    Ok(None) => Err(WriterExit::Poisoned {
-                        batch,
-                        detail: "unresolved WAL create is absent on its one reconciliation read"
-                            .into(),
-                    }),
-                    Err(
-                        TypedStoreError::Retryable { detail }
-                        | TypedStoreError::Rejected { detail },
-                    ) => Err(WriterExit::Poisoned { batch, detail }),
-                    Err(TypedStoreError::Contradiction { detail }) => {
-                        Err(WriterExit::Contradiction { batch, detail })
-                    }
-                }
-            }
+            Ok(WalEstablishment::Occupied) => WriterExit::Fenced { batch },
+            Ok(WalEstablishment::UnresolvedAbsent) => WriterExit::Poisoned {
+                batch,
+                detail: "unresolved WAL create is absent on its one reconciliation read".into(),
+            },
             Err(TypedStoreError::Retryable { detail } | TypedStoreError::Rejected { detail }) => {
-                Err(WriterExit::Poisoned { batch, detail })
+                WriterExit::Poisoned { batch, detail }
             }
             Err(TypedStoreError::Contradiction { detail }) => {
-                Err(WriterExit::Contradiction { batch, detail })
+                WriterExit::Contradiction { batch, detail }
             }
         };
-        match outcome {
-            Ok(()) => Ok(()),
-            Err(exit) => {
-                self.state.discard_wal_flight(batch);
-                Err(exit)
-            }
-        }
+        self.state.discard_wal_flight(batch);
+        FlightCompletion::Exit(exit)
     }
 
     fn record_wal_durable(&mut self, batch: BatchId) {
@@ -300,54 +283,35 @@ impl Writer {
     fn complete_checkpoint(
         &mut self,
         ticket: CheckpointTicket,
-        outcome: CheckpointOutcome,
+        outcome: CheckpointCompletion,
     ) -> Result<(), WriterExit> {
         let completion = match outcome {
-            CheckpointOutcome::Abandoned => {
+            CheckpointCompletion::Abandoned => {
                 self.state.abandon_checkpoint(ticket);
                 Ok(())
             }
-            CheckpointOutcome::Contradiction { cut, detail } => {
-                assert_eq!(
-                    ticket.cut, cut,
-                    "checkpoint contradiction names its plan cut"
-                );
-                Err(WriterExit::Contradiction { batch: cut, detail })
+            CheckpointCompletion::Installed(install) => {
+                let installed = self.state.install_checkpoint(ticket, install);
+                self.view.send_replace(PublishedView::new(installed.forest));
+                if self.collector.is_none() {
+                    let adapter = self.adapter.clone();
+                    self.collector = Some(tokio::spawn(collect_advance(
+                        adapter,
+                        installed.source,
+                        installed.successor,
+                    )));
+                }
+                Ok(())
             }
-            CheckpointOutcome::Seal { prepared, evidence } => match evidence {
-                Ok(CreateEvidence::Direct) => {
-                    let installed = self
-                        .state
-                        .install_checkpoint(ticket, (*prepared).into_install());
-                    self.view.send_replace(PublishedView::new(installed.forest));
-                    if self.collector.is_none() {
-                        let adapter = self.adapter.clone();
-                        self.collector = Some(tokio::spawn(collect_advance(
-                            adapter,
-                            installed.source,
-                            installed.successor,
-                        )));
-                    }
-                    Ok(())
-                }
-                Ok(CreateEvidence::DurableMatch | CreateEvidence::NotOurs) => {
-                    Err(WriterExit::Fenced { batch: ticket.cut })
-                }
-                Ok(CreateEvidence::Unresolved) => Err(WriterExit::Poisoned {
-                    batch: ticket.cut,
-                    detail: "advancing Seal create is unresolved".into(),
-                }),
-                Err(TypedStoreError::Contradiction { detail }) => Err(WriterExit::Contradiction {
-                    batch: ticket.cut,
-                    detail,
-                }),
-                Err(
-                    TypedStoreError::Retryable { detail } | TypedStoreError::Rejected { detail },
-                ) => Err(WriterExit::Poisoned {
-                    batch: ticket.cut,
-                    detail,
-                }),
-            },
+            CheckpointCompletion::Fenced => Err(WriterExit::Fenced { batch: ticket.cut }),
+            CheckpointCompletion::Poisoned { detail } => Err(WriterExit::Poisoned {
+                batch: ticket.cut,
+                detail,
+            }),
+            CheckpointCompletion::Contradiction { detail } => Err(WriterExit::Contradiction {
+                batch: ticket.cut,
+                detail,
+            }),
         };
         match completion {
             Ok(()) => Ok(()),
@@ -378,15 +342,16 @@ impl Writer {
                 (&mut flight.task).await
             };
             match completion {
-                Ok(evidence) => {
-                    let _classified_wal = self.complete_flight(evidence).await;
-                }
+                Ok(evidence) => match self.complete_flight(evidence) {
+                    FlightCompletion::Continue => {}
+                    FlightCompletion::Exit(_terminal_exit) => {}
+                },
                 Err(_join_error) => {
                     let flight = self
                         .flight
                         .take()
                         .expect("terminal WAL join failure retains its shell flight");
-                    self.state.discard_wal_flight(flight.encoded.batch());
+                    self.state.discard_wal_flight(flight.batch);
                 }
             }
         }
