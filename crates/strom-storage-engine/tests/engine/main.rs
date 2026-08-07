@@ -1,22 +1,22 @@
 //! Behavioral claims for the public engine boundary.
 
+mod support;
+mod writer;
+
 use std::sync::Arc;
 
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
-use strom_common::{Entropy, Seed};
-use strom_domain::{
-    CreateOutcome, ExpiryPolicy, StreamContentType, StreamId, StreamLifecycle, StreamStatus,
-};
+use strom_domain::{CreateOutcome, StreamId, StreamStatus};
 use strom_storage_engine::{CloseOutcome, Engine, StreamError};
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+use support::{TestResult, create, entropy};
 
 #[tokio::test]
 async fn success_is_visible_before_reply_and_survives_reopen() -> TestResult {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let id: StreamId = "events/a".parse()?;
-    let engine = Engine::open(Arc::clone(&store), test_entropy()).await?;
+    let engine = Engine::open(Arc::clone(&store), entropy()).await?;
     let partition = engine.partition_id();
     assert_eq!(CreateOutcome::Created, create(&engine, &id).await?,);
     assert!(matches!(engine.stream(&id)?, StreamStatus::Live { .. }));
@@ -26,7 +26,7 @@ async fn success_is_visible_before_reply_and_survives_reopen() -> TestResult {
         "a success reply is released only after its immutable view is installed"
     );
 
-    let reopened = Engine::open(store, test_entropy()).await?;
+    let reopened = Engine::open(store, entropy()).await?;
     assert_eq!(
         partition,
         reopened.partition_id(),
@@ -45,7 +45,7 @@ async fn success_is_visible_before_reply_and_survives_reopen() -> TestResult {
 async fn duplicate_create_is_idempotent_and_survives_reopen() -> TestResult {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let id: StreamId = "events/dup".parse()?;
-    let engine = Engine::open(Arc::clone(&store), test_entropy()).await?;
+    let engine = Engine::open(Arc::clone(&store), entropy()).await?;
     assert_eq!(CreateOutcome::Created, create(&engine, &id).await?);
     assert_eq!(CreateOutcome::AlreadyExists, create(&engine, &id).await?);
     assert!(matches!(engine.stream(&id)?, StreamStatus::Live { .. }));
@@ -55,7 +55,7 @@ async fn duplicate_create_is_idempotent_and_survives_reopen() -> TestResult {
         "an idempotent create does not change the published view"
     );
 
-    let reopened = Engine::open(store, test_entropy()).await?;
+    let reopened = Engine::open(store, entropy()).await?;
     assert!(matches!(reopened.stream(&id)?, StreamStatus::Live { .. }));
     assert_eq!(
         CloseOutcome::Shutdown,
@@ -67,7 +67,7 @@ async fn duplicate_create_is_idempotent_and_survives_reopen() -> TestResult {
 
 #[tokio::test]
 async fn typed_refusal_does_not_change_the_published_view() -> TestResult {
-    let engine = Engine::open(Arc::new(InMemory::new()), test_entropy()).await?;
+    let engine = Engine::open(Arc::new(InMemory::new()), entropy()).await?;
     let missing: StreamId = "events/missing".parse()?;
     assert_eq!(
         Err(StreamError::NotLive),
@@ -81,8 +81,8 @@ async fn typed_refusal_does_not_change_the_published_view() -> TestResult {
 #[tokio::test]
 async fn a_new_engine_revokes_the_previous_writer() -> TestResult {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let previous = Engine::open(Arc::clone(&store), test_entropy()).await?;
-    let current = Engine::open(store, test_entropy()).await?;
+    let previous = Engine::open(Arc::clone(&store), entropy()).await?;
+    let current = Engine::open(store, entropy()).await?;
     let id: StreamId = "events/fenced".parse()?;
 
     assert_eq!(
@@ -93,20 +93,4 @@ async fn a_new_engine_revokes_the_previous_writer() -> TestResult {
     assert_eq!(CloseOutcome::Fenced, previous.shutdown().await);
     assert_eq!(CloseOutcome::Shutdown, current.shutdown().await);
     Ok(())
-}
-
-async fn create(engine: &Engine, id: &StreamId) -> Result<CreateOutcome, StreamError> {
-    engine
-        .create_stream(
-            id,
-            StreamContentType::octet_stream(),
-            ExpiryPolicy::None,
-            StreamLifecycle::Open,
-        )
-        .await
-}
-
-fn test_entropy() -> Entropy {
-    const TEST_SEED: u64 = 42;
-    Entropy::from_seed(Seed::from(TEST_SEED))
 }

@@ -21,6 +21,7 @@ tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 [dev-dependencies]
 proptest = { workspace = true }
 strom-domain = { path = "../strom-domain", version = "0.1.0", features = ["proptest"] }
+strom-object-store = { path = "../strom-object-store", version = "0.1.0", features = ["test-support"] }
 strom-storage-domain = { path = "../strom-storage-domain", version = "0.1.0", features = ["proptest"] }
 
 [lints]
