@@ -1,6 +1,8 @@
 use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::time::Duration;
 
+use futures::TryStreamExt as _;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload};
 use strom_domain::{CreateOutcome, StreamId, StreamStatus};
@@ -9,23 +11,32 @@ use strom_object_store::test_support::{
     BackendFailure, Fault, FaultStore, Gate, Operation, Selection, Target,
 };
 use strom_storage_domain::{
-    BatchId, OwnerToken, Seal, SealGeneration, SortedRun, StoreKind, TableKey, TableRef,
-    TreeVersion, WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WalReplayPoint, encode_seal,
+    BatchId, OwnerToken, Seal, SealKey, SortedRun, StoreKind, TableKey, TableRef, TreeVersion,
+    WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WalReplayPoint, encode_seal,
 };
 use strom_storage_engine::{CloseOutcome, Engine, OpenError};
 
 use super::support::{
-    TestResult, assert_object_absent, assert_object_present, checkpoint_table_key,
-    checkpoint_table_key_at_attempt, create, entropy, seal_key, wal_key,
+    TestResult, assert_object_absent, assert_object_present, checkpoint_table_key_at_attempt,
+    create, entropy, wal_key,
 };
 
 const CHECKPOINT_CUT: u64 = WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER;
+const CHECKPOINT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+struct CheckpointKeys {
+    seal: ObjectKey,
+    directory: ObjectKey,
+    ledger: ObjectKey,
+}
 
 #[tokio::test]
 async fn children_are_durable_before_the_seal_is_published() -> TestResult {
-    let seal = seal_key(3);
-    let directory = checkpoint_table_key(StoreKind::Directory, 0);
-    let ledger = checkpoint_table_key(StoreKind::Ledger, 1);
+    let keys = observe_checkpoint_keys().await?;
+    let seal = keys.seal;
+    let directory = keys.directory;
+    let ledger = keys.ledger;
     let gate = Gate::new();
     let store =
         FaultStore::new().gate(Selection::create(Target::Key(seal.clone())), gate.clone())?;
@@ -39,7 +50,11 @@ async fn children_are_durable_before_the_seal_is_published() -> TestResult {
     assert_object_absent(&backend, &seal).await?;
 
     gate.release();
-    assert_eq!(CloseOutcome::Shutdown, engine.shutdown().await);
+    assert_eq!(
+        CloseOutcome::Shutdown,
+        engine.shutdown().await,
+        "shutdown completes after the held Seal publication is released"
+    );
     assert_reopens_with_streams(backend, &streams).await?;
     store.assert_called_once(Operation::Create, &directory)?;
     store.assert_called_once(Operation::Create, &ledger)?;
@@ -50,8 +65,9 @@ async fn children_are_durable_before_the_seal_is_published() -> TestResult {
 
 #[tokio::test]
 async fn applied_child_with_a_lost_reply_reconciles_and_publishes() -> TestResult {
-    let directory = checkpoint_table_key(StoreKind::Directory, 0);
-    let seal = seal_key(3);
+    let keys = observe_checkpoint_keys().await?;
+    let directory = keys.directory;
+    let seal = keys.seal;
     let gate = Gate::new();
     let store = FaultStore::new()
         .inject(Fault::CreateThenLoseResponse {
@@ -66,7 +82,11 @@ async fn applied_child_with_a_lost_reply_reconciles_and_publishes() -> TestResul
     store.assert_called_once(Operation::Create, &directory)?;
     store.assert_called_once(Operation::Read, &directory)?;
     gate.release();
-    assert_eq!(CloseOutcome::Shutdown, engine.shutdown().await);
+    assert_eq!(
+        CloseOutcome::Shutdown,
+        engine.shutdown().await,
+        "shutdown completes after the held Seal publication is released"
+    );
     assert_object_present(&backend, &directory).await?;
     assert_object_present(&backend, &seal).await?;
     assert_reopens_with_streams(backend, &streams).await?;
@@ -76,9 +96,10 @@ async fn applied_child_with_a_lost_reply_reconciles_and_publishes() -> TestResul
 
 #[tokio::test]
 async fn absent_child_reconciliation_abandons_and_reopens_from_wal() -> TestResult {
-    let directory = checkpoint_table_key(StoreKind::Directory, 0);
-    let retry_directory = checkpoint_table_key_at_attempt(StoreKind::Directory, 1, 0);
-    let seal = seal_key(3);
+    let keys = observe_checkpoint_keys().await?;
+    let directory = keys.directory;
+    let retry_directory = checkpoint_table_key_at_attempt(&directory, 1);
+    let seal = keys.seal;
     let reconciliation = Gate::new();
     let retry = Gate::new();
     let store = FaultStore::new()
@@ -113,9 +134,10 @@ async fn absent_child_reconciliation_abandons_and_reopens_from_wal() -> TestResu
 
 #[tokio::test]
 async fn failed_child_reconciliation_abandons_and_reopens_from_wal() -> TestResult {
-    let directory = checkpoint_table_key(StoreKind::Directory, 0);
-    let retry_directory = checkpoint_table_key_at_attempt(StoreKind::Directory, 1, 0);
-    let seal = seal_key(3);
+    let keys = observe_checkpoint_keys().await?;
+    let directory = keys.directory;
+    let retry_directory = checkpoint_table_key_at_attempt(&directory, 1);
+    let seal = keys.seal;
     let reconciliation = Gate::new();
     let retry = Gate::new();
     let store = FaultStore::new()
@@ -153,8 +175,9 @@ async fn failed_child_reconciliation_abandons_and_reopens_from_wal() -> TestResu
 
 #[tokio::test]
 async fn foreign_child_reconciliation_is_a_contradiction_but_remains_unpublished() -> TestResult {
-    let directory = checkpoint_table_key(StoreKind::Directory, 0);
-    let seal = seal_key(3);
+    let keys = observe_checkpoint_keys().await?;
+    let directory = keys.directory;
+    let seal = keys.seal;
     let gate = Gate::new();
     let store = FaultStore::new()
         .inject(Fault::FailBefore {
@@ -184,9 +207,10 @@ async fn foreign_child_reconciliation_is_a_contradiction_but_remains_unpublished
 
 #[tokio::test]
 async fn shutdown_cancels_before_publication_and_leaves_only_ignored_child_garbage() -> TestResult {
-    let directory = checkpoint_table_key(StoreKind::Directory, 0);
-    let ledger = checkpoint_table_key(StoreKind::Ledger, 1);
-    let seal = seal_key(3);
+    let keys = observe_checkpoint_keys().await?;
+    let directory = keys.directory;
+    let ledger = keys.ledger;
+    let seal = keys.seal;
     let gate = Gate::new();
     let store =
         FaultStore::new().gate(Selection::create(Target::Key(ledger.clone())), gate.clone())?;
@@ -210,7 +234,7 @@ async fn shutdown_cancels_before_publication_and_leaves_only_ignored_child_garba
 
 #[tokio::test]
 async fn seal_failure_before_apply_poisoned_but_reopens_from_wal() -> TestResult {
-    let seal = seal_key(3);
+    let seal = observe_checkpoint_keys().await?.seal;
     let gate = Gate::new();
     let store = FaultStore::new()
         .inject(Fault::FailBefore {
@@ -236,7 +260,7 @@ async fn seal_failure_before_apply_poisoned_but_reopens_from_wal() -> TestResult
 
 #[tokio::test]
 async fn applied_seal_with_a_lost_reply_poisoned_but_reopens_from_the_checkpoint() -> TestResult {
-    let seal = seal_key(3);
+    let seal = observe_checkpoint_keys().await?.seal;
     let gate = Gate::new();
     let store = FaultStore::new()
         .inject(Fault::CreateThenLoseResponse {
@@ -262,7 +286,8 @@ async fn applied_seal_with_a_lost_reply_poisoned_but_reopens_from_the_checkpoint
 
 #[tokio::test]
 async fn matching_seal_occupant_fences_but_is_authoritative_on_reopen() -> TestResult {
-    let seal = seal_key(3);
+    let keys = observe_checkpoint_keys().await?;
+    let seal = keys.seal.clone();
     let gate = Gate::new();
     let store =
         FaultStore::new().gate(Selection::create(Target::Key(seal.clone())), gate.clone())?;
@@ -272,7 +297,7 @@ async fn matching_seal_occupant_fences_but_is_authoritative_on_reopen() -> TestR
     let streams = drive_checkpoint(&engine).await?;
 
     gate.wait_until_blocked().await;
-    let candidate = checkpoint_seal(&backend, partition).await?;
+    let candidate = checkpoint_seal(&backend, partition, &keys).await?;
     backend
         .put(
             &Path::from(seal.as_str()),
@@ -291,7 +316,7 @@ async fn matching_seal_occupant_fences_but_is_authoritative_on_reopen() -> TestR
 
 #[tokio::test]
 async fn foreign_seal_occupant_fences_and_is_a_contradiction_on_reopen() -> TestResult {
-    let seal = seal_key(3);
+    let seal = observe_checkpoint_keys().await?.seal;
     let gate = Gate::new();
     let store =
         FaultStore::new().gate(Selection::create(Target::Key(seal.clone())), gate.clone())?;
@@ -347,6 +372,67 @@ async fn advancing_publication_starts_leak_only_collection_without_poisoning_the
     Ok(())
 }
 
+async fn observe_checkpoint_keys() -> Result<CheckpointKeys, Box<dyn std::error::Error>> {
+    let store = FaultStore::new();
+    let backend = store.backend();
+    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    drive_checkpoint(&engine).await?;
+
+    let (directory, ledger) = tokio::time::timeout(CHECKPOINT_OBSERVATION_TIMEOUT, async {
+        loop {
+            let mut directory = None;
+            let mut ledger = None;
+            let mut listing = backend.list(None);
+            while let Some(metadata) = listing.try_next().await? {
+                let Ok(key) = metadata.location.as_ref().parse::<ObjectKey>() else {
+                    continue;
+                };
+                let Ok(table) = key.as_str().parse::<TableKey>() else {
+                    continue;
+                };
+                match table.object().store() {
+                    StoreKind::Directory => directory = Some(key),
+                    StoreKind::Ledger => ledger = Some(key),
+                    StoreKind::Tally | StoreKind::Annals => {}
+                }
+            }
+            if let (Some(directory), Some(ledger)) = (directory, ledger) {
+                return Ok::<_, object_store::Error>((directory, ledger));
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+
+    assert_eq!(
+        CloseOutcome::Shutdown,
+        engine.shutdown().await,
+        "the observation run remains healthy after producing checkpoint children"
+    );
+    let directory_table: TableKey = directory.as_str().parse()?;
+    let ledger_table: TableKey = ledger.as_str().parse()?;
+    let directory_fresh = directory_table.object().fresh();
+    let ledger_fresh = ledger_table.object().fresh();
+    assert_eq!(
+        directory_fresh.birth_generation(),
+        ledger_fresh.birth_generation(),
+        "one checkpoint gives every child the same birth generation"
+    );
+    assert_eq!(
+        directory_fresh.attempt(),
+        ledger_fresh.attempt(),
+        "one checkpoint gives every child the same attempt identity"
+    );
+    let seal = SealKey::from(directory_fresh.birth_generation())
+        .to_string()
+        .parse()?;
+    Ok(CheckpointKeys {
+        seal,
+        directory,
+        ledger,
+    })
+}
+
 async fn drive_checkpoint(engine: &Engine) -> Result<Vec<StreamId>, Box<dyn std::error::Error>> {
     let mut streams = Vec::new();
     for ordinal in 0..WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER {
@@ -383,17 +469,20 @@ async fn assert_reopens_with_streams(
 async fn checkpoint_seal(
     backend: &Arc<dyn ObjectStore>,
     partition: strom_storage_domain::PartitionId,
+    keys: &CheckpointKeys,
 ) -> Result<Seal, Box<dyn std::error::Error>> {
-    let directory = table_ref(backend, StoreKind::Directory, 0).await?;
-    let ledger = table_ref(backend, StoreKind::Ledger, 1).await?;
+    let directory = table_ref(backend, &keys.directory).await?;
+    let ledger = table_ref(backend, &keys.ledger).await?;
     let directory = TreeVersion::try_from(vec![SortedRun::try_from(vec![directory])?])?;
     let ledger = TreeVersion::try_from(vec![SortedRun::try_from(vec![ledger])?])?;
+    let checkpoint: TableKey = keys.directory.as_str().parse()?;
+    let fresh = checkpoint.object().fresh();
     Ok(Seal::new(
         partition,
-        SealGeneration::try_from(3)?,
+        fresh.birth_generation(),
         WalReplayPoint::Through {
             batch: BatchId::try_from(CHECKPOINT_CUT)?,
-            owner: OwnerToken::from(SealGeneration::try_from(2)?),
+            owner: OwnerToken::from(fresh.attempt().owner_claim()),
         },
         directory,
         ledger,
@@ -402,10 +491,8 @@ async fn checkpoint_seal(
 
 async fn table_ref(
     backend: &Arc<dyn ObjectStore>,
-    store: StoreKind,
-    ordinal: u32,
+    key: &ObjectKey,
 ) -> Result<TableRef, Box<dyn std::error::Error>> {
-    let key = checkpoint_table_key(store, ordinal);
     let metadata = backend.head(&Path::from(key.as_str())).await?;
     let bytes = NonZeroU64::new(metadata.size).ok_or("a checkpoint table is nonempty")?;
     let key: TableKey = key.as_str().parse()?;
