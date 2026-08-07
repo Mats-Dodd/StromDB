@@ -1268,4 +1268,21 @@ fn pending_facts(facts: Vec<OperationFact>) -> WalFacts {
 }
 
 #[cfg(test)]
-mod machine_tests;
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suffix_room_reserves_one_takeover_coordinate() -> Result<(), Box<dyn std::error::Error>> {
+        let last_genesis_run = BatchId::try_from(WAL_SUFFIX_COORDINATES_MAX_V2 - 1)?;
+        assert!(decide_suffix_room(None, last_genesis_run));
+        assert!(!decide_suffix_room(None, last_genesis_run.successor()?));
+
+        let cut = BatchId::try_from(u64::MAX - 2)?;
+        assert!(decide_suffix_room(
+            Some(cut),
+            BatchId::try_from(u64::MAX - 1)?
+        ));
+        assert!(!decide_suffix_room(Some(cut), BatchId::try_from(u64::MAX)?));
+        Ok(())
+    }
+}

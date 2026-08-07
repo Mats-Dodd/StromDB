@@ -3,8 +3,7 @@
 use proptest::prelude::*;
 use strom_domain::{ExpiryPolicy, StreamContentType, StreamId, StreamLifecycle};
 use strom_storage_domain::{BatchId, DirectoryEntry, DirectoryKey, OperationFact, StreamUid};
-
-use super::{Applied, FoldContradiction, Forest};
+use strom_storage_protocol::{Applied, FoldContradiction, Forest};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -28,10 +27,7 @@ proptest! {
             prop_assert_eq!(forest.resolve(&path), Some(DirectoryEntry::Live(uid)));
             prop_assert!(forest.record(uid).is_some());
         }
-        prop_assert_eq!(
-            forest.path_count(),
-            u64::try_from(count).expect("test count fits in u64")
-        );
+        prop_assert_eq!(forest.directory_rows().len(), count);
     }
 }
 
@@ -83,7 +79,7 @@ fn create_close_delete_follows_the_fact_effects() -> TestResult {
         "delete leaves permanent path occupancy"
     );
     assert_eq!(None, forest.record(uid));
-    assert_eq!(1, forest.path_count());
+    assert_eq!(1, forest.directory_rows().len());
 
     let path_b = directory_key("events/b")?;
     let uid_2 = StreamUid::try_from(2)?;
@@ -176,7 +172,7 @@ fn every_rejected_fact_leaves_the_forest_unchanged() -> TestResult {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Observation {
-    path_count: u64,
+    path_count: usize,
     paths: Vec<Option<DirectoryEntry>>,
     records: Vec<bool>,
 }
@@ -185,7 +181,7 @@ fn directory_key(raw: &str) -> Result<DirectoryKey, Box<dyn std::error::Error>> 
     Ok(DirectoryKey::from(&raw.parse::<StreamId>()?))
 }
 
-fn create(path: DirectoryKey, uid: StreamUid) -> OperationFact {
+const fn create(path: DirectoryKey, uid: StreamUid) -> OperationFact {
     OperationFact::StreamCreated {
         path,
         uid,
@@ -197,7 +193,7 @@ fn create(path: DirectoryKey, uid: StreamUid) -> OperationFact {
 
 fn observe(forest: &Forest, paths: [&DirectoryKey; 3], uids: [StreamUid; 3]) -> Observation {
     Observation {
-        path_count: forest.path_count(),
+        path_count: forest.directory_rows().len(),
         paths: paths.into_iter().map(|path| forest.resolve(path)).collect(),
         records: uids
             .into_iter()
