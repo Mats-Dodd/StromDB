@@ -356,11 +356,7 @@ pub enum WriterExit {
 
 /// Proof that bootstrap directly authored the live claim Seal.
 #[derive(Debug)]
-#[expect(
-    missing_copy_implementations,
-    reason = "the authority witness is deliberately linear even though its representation is Copy"
-)]
-pub struct AuthoredClaim {
+pub(crate) struct AuthoredClaim {
     generation: SealGeneration,
     owner: OwnerToken,
 }
@@ -402,12 +398,12 @@ impl AuthoredClaim {
     }
 
     #[must_use]
-    pub const fn generation(&self) -> SealGeneration {
+    pub(crate) const fn generation(&self) -> SealGeneration {
         self.generation
     }
 
     #[must_use]
-    pub const fn owner(&self) -> OwnerToken {
+    pub(crate) const fn owner(&self) -> OwnerToken {
         self.owner
     }
 }
@@ -511,11 +507,6 @@ impl WriterMachine {
     #[must_use]
     pub const fn partition(&self) -> PartitionId {
         self.seal.partition()
-    }
-
-    #[must_use]
-    pub const fn durable_forest(&self) -> &Forest {
-        &self.durable
     }
 
     /// Apply one observation and return all ordered work it causes.

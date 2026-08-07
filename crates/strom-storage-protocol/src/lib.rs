@@ -11,8 +11,8 @@ pub use bootstrap::{
 pub use forest::{Applied, FoldContradiction, Forest, ForestContradiction, ForestDelta};
 pub use outcome::{GenesisEstablishment, SealPublication, TypedStoreError, WalEstablishment};
 pub use writer::{
-    AdmissionRefusal, AuthoredClaim, CheckpointInput, CheckpointTicket, CollectionInput,
-    CommandEnvelope, Completion, CreateStream, EffectKey, PreparationOutcome, PreparedCheckpoint,
+    AdmissionRefusal, CheckpointInput, CheckpointTicket, CollectionInput, CommandEnvelope,
+    Completion, CreateStream, EffectKey, PreparationOutcome, PreparedCheckpoint,
     WRITER_OUTPUTS_PER_STEP_MAX, WriterAction, WriterEffect, WriterEvent, WriterExit,
     WriterMachine, WriterOutput, WriterRecovery, WriterStep,
 };

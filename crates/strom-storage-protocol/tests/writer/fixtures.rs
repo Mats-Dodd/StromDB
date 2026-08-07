@@ -305,6 +305,16 @@ pub(super) fn has_publish_then_replies(step: WriterStep) -> bool {
         )
 }
 
+pub(super) fn published_view(outputs: &[WriterOutput]) -> Option<&Forest> {
+    outputs.iter().find_map(|output| match output {
+        WriterOutput::Action(WriterAction::PublishView(view)) => Some(view),
+        WriterOutput::Effect(_)
+        | WriterOutput::Action(
+            WriterAction::SendReplies(_) | WriterAction::CancelCheckpointPreparation { .. },
+        ) => None,
+    })
+}
+
 pub(super) fn collection_cut(step: WriterStep) -> TestResult<BatchId> {
     let (outputs, exit) = step.into_parts();
     assert_eq!(None, exit, "collection request step remains live");
@@ -328,6 +338,22 @@ pub(super) fn execute_actions(step: WriterStep) {
     assert!(
         execute_outputs(outputs).is_empty(),
         "the scripted step contains immediate actions only"
+    );
+}
+
+pub(super) fn execute_replies(step: WriterStep) {
+    let (outputs, exit) = step.into_parts();
+    assert_eq!(None, exit, "the immediate reply step remains live");
+    assert!(
+        !outputs.is_empty()
+            && outputs
+                .iter()
+                .all(|output| matches!(output, WriterOutput::Action(WriterAction::SendReplies(_)))),
+        "the scripted step emits replies without publishing or starting effects"
+    );
+    assert!(
+        execute_outputs(outputs).is_empty(),
+        "the scripted reply step contains no effects"
     );
 }
 

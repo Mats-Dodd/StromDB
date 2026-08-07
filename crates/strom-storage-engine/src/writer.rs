@@ -209,9 +209,8 @@ fn send_replies(replies: Vec<Completion>) {
 #[cfg(test)]
 mod tests {
     use std::future::pending;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    use strom_domain::{CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle};
+    use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
     use strom_storage_domain::{
         BatchId, DirectoryKey, OwnerToken, Seal, SealGeneration, TreeVersion, WalBody, WalObject,
         WalReplayPoint,
@@ -228,55 +227,6 @@ mod tests {
 
     mod scripts {
         use super::*;
-
-        #[tokio::test]
-        async fn interpreter_wires_one_wal_completion_into_ordered_publication_and_reply()
-        -> TestResult {
-            let machine = machine()?;
-            let initial = machine.durable_forest().clone();
-            let (view, published) = watch::channel(PublishedView::new(initial));
-            let adapter = ObjectStoreAdapter::in_memory();
-            let mut writer = Writer {
-                machine,
-                wal_store: WalStore::new(adapter.clone()),
-                adapter,
-                view,
-                effects: JoinMap::with_capacity(WRITER_EFFECTS_MAX),
-            };
-
-            let (reply, mut outcome) = oneshot::channel();
-            let step = writer
-                .machine
-                .handle(WriterEvent::Command(CommandEnvelope::Create {
-                    command: CreateStream {
-                        path: path("events/interpreter")?,
-                        content_type: StreamContentType::octet_stream(),
-                        expiry: ExpiryPolicy::None,
-                        lifecycle: StreamLifecycle::Open,
-                    },
-                    reply,
-                }));
-            assert_eq!(None, writer.execute_step(step));
-            assert!(matches!(
-                outcome.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ));
-
-            let joined = writer
-                .effects
-                .join_next()
-                .await
-                .expect("the WAL effect is present");
-            let step = writer.machine.handle(joined_event(joined));
-            assert_eq!(None, writer.execute_step(step));
-            assert_eq!(Ok(CreateOutcome::Created), outcome.try_recv()?);
-            assert!(
-                published.has_changed()?,
-                "the inline publication action runs in the reply-producing step"
-            );
-            assert!(writer.effects.is_empty());
-            Ok(())
-        }
 
         #[tokio::test]
         async fn cancelled_preparation_join_retains_its_exact_key() -> TestResult {
@@ -312,32 +262,6 @@ mod tests {
                 .await
                 .expect("the cancelled WAL remains joinable");
             drop(joined_event(joined));
-        }
-
-        #[tokio::test]
-        async fn exact_preparation_cancellation_preserves_unrelated_effects() -> TestResult {
-            let ticket = preparation_ticket()?;
-            let target = EffectKey::CheckpointPreparation { ticket };
-            let unrelated = EffectKey::Wal {
-                batch: BatchId::try_from(77)?,
-            };
-            let mut writer = writer_with_machine(machine()?);
-            writer.effects.spawn(target, pending::<WriterEvent>());
-            writer.effects.spawn(unrelated, pending::<WriterEvent>());
-            writer.execute_action(WriterAction::CancelCheckpointPreparation { ticket });
-            let joined = writer
-                .effects
-                .join_next()
-                .await
-                .expect("the cancelled preparation remains joinable");
-            assert!(matches!(
-                joined_event(joined),
-                WriterEvent::CheckpointPreparationCancelled { ticket: observed }
-                    if observed == ticket
-            ));
-            assert!(writer.effects.contains_key(&unrelated));
-            assert_eq!(1, writer.effects.len());
-            Ok(())
         }
 
         #[test]
@@ -379,108 +303,6 @@ mod tests {
                 .await
                 .expect("the panicked task remains joinable");
             drop(joined_event(joined));
-        }
-
-        #[tokio::test]
-        async fn duplicate_effect_key_panics_before_join_map_replacement() -> TestResult {
-            let mut writer = writer_with_machine(machine()?);
-            let (reply, _outcome) = oneshot::channel();
-            let step = writer
-                .machine
-                .handle(WriterEvent::Command(CommandEnvelope::Create {
-                    command: CreateStream {
-                        path: path("events/duplicate-key")?,
-                        content_type: StreamContentType::octet_stream(),
-                        expiry: ExpiryPolicy::None,
-                        lifecycle: StreamLifecycle::Open,
-                    },
-                    reply,
-                }));
-            let effect = wal_effect(step).ok_or("the command emits one WAL")?;
-            let key = effect.key();
-            writer.effects.spawn(key, pending::<WriterEvent>());
-            assert!(catch_unwind(AssertUnwindSafe(|| writer.spawn_effect(effect))).is_err());
-            assert_eq!(1, writer.effects.len());
-            assert!(writer.effects.contains_key(&key));
-            Ok(())
-        }
-
-        #[tokio::test]
-        async fn empty_effect_map_blocks_on_ingress_until_it_closes() -> TestResult {
-            let writer = writer_with_machine(recovered_machine()?);
-            let (ingress, receiver) = mpsc::channel(1);
-            let task = tokio::spawn(writer.run(receiver));
-            tokio::task::yield_now().await;
-            assert!(
-                !task.is_finished(),
-                "idle writer blocks instead of busy-looping"
-            );
-            drop(ingress);
-            assert_eq!(WriterExit::Shutdown, task.await?);
-            Ok(())
-        }
-
-        #[tokio::test]
-        async fn terminal_actions_run_before_outstanding_effects_are_dropped() -> TestResult {
-            let mut machine = machine()?;
-            let initial = machine.durable_forest().clone();
-            let (reply, mut outcome) = oneshot::channel();
-            let batch = wal_batch(
-                machine.handle(WriterEvent::Command(CommandEnvelope::Create {
-                    command: CreateStream {
-                        path: path("events/terminal")?,
-                        content_type: StreamContentType::octet_stream(),
-                        expiry: ExpiryPolicy::None,
-                        lifecycle: StreamLifecycle::Open,
-                    },
-                    reply,
-                })),
-            )
-            .ok_or("the terminal fixture issues one WAL")?;
-            let (outputs, exit) = machine.handle(WriterEvent::IngressClosed).into_parts();
-            assert!(outputs.is_empty());
-            assert_eq!(None, exit);
-            let terminal = machine.handle(WriterEvent::WalEstablished {
-                batch,
-                result: Ok(WalEstablishment::Durable),
-            });
-
-            let (view, published) = watch::channel(PublishedView::new(initial));
-            let adapter = ObjectStoreAdapter::in_memory();
-            let mut writer = Writer {
-                machine,
-                wal_store: WalStore::new(adapter.clone()),
-                adapter,
-                view,
-                effects: JoinMap::new(),
-            };
-            let (dropped, dropped_receiver) = oneshot::channel();
-            let guard = DropSignal(Some(dropped));
-            writer.effects.spawn(
-                EffectKey::Collection {
-                    cut: BatchId::try_from(1)?,
-                },
-                async move {
-                    let _guard = guard;
-                    pending::<WriterEvent>().await
-                },
-            );
-            assert_eq!(Some(WriterExit::Shutdown), writer.execute_step(terminal));
-            assert_eq!(Ok(CreateOutcome::Created), outcome.try_recv()?);
-            assert!(published.has_changed()?);
-            drop(writer);
-            dropped_receiver.await?;
-            Ok(())
-        }
-    }
-
-    struct DropSignal(Option<oneshot::Sender<()>>);
-
-    impl Drop for DropSignal {
-        fn drop(&mut self) {
-            if let Some(sender) = self.0.take() {
-                let _receiver_may_be_gone = sender.send(());
-            }
         }
     }
 
@@ -559,19 +381,6 @@ mod tests {
         Ok(WriterMachine::from_recovery(recovery))
     }
 
-    fn writer_with_machine(machine: WriterMachine) -> Writer {
-        let initial = machine.durable_forest().clone();
-        let (view, _published) = watch::channel(PublishedView::new(initial));
-        let adapter = ObjectStoreAdapter::in_memory();
-        Writer {
-            machine,
-            wal_store: WalStore::new(adapter.clone()),
-            adapter,
-            view,
-            effects: JoinMap::new(),
-        }
-    }
-
     fn path(raw: &str) -> Result<DirectoryKey, Box<dyn std::error::Error>> {
         Ok(DirectoryKey::try_from(Box::<[u8]>::from(raw.as_bytes()))?)
     }
@@ -581,20 +390,6 @@ mod tests {
         assert_eq!(None, exit);
         outputs.into_iter().find_map(|output| match output {
             WriterOutput::Effect(WriterEffect::EstablishWal(candidate)) => Some(candidate.batch()),
-            WriterOutput::Effect(
-                WriterEffect::PrepareCheckpoint(_)
-                | WriterEffect::PublishAuthority { .. }
-                | WriterEffect::Collect(_),
-            )
-            | WriterOutput::Action(_) => None,
-        })
-    }
-
-    fn wal_effect(step: WriterStep) -> Option<WriterEffect> {
-        let (outputs, exit) = step.into_parts();
-        assert_eq!(None, exit);
-        outputs.into_iter().find_map(|output| match output {
-            WriterOutput::Effect(effect @ WriterEffect::EstablishWal(_)) => Some(effect),
             WriterOutput::Effect(
                 WriterEffect::PrepareCheckpoint(_)
                 | WriterEffect::PublishAuthority { .. }

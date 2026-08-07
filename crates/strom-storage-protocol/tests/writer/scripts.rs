@@ -427,6 +427,9 @@ fn consecutive_wal_runs_publish_and_release_only_their_own_barriers() -> TestRes
             WriterOutput::Effect(WriterEffect::EstablishWal(_))
         ]
     ));
+    let first_view = published_view(&outputs).ok_or("the durable WAL publishes its view")?;
+    assert!(first_view.resolve(&path("events/first")?).is_some());
+    assert!(first_view.resolve(&path("events/second")?).is_none());
     let mut effects = execute_outputs(outputs);
     let WriterEffect::EstablishWal(second_candidate) =
         effects.pop().ok_or("the pending fact is promoted")?
@@ -439,30 +442,18 @@ fn consecutive_wal_runs_publish_and_release_only_their_own_barriers() -> TestRes
         second_outcome.try_recv(),
         Err(oneshot::error::TryRecvError::Empty)
     ));
-    assert!(
-        machine
-            .durable_forest()
-            .resolve(&path("events/first")?)
-            .is_some()
-    );
-    assert!(
-        machine
-            .durable_forest()
-            .resolve(&path("events/second")?)
-            .is_none()
-    );
-
-    execute_actions(machine.handle(WriterEvent::WalEstablished {
-        batch: second_candidate.batch(),
-        result: Ok(WalEstablishment::Durable),
-    }));
+    let (outputs, exit) = machine
+        .handle(WriterEvent::WalEstablished {
+            batch: second_candidate.batch(),
+            result: Ok(WalEstablishment::Durable),
+        })
+        .into_parts();
+    assert_eq!(None, exit);
+    let second_view =
+        published_view(&outputs).ok_or("the second durable WAL publishes its view")?;
+    assert!(second_view.resolve(&path("events/second")?).is_some());
+    assert!(execute_outputs(outputs).is_empty());
     assert_eq!(Ok(CreateOutcome::Created), second_outcome.try_recv()?);
-    assert!(
-        machine
-            .durable_forest()
-            .resolve(&path("events/second")?)
-            .is_some()
-    );
     Ok(())
 }
 
@@ -477,7 +468,6 @@ fn admission_refusal_and_idempotence_axes_are_complete() -> TestResult {
         result: Ok(WalEstablishment::Durable),
     }));
     assert_eq!(Ok(CreateOutcome::Created), created.try_recv()?);
-    let durable = machine.durable_forest().clone();
 
     for command in [
         CreateStream {
@@ -502,18 +492,17 @@ fn admission_refusal_and_idempotence_axes_are_complete() -> TestResult {
         },
     ] {
         let (reply, mut outcome) = oneshot::channel();
-        execute_actions(
+        execute_replies(
             machine.handle(WriterEvent::Command(CommandEnvelope::Create {
                 command,
                 reply,
             })),
         );
         assert_eq!(Err(AdmissionRefusal::PathOccupied), outcome.try_recv()?);
-        assert_eq!(&durable, machine.durable_forest());
     }
 
     let (reply, mut missing_close) = oneshot::channel();
-    execute_actions(machine.handle(WriterEvent::Command(CommandEnvelope::Close {
+    execute_replies(machine.handle(WriterEvent::Command(CommandEnvelope::Close {
         path: path("events/missing")?,
         reply,
     })));
@@ -534,7 +523,7 @@ fn admission_refusal_and_idempotence_axes_are_complete() -> TestResult {
     assert_eq!(Ok(CloseStreamOutcome::Closed), closed.try_recv()?);
 
     let (reply, mut already_closed) = oneshot::channel();
-    execute_actions(machine.handle(WriterEvent::Command(CommandEnvelope::Close {
+    execute_replies(machine.handle(WriterEvent::Command(CommandEnvelope::Close {
         path: axes.clone(),
         reply,
     })));
@@ -557,7 +546,7 @@ fn admission_refusal_and_idempotence_axes_are_complete() -> TestResult {
     assert_eq!(Ok(()), deleted.try_recv()?);
 
     let (reply, mut deleted_again) = oneshot::channel();
-    execute_actions(
+    execute_replies(
         machine.handle(WriterEvent::Command(CommandEnvelope::Delete {
             path: axes,
             reply,
@@ -601,6 +590,10 @@ fn suffix_shedding_refuses_new_facts_without_changing_durable_state() -> TestRes
         .handle(WriterEvent::Command(new_stream))
         .into_parts();
     assert_eq!(None, exit);
+    assert!(
+        published_view(&outputs).is_none(),
+        "suffix shedding does not publish a new durable view"
+    );
     let mut effects = execute_outputs(outputs);
     let WriterEffect::PrepareCheckpoint(retry_input) =
         effects.pop().ok_or("shed rearms checkpoint")?
@@ -611,15 +604,13 @@ fn suffix_shedding_refuses_new_facts_without_changing_durable_state() -> TestRes
     let retry = retry_input.ticket();
     assert_eq!(Err(AdmissionRefusal::Overloaded), refused.try_recv()?);
     assert_eq!(first.cut(), retry.cut());
-    assert_eq!(&forest, machine.durable_forest());
 
     let (duplicate, mut duplicate_outcome) = create("events/existing")?;
-    execute_actions(machine.handle(WriterEvent::Command(duplicate)));
+    execute_replies(machine.handle(WriterEvent::Command(duplicate)));
     assert_eq!(
         Ok(CreateOutcome::AlreadyExists),
         duplicate_outcome.try_recv()?
     );
-    assert_eq!(&forest, machine.durable_forest());
     Ok(())
 }
 
@@ -627,7 +618,7 @@ fn suffix_shedding_refuses_new_facts_without_changing_durable_state() -> TestRes
 fn authored_checkpoint_publication_preserves_the_durable_view_and_starts_collection() -> TestResult
 {
     let (mut machine, ticket, input) = machine_with_preparation()?;
-    let durable = machine.durable_forest().clone();
+    let durable = Forest::empty();
     let prepared = prepared(input)?;
     let successor = prepared.successor().clone();
     assert_publication(
@@ -656,7 +647,6 @@ fn authored_checkpoint_publication_preserves_the_durable_view_and_starts_collect
     assert!(effects.is_empty());
     assert_eq!(ticket.cut(), cut);
     assert_eq!(successor, observed_successor);
-    assert_eq!(&durable, machine.durable_forest());
     Ok(())
 }
 

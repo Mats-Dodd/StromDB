@@ -11,9 +11,10 @@ use strom_storage_domain::{
     StreamUid, TableRef, WAL_SUFFIX_COORDINATES_MAX_V2, WalBody, WalObject, WalReplayPoint,
 };
 
+use crate::writer::AuthoredClaim;
 use crate::{
-    AuthoredClaim, Forest, ForestContradiction, GenesisEstablishment, SealPublication,
-    TypedStoreError, WalEstablishment, WriterRecovery,
+    Forest, ForestContradiction, GenesisEstablishment, SealPublication, TypedStoreError,
+    WalEstablishment, WriterRecovery,
 };
 
 /// Why a partition did not become ready.
