@@ -887,10 +887,9 @@ mod tests {
     use std::num::NonZeroU64;
 
     use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
-    use strom_object_store::{FrozenBytes, ObjectKey};
     use strom_storage_domain::{
-        AttemptId, FreshIdentity, LedgerCell, SortedRun, StoreKind, StreamRecord, TableKey,
-        TableObjectId, TreeVersion, encode_directory_sst, encode_ledger_sst,
+        AttemptId, FreshIdentity, LedgerCell, SortedRun, StoreKind, StreamRecord, TableObjectId,
+        TreeVersion,
     };
 
     use super::*;
@@ -978,8 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_table_merge_applies_newest_delete_and_rejects_run_overlap()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn pure_table_merge_rejects_run_overlap() -> Result<(), Box<dyn std::error::Error>> {
         let uid = StreamUid::try_from(1)?;
         let mut merged = MergedRows::default();
         let last = merge_ledger_table(
@@ -995,8 +993,6 @@ mod tests {
             ),
             Err(BootstrapExit::Contradiction { .. })
         ));
-        merge_ledger_table(&mut merged, None, vec![(uid, LedgerCell::Delete)])?;
-        assert_eq!(None, merged.ledger.get(&uid));
         Ok(())
     }
 
@@ -1041,131 +1037,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn nonempty_tables_merge_oldest_to_newest_before_suffix_replay()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let adapter = ObjectStoreAdapter::in_memory();
-        let partition = partition();
-        let generation_1 = SealGeneration::genesis();
-        let generation_2 = generation_1.successor()?;
-        let path = DirectoryKey::try_from(Box::<[u8]>::from(b"events/base".as_slice()))?;
-        let deleted_path = DirectoryKey::try_from(Box::<[u8]>::from(b"events/deleted".as_slice()))?;
-        let uid = StreamUid::try_from(1)?;
-        let deleted_uid = StreamUid::try_from(2)?;
-        let created_at = BatchId::try_from(1)?;
-
-        let directory_key = table_key(generation_2, StoreKind::Directory, 0)?;
-        let directory_bytes = encode_directory_sst(
-            partition,
-            &directory_key,
-            &[
-                (
-                    path.clone(),
-                    strom_storage_domain::DirectoryEntry::Live(uid),
-                ),
-                (
-                    deleted_path.clone(),
-                    strom_storage_domain::DirectoryEntry::Tombstone(deleted_uid),
-                ),
-            ],
-        )?;
-        let directory_ref = plant_table(&adapter, directory_key, directory_bytes).await?;
-
-        let older_key = table_key(generation_2, StoreKind::Ledger, 1)?;
-        let older_bytes = encode_ledger_sst(
-            partition,
-            &older_key,
-            &[
-                (
-                    uid,
-                    LedgerCell::Value(StreamRecord::new(
-                        StreamContentType::octet_stream(),
-                        ExpiryPolicy::None,
-                        StreamLifecycle::Open,
-                        created_at,
-                    )),
-                ),
-                (
-                    deleted_uid,
-                    LedgerCell::Value(StreamRecord::new(
-                        StreamContentType::octet_stream(),
-                        ExpiryPolicy::None,
-                        StreamLifecycle::Open,
-                        created_at,
-                    )),
-                ),
-            ],
-        )?;
-        let older_ref = plant_table(&adapter, older_key, older_bytes).await?;
-
-        let newer_key = table_key(generation_2, StoreKind::Ledger, 2)?;
-        let newer_record = StreamRecord::new(
-            "application/json".parse()?,
-            ExpiryPolicy::None,
-            StreamLifecycle::Closed,
-            created_at,
-        );
-        let newer_bytes = encode_ledger_sst(
-            partition,
-            &newer_key,
-            &[
-                (uid, LedgerCell::Value(newer_record.clone())),
-                (deleted_uid, LedgerCell::Delete),
-            ],
-        )?;
-        let newer_ref = plant_table(&adapter, newer_key, newer_bytes).await?;
-
-        let seals = SealStore::new(adapter.clone());
-        let genesis = Seal::new(
-            partition,
-            generation_1,
-            WalReplayPoint::Genesis,
-            TreeVersion::empty(),
-            TreeVersion::empty(),
-        )?;
-        assert_eq!(
-            CreateEvidence::Direct,
-            seals.create_seal(&EncodedSeal::new(&genesis)?).await?
-        );
-        let directory = TreeVersion::try_from(vec![SortedRun::try_from(vec![directory_ref])?])?;
-        let ledger = TreeVersion::try_from(vec![
-            SortedRun::try_from(vec![newer_ref])?,
-            SortedRun::try_from(vec![older_ref])?,
-        ])?;
-        let materialized = Seal::new(
-            partition,
-            generation_2,
-            WalReplayPoint::Through {
-                batch: created_at,
-                owner: OwnerToken::from(generation_1),
-            },
-            directory,
-            ledger,
-        )?;
-        assert_eq!(
-            CreateEvidence::Direct,
-            seals.create_seal(&EncodedSeal::new(&materialized)?).await?
-        );
-
-        let ready = bootstrap(adapter, crate::test_entropy()).await?;
-        assert_eq!(
-            Some(strom_storage_domain::DirectoryEntry::Live(uid)),
-            ready.forest.resolve(&path)
-        );
-        assert_eq!(
-            Some(&newer_record),
-            ready.forest.record(uid),
-            "the newer Ledger run overwrites the older value"
-        );
-        assert_eq!(
-            None,
-            ready.forest.record(deleted_uid),
-            "a newest Ledger delete hides the older value"
-        );
-        assert_eq!(BatchId::try_from(3)?, ready.next_batch);
-        Ok(())
-    }
-
     fn seal_with_tables(
         count: usize,
         object_bytes: NonZeroU64,
@@ -1189,33 +1060,6 @@ mod tests {
             directory,
             TreeVersion::empty(),
         )?)
-    }
-
-    fn table_key(
-        birth: SealGeneration,
-        store: StoreKind,
-        ordinal: u32,
-    ) -> Result<TableKey, Box<dyn std::error::Error>> {
-        let fresh =
-            FreshIdentity::new(birth, AttemptId::new(SealGeneration::genesis(), 1), ordinal)?;
-        Ok(TableKey::new(TableObjectId::new(fresh, store)))
-    }
-
-    async fn plant_table(
-        adapter: &ObjectStoreAdapter,
-        key: TableKey,
-        bytes: Vec<u8>,
-    ) -> Result<TableRef, Box<dyn std::error::Error>> {
-        let object_key = ObjectKey::try_from(key.to_string())?;
-        let object_bytes =
-            NonZeroU64::new(u64::try_from(bytes.len())?).expect("encoded SST bodies are nonempty");
-        assert_eq!(
-            CreateEvidence::Direct,
-            adapter
-                .create_if_absent(&object_key, FrozenBytes::try_from(bytes)?)
-                .await?,
-        );
-        Ok(TableRef::new(key.object(), object_bytes)?)
     }
 
     fn stream_record() -> Result<StreamRecord, Box<dyn std::error::Error>> {

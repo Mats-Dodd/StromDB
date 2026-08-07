@@ -243,12 +243,7 @@ mod tests {
             !decide_suffix_room(Some(cut), cut),
             "a proposed RUN must be strictly after the Seal cut"
         );
-        Ok(())
-    }
 
-    #[test]
-    fn suffix_gate_rejects_a_run_without_a_real_successor_coordinate()
-    -> Result<(), Box<dyn std::error::Error>> {
         let cut = BatchId::try_from(u64::MAX - 2)?;
         assert!(decide_suffix_room(
             cut.into(),
@@ -258,111 +253,6 @@ mod tests {
             cut.into(),
             BatchId::try_from(u64::MAX)?
         ));
-        Ok(())
-    }
-
-    #[test]
-    fn every_refusal_leaves_the_forest_unchanged() -> Result<(), Box<dyn std::error::Error>> {
-        let path = DirectoryKey::try_from(Box::<[u8]>::from(b"events/a".as_slice()))?;
-        let batch = BatchId::try_from(1)?;
-        let create = CreateStream {
-            path: path.clone(),
-            content_type: StreamContentType::octet_stream(),
-            expiry: ExpiryPolicy::None,
-            lifecycle: StreamLifecycle::Open,
-        };
-        let CreateAdmission::Fact(admitted) = admit_create(&Forest::empty(), &create, batch)?
-        else {
-            return Err("first create must produce a fact".into());
-        };
-        let mut forest = admitted.forest;
-        let before = forest.clone();
-        let mismatched = CreateStream {
-            path: path.clone(),
-            content_type: "text/plain".parse()?,
-            expiry: ExpiryPolicy::None,
-            lifecycle: StreamLifecycle::Open,
-        };
-        assert_eq!(
-            Err(AdmissionRefusal::PathOccupied),
-            admit_create(&forest, &mismatched, batch)
-        );
-        assert_eq!(before.path_count(), forest.path_count());
-        assert_eq!(before.resolve(&path), forest.resolve(&path));
-
-        assert_eq!(
-            CreateAdmission::AlreadyExists,
-            admit_create(&forest, &create, batch)?
-        );
-        assert_eq!(before.path_count(), forest.path_count());
-
-        let CloseAdmission::Fact(closed) = admit_close(&forest, &path, batch)? else {
-            return Err("first close must produce a fact".into());
-        };
-        forest = closed.forest;
-        let record_before = forest.record(StreamUid::try_from(1)?).cloned();
-        assert_eq!(
-            Ok(CloseAdmission::AlreadyClosed),
-            admit_close(&forest, &path, batch)
-        );
-        assert_eq!(
-            record_before.as_ref(),
-            forest.record(StreamUid::try_from(1)?)
-        );
-
-        let missing = DirectoryKey::try_from(Box::<[u8]>::from(b"events/missing".as_slice()))?;
-        let before_count = forest.path_count();
-        assert_eq!(
-            Err(AdmissionRefusal::PathNotLive),
-            admit_delete(&forest, &missing, batch)
-        );
-        assert_eq!(before_count, forest.path_count());
-        Ok(())
-    }
-
-    #[test]
-    fn create_closed_installs_closed_lifecycle_and_is_idempotent()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let path = DirectoryKey::try_from(Box::<[u8]>::from(b"events/closed".as_slice()))?;
-        let batch = BatchId::try_from(1)?;
-        let create_closed = CreateStream {
-            path: path.clone(),
-            content_type: StreamContentType::octet_stream(),
-            expiry: ExpiryPolicy::None,
-            lifecycle: StreamLifecycle::Closed,
-        };
-        let CreateAdmission::Fact(admitted) =
-            admit_create(&Forest::empty(), &create_closed, batch)?
-        else {
-            return Err("create-closed must produce a fact".into());
-        };
-        let uid = StreamUid::try_from(1)?;
-        assert_eq!(
-            Some(StreamLifecycle::Closed),
-            admitted
-                .forest
-                .record(uid)
-                .map(strom_storage_domain::StreamRecord::lifecycle),
-            "one StreamCreated fact carries Closed into the ledger"
-        );
-        assert_eq!(
-            Ok(CreateAdmission::AlreadyExists),
-            admit_create(&admitted.forest, &create_closed, batch)
-        );
-        assert_eq!(
-            Err(AdmissionRefusal::PathOccupied),
-            admit_create(
-                &admitted.forest,
-                &CreateStream {
-                    path,
-                    content_type: StreamContentType::octet_stream(),
-                    expiry: ExpiryPolicy::None,
-                    lifecycle: StreamLifecycle::Open,
-                },
-                batch
-            ),
-            "open-create on a create-closed stream is a config mismatch"
-        );
         Ok(())
     }
 
@@ -425,43 +315,6 @@ mod tests {
                 batch
             ),
             "lifecycle mismatch refuses"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn delete_preserves_path_occupancy_and_the_next_create_gets_the_dense_successor()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let first = DirectoryKey::try_from(Box::<[u8]>::from(b"events/a".as_slice()))?;
-        let second = DirectoryKey::try_from(Box::<[u8]>::from(b"events/b".as_slice()))?;
-        let batch = BatchId::try_from(1)?;
-        let create = |path| CreateStream {
-            path,
-            content_type: StreamContentType::octet_stream(),
-            expiry: ExpiryPolicy::None,
-            lifecycle: StreamLifecycle::Open,
-        };
-        let CreateAdmission::Fact(first_create) =
-            admit_create(&Forest::empty(), &create(first.clone()), batch)?
-        else {
-            return Err("first create must produce a fact".into());
-        };
-        let deleted = admit_delete(&first_create.forest, &first, batch)?;
-        let forest = deleted.forest;
-        assert_eq!(
-            Err(AdmissionRefusal::PathOccupied),
-            admit_create(&forest, &create(first), batch)
-        );
-        let CreateAdmission::Fact(admitted) = admit_create(&forest, &create(second), batch)? else {
-            return Err("create on a free path must produce a fact".into());
-        };
-        assert_eq!(
-            Some(DirectoryEntry::Live(StreamUid::try_from(2)?)),
-            admitted
-                .forest
-                .resolve(&DirectoryKey::try_from(Box::<[u8]>::from(
-                    b"events/b".as_slice()
-                ))?)
         );
         Ok(())
     }

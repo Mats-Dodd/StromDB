@@ -84,6 +84,18 @@ fn create_close_delete_follows_the_fact_effects() -> TestResult {
     );
     assert_eq!(None, forest.record(uid));
     assert_eq!(1, forest.path_count());
+
+    let path_b = directory_key("events/b")?;
+    let uid_2 = StreamUid::try_from(2)?;
+    assert_eq!(
+        Applied,
+        forest.strict_fold(BatchId::try_from(4)?, &create(path_b.clone(), uid_2))?
+    );
+    assert_eq!(
+        Some(DirectoryEntry::Live(uid_2)),
+        forest.resolve(&path_b),
+        "the dense successor counts tombstoned paths"
+    );
     Ok(())
 }
 

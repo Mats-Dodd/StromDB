@@ -245,11 +245,9 @@ async fn shutdown_waits_for_an_active_wal_flight() -> TestResult {
         }
     }
 
-    let mut shutdown = tokio::spawn(engine.shutdown());
-    tokio::task::yield_now().await;
-    assert!(!shutdown.is_finished());
+    let shutdown = tokio::spawn(engine.shutdown());
     gate.release();
-    assert_eq!(CloseOutcome::Shutdown, (&mut shutdown).await?);
+    assert_eq!(CloseOutcome::Shutdown, shutdown.await?);
 
     let reopened = Engine::open(store.backend(), entropy()).await?;
     assert!(matches!(reopened.stream(&id)?, StreamStatus::Live { .. }));

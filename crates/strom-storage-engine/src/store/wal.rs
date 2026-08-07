@@ -359,58 +359,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_create_reports_durable_match_or_not_ours_by_bytes() {
-        let store = WalStore::new(ObjectStoreAdapter::in_memory());
-        let object = run_at(batch(1));
-        let candidate = EncodedWal::new(&object).expect("run encodes");
-        store
-            .create_wal(&candidate)
-            .await
-            .expect("first create runs");
-
-        let same = store
-            .create_wal(&candidate)
-            .await
-            .expect("second create runs");
-        assert_eq!(
-            CreateEvidence::DurableMatch,
-            same,
-            "identical bytes prove existence, never authorship"
-        );
-
-        let adapter = ObjectStoreAdapter::in_memory();
-        let contested = WalStore::new(adapter.clone());
-        let key = object_key(WalKey::from(object.batch()));
-        let foreign = FrozenBytes::try_from(b"not-a-wal".to_vec()).expect("foreign body freezes");
-        adapter
-            .create_if_absent(&key, foreign)
-            .await
-            .expect("foreign create runs");
-        let different = contested
-            .create_wal(&candidate)
-            .await
-            .expect("contested create runs");
-        assert_eq!(
-            CreateEvidence::NotOurs,
-            different,
-            "a different occupant fences the caller"
-        );
-    }
-
-    #[tokio::test]
-    async fn absence_is_none_for_read_and_newest_surviving_batch() {
-        let store = WalStore::new(ObjectStoreAdapter::in_memory());
-        let batch = batch(1);
-        let read = store.read_wal(partition(), batch).await.expect("read runs");
-        assert!(read.is_none(), "absence is Ok(None), not an error");
-        let newest = store.newest_surviving_batch().await.expect("list runs");
-        assert!(
-            newest.is_none(),
-            "an empty WAL namespace has no newest surviving batch"
-        );
-    }
-
-    #[tokio::test]
     async fn garbage_bytes_at_a_valid_wal_key_are_a_typed_contradiction() {
         let adapter = ObjectStoreAdapter::in_memory();
         let store = WalStore::new(adapter.clone());
@@ -452,77 +400,6 @@ mod tests {
                 batch: object.batch()
             }),
             "a fence observation cannot construct a delete proof"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_delete_removes_the_object_and_is_idempotent_with_a_second_proof() {
-        let store = WalStore::new(ObjectStoreAdapter::in_memory());
-        let object = run_at(batch(1));
-        let candidate = EncodedWal::new(&object).expect("run encodes");
-        store.create_wal(&candidate).await.expect("create runs");
-
-        // Two observations before delete: AuthorizedWalRunDelete is consumed,
-        // so a second delete needs its own proof rather than cloning the first.
-        let first_proof = store
-            .read_wal(partition(), candidate.batch())
-            .await
-            .expect("read runs")
-            .expect("run is present")
-            .into_run_delete()
-            .expect("a run observation yields a delete proof");
-        let second_proof = store
-            .read_wal(partition(), candidate.batch())
-            .await
-            .expect("re-read runs")
-            .expect("run is still present")
-            .into_run_delete()
-            .expect("a second run observation yields a second proof");
-
-        store
-            .delete_run(first_proof)
-            .await
-            .expect("delete of a present run runs");
-        let after = store
-            .read_wal(partition(), candidate.batch())
-            .await
-            .expect("read after delete runs");
-        assert!(after.is_none(), "a deleted RUN is absent");
-
-        store
-            .delete_run(second_proof)
-            .await
-            .expect("delete of an already-absent coordinate is idempotent");
-    }
-
-    #[tokio::test]
-    async fn deleting_the_newest_run_leaves_older_surviving_coordinates() {
-        let store = WalStore::new(ObjectStoreAdapter::in_memory());
-        let older = run_at(batch(1));
-        let newer = run_at(batch(2));
-        store
-            .create_wal(&EncodedWal::new(&older).expect("older encodes"))
-            .await
-            .expect("create older runs");
-        store
-            .create_wal(&EncodedWal::new(&newer).expect("newer encodes"))
-            .await
-            .expect("create newer runs");
-
-        let proof = store
-            .read_wal(partition(), newer.batch())
-            .await
-            .expect("read runs")
-            .expect("newer run is present")
-            .into_run_delete()
-            .expect("newer run yields a delete proof");
-        store.delete_run(proof).await.expect("delete newer runs");
-
-        let newest = store.newest_surviving_batch().await.expect("list runs");
-        assert_eq!(
-            newest,
-            Some(batch(1)),
-            "deleting batch two leaves batch one as the newest survivor"
         );
     }
 

@@ -1,14 +1,18 @@
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload};
+use strom_domain::{ExpiryPolicy, StreamContentType, StreamId, StreamLifecycle, StreamStatus};
 use strom_object_store::ObjectKey;
 use strom_object_store::test_support::{
     BackendFailure, Fault, FaultStore, Gate, Operation, Selection, Target,
 };
 use strom_storage_domain::{
-    DirectoryKey, OperationFact, OwnerToken, PartitionId, Seal, SealGeneration, StreamUid,
-    TreeVersion, WalBody, WalFacts, WalObject, WalReplayPoint, encode_seal, encode_wal,
+    AttemptId, BatchId, DirectoryEntry, DirectoryKey, FreshIdentity, LedgerCell, OperationFact,
+    OwnerToken, PartitionId, Seal, SealGeneration, SortedRun, StoreKind, StreamRecord, StreamUid,
+    TableKey, TableObjectId, TableRef, TreeVersion, WalBody, WalFacts, WalObject, WalReplayPoint,
+    encode_directory_sst, encode_ledger_sst, encode_seal, encode_wal,
 };
 use strom_storage_engine::{CloseOutcome, Engine, OpenError};
 
@@ -232,6 +236,116 @@ async fn wal_read_failure_reopens_from_published_fence() -> TestResult {
 }
 
 #[tokio::test]
+async fn planted_tables_merge_newest_wins_and_replay_continues_after_the_cut() -> TestResult {
+    let store = FaultStore::new();
+    let backend = store.backend();
+    let partition = partition();
+    let generation_1 = SealGeneration::genesis();
+    let generation_2 = generation_1.successor()?;
+    let base = "events/base".parse::<StreamId>()?;
+    let deleted = "events/deleted".parse::<StreamId>()?;
+    let uid = StreamUid::try_from(1)?;
+    let deleted_uid = StreamUid::try_from(2)?;
+    let created_at = BatchId::try_from(1)?;
+
+    let directory_key = table_key(generation_2, StoreKind::Directory, 0)?;
+    let directory_bytes = encode_directory_sst(
+        partition,
+        &directory_key,
+        &[
+            (DirectoryKey::from(&base), DirectoryEntry::Live(uid)),
+            (
+                DirectoryKey::from(&deleted),
+                DirectoryEntry::Tombstone(deleted_uid),
+            ),
+        ],
+    )?;
+    let directory_ref = plant_table(&backend, &directory_key, directory_bytes).await?;
+
+    let older_key = table_key(generation_2, StoreKind::Ledger, 1)?;
+    let older_bytes = encode_ledger_sst(
+        partition,
+        &older_key,
+        &[
+            (
+                uid,
+                LedgerCell::Value(StreamRecord::new(
+                    StreamContentType::octet_stream(),
+                    ExpiryPolicy::None,
+                    StreamLifecycle::Open,
+                    created_at,
+                )),
+            ),
+            (
+                deleted_uid,
+                LedgerCell::Value(StreamRecord::new(
+                    StreamContentType::octet_stream(),
+                    ExpiryPolicy::None,
+                    StreamLifecycle::Open,
+                    created_at,
+                )),
+            ),
+        ],
+    )?;
+    let older_ref = plant_table(&backend, &older_key, older_bytes).await?;
+
+    let newer_key = table_key(generation_2, StoreKind::Ledger, 2)?;
+    let newer_bytes = encode_ledger_sst(
+        partition,
+        &newer_key,
+        &[
+            (
+                uid,
+                LedgerCell::Value(StreamRecord::new(
+                    "application/json".parse()?,
+                    ExpiryPolicy::None,
+                    StreamLifecycle::Closed,
+                    created_at,
+                )),
+            ),
+            (deleted_uid, LedgerCell::Delete),
+        ],
+    )?;
+    let newer_ref = plant_table(&backend, &newer_key, newer_bytes).await?;
+
+    put_seal(&backend, &genesis(partition)).await?;
+    let directory = TreeVersion::try_from(vec![SortedRun::try_from(vec![directory_ref])?])?;
+    let ledger = TreeVersion::try_from(vec![
+        SortedRun::try_from(vec![newer_ref])?,
+        SortedRun::try_from(vec![older_ref])?,
+    ])?;
+    put_seal(
+        &backend,
+        &Seal::new(
+            partition,
+            generation_2,
+            WalReplayPoint::Through {
+                batch: created_at,
+                owner: OwnerToken::from(generation_1),
+            },
+            directory,
+            ledger,
+        )?,
+    )
+    .await?;
+
+    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    assert_eq!(
+        StreamStatus::Live {
+            content_type: "application/json".parse()?,
+            expiry: ExpiryPolicy::None,
+            lifecycle: StreamLifecycle::Closed,
+        },
+        engine.stream(&base)?,
+    );
+    assert_eq!(StreamStatus::Deleted, engine.stream(&deleted)?);
+    assert_object_present(&backend, &wal_key(2)).await?;
+    assert_eq!(CloseOutcome::Shutdown, engine.shutdown().await);
+    store.verify()?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn replay_gap_below_the_takeover_fence_is_a_contradiction() -> TestResult {
     let store = FaultStore::new();
     let backend = store.backend();
@@ -353,6 +467,26 @@ fn genesis(partition: PartitionId) -> Seal {
         TreeVersion::empty(),
     )
     .expect("canonical genesis is valid")
+}
+
+fn table_key(
+    birth: SealGeneration,
+    store: StoreKind,
+    ordinal: u32,
+) -> Result<TableKey, Box<dyn std::error::Error>> {
+    let fresh = FreshIdentity::new(birth, AttemptId::new(SealGeneration::genesis(), 1), ordinal)?;
+    Ok(TableKey::new(TableObjectId::new(fresh, store)))
+}
+
+async fn plant_table(
+    store: &Arc<dyn ObjectStore>,
+    key: &TableKey,
+    bytes: Vec<u8>,
+) -> Result<TableRef, Box<dyn std::error::Error>> {
+    let object_bytes =
+        NonZeroU64::new(u64::try_from(bytes.len())?).expect("encoded SST bodies are nonempty");
+    put_object(store, ObjectKey::try_from(key.to_string())?, bytes).await?;
+    Ok(TableRef::new(key.object(), object_bytes)?)
 }
 
 fn partition() -> PartitionId {

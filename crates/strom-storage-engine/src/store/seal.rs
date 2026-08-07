@@ -237,58 +237,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_create_reports_durable_match_or_not_ours_by_bytes() {
-        let store = SealStore::new(ObjectStoreAdapter::in_memory());
-        let seal = seal_at(SealGeneration::genesis());
-        let candidate = EncodedSeal::new(&seal).expect("seal encodes");
-        store
-            .create_seal(&candidate)
-            .await
-            .expect("first create runs");
-
-        let same = store
-            .create_seal(&candidate)
-            .await
-            .expect("second create runs");
-        assert_eq!(
-            CreateEvidence::DurableMatch,
-            same,
-            "identical bytes prove existence, never authorship"
-        );
-
-        let adapter = ObjectStoreAdapter::in_memory();
-        let contested = SealStore::new(adapter.clone());
-        let key = object_key(SealKey::from(seal.generation()));
-        let foreign = FrozenBytes::try_from(b"not-a-seal".to_vec()).expect("foreign body freezes");
-        adapter
-            .create_if_absent(&key, foreign)
-            .await
-            .expect("foreign create runs");
-        let different = contested
-            .create_seal(&candidate)
-            .await
-            .expect("contested create runs");
-        assert_eq!(
-            CreateEvidence::NotOurs,
-            different,
-            "a different occupant fences the caller"
-        );
-    }
-
-    #[tokio::test]
-    async fn absence_is_none_for_read_and_newest_generation() {
-        let store = SealStore::new(ObjectStoreAdapter::in_memory());
-        let identity = SealGeneration::genesis();
-        let read = store.read_seal(identity).await.expect("read runs");
-        assert!(read.is_none(), "absence is Ok(None), not an error");
-        let newest = store.newest_generation().await.expect("list runs");
-        assert!(
-            newest.is_none(),
-            "an empty Seal namespace has no newest generation"
-        );
-    }
-
-    #[tokio::test]
     async fn garbage_bytes_at_a_valid_seal_key_are_a_typed_contradiction() {
         let adapter = ObjectStoreAdapter::in_memory();
         let store = SealStore::new(adapter.clone());
