@@ -397,12 +397,12 @@ Each completed step compiles and passes `just ci` on its own.
 
 ## Follow-up, out of scope here
 
-- `prepare.rs`'s Full path still reads `directory_rows()`/`ledger_rows()`
-  across the forest seam; give `Forest` one "emit all rows as checkpoint
-  cells" operation and make the row accessors test-only.
-- `engine.rs` drops `Fenced { observed }` and exit `batch` when mapping to
-  public errors; decide whether the public interface should carry them.
-- `store/table.rs`'s table-delete planning (`targeted_table_deletes`) and
-  `prepare.rs`'s `seal_tables` walk the same Seal shape twice; one Seal-owned
-  walk would delete the duplicate and give the delete-proof walk its final
-  home (decision 5).
+- Implemented after this refactor: `Forest::checkpoint_cells` owns full-base
+  checkpoint spelling, and the raw row accessors were deleted.
+- Implemented after this refactor: `OpenError::Fenced { observed }` preserves
+  the generation reported by bootstrap. `CloseOutcome::Fenced` deliberately
+  remains a class-only outcome because the writer records a WAL batch, not an
+  observed Seal generation.
+- Implemented after this refactor: `Seal::tables` owns the complete manifest
+  walk used by bootstrap, checkpoint accounting, and table-delete planning.
+  `AuthorizedTableDelete` construction remains private to `store/table.rs`.

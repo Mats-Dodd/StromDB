@@ -186,19 +186,14 @@ pub(crate) fn targeted_table_deletes(
         successor.generation(),
         "targeted collection requires an exact Seal successor pair"
     );
-    let successor_objects: BTreeSet<TableObjectId> = seal_tables(successor).collect();
-    seal_tables(source)
+    let successor_objects: BTreeSet<TableObjectId> =
+        successor.tables().map(|table| table.object()).collect();
+    source
+        .tables()
+        .map(|table| table.object())
         .filter(|object| !successor_objects.contains(object))
         .map(|object| AuthorizedTableDelete { object })
         .collect()
-}
-
-fn seal_tables(seal: &Seal) -> impl Iterator<Item = TableObjectId> + '_ {
-    [seal.directory(), seal.ledger()]
-        .into_iter()
-        .flat_map(strom_storage_domain::TreeVersion::runs)
-        .flat_map(strom_storage_domain::SortedRun::tables)
-        .map(|table| table.object())
 }
 
 #[cfg(test)]

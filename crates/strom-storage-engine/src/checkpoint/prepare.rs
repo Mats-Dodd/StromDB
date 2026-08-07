@@ -29,12 +29,6 @@ struct ChunkAccounting {
     bytes: u64,
 }
 
-#[derive(Debug)]
-enum PlanShape {
-    Delta,
-    Full,
-}
-
 pub(super) fn prepare_checkpoint(
     input: CheckpointInput,
     emit: &mut impl FnMut(EncodedTable) -> bool,
@@ -56,71 +50,33 @@ pub(super) fn prepare_checkpoint(
         .map_err(|error| error.to_string())?;
 
     let delta = snapshot.delta_since(&base);
-    let plan = plan_checkpoint(&source, &snapshot, &delta);
+    let (cells, carried) = plan_checkpoint(&source, &snapshot, delta);
     let mut ordinal = 0u32;
-    let (directory, ledger) = match plan {
-        PlanShape::Delta => {
-            let ForestDelta {
-                directory: directory_rows,
-                ledger: ledger_rows,
-            } = delta;
-            let Some(directory) = build_directory_tree(
-                partition,
-                generation,
-                attempt,
-                &mut ordinal,
-                directory_rows,
-                Some(source.directory()),
-                emit,
-            ) else {
-                return Ok(None);
-            };
-            let Some(ledger) = build_ledger_tree(
-                partition,
-                generation,
-                attempt,
-                &mut ordinal,
-                ledger_rows,
-                Some(source.ledger()),
-                emit,
-            ) else {
-                return Ok(None);
-            };
-            (directory, ledger)
-        }
-        PlanShape::Full => {
-            let directory_rows = snapshot
-                .directory_rows()
-                .iter()
-                .map(|(key, entry)| (key.clone(), *entry));
-            let Some(directory) = build_directory_tree(
-                partition,
-                generation,
-                attempt,
-                &mut ordinal,
-                directory_rows,
-                None,
-                emit,
-            ) else {
-                return Ok(None);
-            };
-            let ledger_rows = snapshot
-                .ledger_rows()
-                .iter()
-                .map(|(uid, record)| (*uid, LedgerCell::Value(record.clone())));
-            let Some(ledger) = build_ledger_tree(
-                partition,
-                generation,
-                attempt,
-                &mut ordinal,
-                ledger_rows,
-                None,
-                emit,
-            ) else {
-                return Ok(None);
-            };
-            (directory, ledger)
-        }
+    let ForestDelta {
+        directory: directory_rows,
+        ledger: ledger_rows,
+    } = cells;
+    let Some(directory) = build_directory_tree(
+        partition,
+        generation,
+        attempt,
+        &mut ordinal,
+        directory_rows,
+        carried.map(Seal::directory),
+        emit,
+    ) else {
+        return Ok(None);
+    };
+    let Some(ledger) = build_ledger_tree(
+        partition,
+        generation,
+        attempt,
+        &mut ordinal,
+        ledger_rows,
+        carried.map(Seal::ledger),
+        emit,
+    ) else {
+        return Ok(None);
     };
     let (successor, encoded_seal) = assemble_checkpoint_seal(
         partition,
@@ -139,27 +95,32 @@ pub(super) fn prepare_checkpoint(
     ))))
 }
 
-fn plan_checkpoint(source: &Seal, snapshot: &Forest, delta: &ForestDelta) -> PlanShape {
-    if let Some(plan) = plan_delta(source, delta) {
-        return plan;
+fn plan_checkpoint<'source>(
+    source: &'source Seal,
+    snapshot: &Forest,
+    delta: ForestDelta,
+) -> (ForestDelta, Option<&'source Seal>) {
+    if can_append_delta(source, &delta) {
+        return (delta, Some(source));
     }
+    let cells = snapshot.checkpoint_cells();
     let directory = account_rows(
-        snapshot
-            .directory_rows()
+        cells
+            .directory
             .iter()
             .map(|_row| DIRECTORY_ROW_ENCODED_BYTES_MAX),
     );
     let ledger = account_rows(
-        snapshot
-            .ledger_rows()
+        cells
+            .ledger
             .iter()
-            .map(|_row| LEDGER_VALUE_ROW_ENCODED_BYTES_MAX),
+            .map(|(_uid, cell)| ledger_row_bytes(cell)),
     );
     assert_full_plan(directory, ledger);
-    PlanShape::Full
+    (cells, None)
 }
 
-fn plan_delta(source: &Seal, delta: &ForestDelta) -> Option<PlanShape> {
+fn can_append_delta(source: &Seal, delta: &ForestDelta) -> bool {
     let directory = account_rows(
         delta
             .directory
@@ -224,43 +185,42 @@ fn account_rows(rows: impl IntoIterator<Item = u64>) -> ChunkAccounting {
     accounting
 }
 
-fn select_delta(
-    source: &Seal,
-    directory: ChunkAccounting,
-    ledger: ChunkAccounting,
-) -> Option<PlanShape> {
-    let directory_runs = source
+fn select_delta(source: &Seal, directory: ChunkAccounting, ledger: ChunkAccounting) -> bool {
+    let Some(directory_runs) = source
         .directory()
         .runs()
         .len()
-        .checked_add(usize::from(directory.tables != 0))?;
-    let ledger_runs = source
+        .checked_add(usize::from(directory.tables != 0))
+    else {
+        return false;
+    };
+    let Some(ledger_runs) = source
         .ledger()
         .runs()
         .len()
-        .checked_add(usize::from(ledger.tables != 0))?;
-    let carried_objects = seal_tables(source).count();
-    let fresh_objects = directory.tables.checked_add(ledger.tables)?;
-    let carried_bytes = seal_tables(source)
+        .checked_add(usize::from(ledger.tables != 0))
+    else {
+        return false;
+    };
+    let carried_objects = source.tables().count();
+    let Some(fresh_objects) = directory.tables.checked_add(ledger.tables) else {
+        return false;
+    };
+    let carried_bytes = source
+        .tables()
         .map(|table| table.object_bytes().get())
         .sum::<u64>();
-    let fresh_bytes = directory.bytes.checked_add(ledger.bytes)?;
-    (directory_runs <= TREE_RUNS_MAX
+    let Some(fresh_bytes) = directory.bytes.checked_add(ledger.bytes) else {
+        return false;
+    };
+    directory_runs <= TREE_RUNS_MAX
         && ledger_runs <= TREE_RUNS_MAX
         && carried_objects
             .checked_add(fresh_objects)
             .is_some_and(|objects| objects <= PARTITION_BOOTSTRAP_OBJECTS_MAX_V2)
         && carried_bytes
             .checked_add(fresh_bytes)
-            .is_some_and(|bytes| bytes <= PARTITION_BOOTSTRAP_BYTES_MAX_V2))
-    .then_some(PlanShape::Delta)
-}
-
-fn seal_tables(seal: &Seal) -> impl Iterator<Item = &TableRef> {
-    [seal.directory(), seal.ledger()]
-        .into_iter()
-        .flat_map(TreeVersion::runs)
-        .flat_map(SortedRun::tables)
+            .is_some_and(|bytes| bytes <= PARTITION_BOOTSTRAP_BYTES_MAX_V2)
 }
 
 fn assert_full_plan(directory: ChunkAccounting, ledger: ChunkAccounting) {
@@ -443,6 +403,7 @@ fn assemble_checkpoint_seal(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::num::NonZeroU64;
 
     use proptest::prelude::*;
@@ -470,23 +431,36 @@ mod tests {
             apply_actions(&mut snapshot, suffix_actions, &mut batch);
 
             let rows = plan_delta_rows(&base, &snapshot);
-            let mut directory = base.directory_rows().clone();
+            let base_cells = base.checkpoint_cells();
+            let mut directory = base_cells.directory.into_iter().collect::<BTreeMap<_, _>>();
             for (key, entry) in rows.directory.into_iter().flatten() {
                 directory.insert(key, entry);
             }
-            let mut ledger = base.ledger_rows().clone();
+            let mut ledger = base_cells
+                .ledger
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
             for (uid, cell) in rows.ledger.into_iter().flatten() {
                 match cell {
-                    LedgerCell::Value(record) => {
-                        ledger.insert(uid, record);
+                    LedgerCell::Value(_) => {
+                        ledger.insert(uid, cell);
                     }
                     LedgerCell::Delete => {
                         ledger.remove(&uid);
                     }
                 }
             }
-            prop_assert_eq!(&directory, snapshot.directory_rows());
-            prop_assert_eq!(&ledger, snapshot.ledger_rows());
+            let snapshot_cells = snapshot.checkpoint_cells();
+            let expected_directory = snapshot_cells
+                .directory
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+            let expected_ledger = snapshot_cells
+                .ledger
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+            prop_assert_eq!(directory, expected_directory);
+            prop_assert_eq!(ledger, expected_ledger);
         }
     }
 
@@ -642,12 +616,12 @@ mod tests {
             .expect("the aggregate object bound is nonzero");
         let object_at_bound =
             seal_with_directory_tables(partition, vec![NonZeroU64::MIN; carried_objects])?;
-        assert!(select_delta(&object_at_bound, directory, ledger).is_some());
+        assert!(select_delta(&object_at_bound, directory, ledger));
         let object_over = seal_with_directory_tables(
             partition,
             vec![NonZeroU64::MIN; PARTITION_BOOTSTRAP_OBJECTS_MAX_V2],
         )?;
-        assert!(select_delta(&object_over, directory, ledger).is_none());
+        assert!(!select_delta(&object_over, directory, ledger));
 
         let fresh_bytes = SST_ARCHIVE_FIXED_BYTES_MAX
             .checked_add(DIRECTORY_ROW_ENCODED_BYTES_MAX)
@@ -661,7 +635,7 @@ mod tests {
             vec![NonZeroU64::new(table_bytes_max).expect("the SST byte bound is nonzero"); 255];
         byte_lengths.push(last_at_bound);
         let bytes_at_bound = seal_with_directory_tables(partition, byte_lengths.clone())?;
-        assert!(select_delta(&bytes_at_bound, directory, ledger).is_some());
+        assert!(select_delta(&bytes_at_bound, directory, ledger));
         let last_over = NonZeroU64::new(
             last_at_bound
                 .get()
@@ -674,7 +648,7 @@ mod tests {
             .expect("the byte-bound fixture has tables");
         *last = last_over;
         let bytes_over = seal_with_directory_tables(partition, byte_lengths)?;
-        assert!(select_delta(&bytes_over, directory, ledger).is_none());
+        assert!(!select_delta(&bytes_over, directory, ledger));
         Ok(())
     }
 
@@ -683,30 +657,28 @@ mod tests {
             let fact = match action % 3 {
                 0 => create_for_index(forest, index, *batch),
                 1 => forest
-                    .directory_rows()
-                    .iter()
+                    .checkpoint_cells()
+                    .directory
+                    .into_iter()
                     .find_map(|(path, entry)| match entry {
                         DirectoryEntry::Live(uid)
                             if forest
-                                .record(*uid)
+                                .record(uid)
                                 .is_some_and(|record| !record.lifecycle().is_closed()) =>
                         {
-                            Some(OperationFact::StreamClosed {
-                                path: path.clone(),
-                                uid: *uid,
-                            })
+                            Some(OperationFact::StreamClosed { path, uid })
                         }
                         DirectoryEntry::Live(_) | DirectoryEntry::Tombstone(_) => None,
                     })
                     .unwrap_or_else(|| create_for_index(forest, index, *batch)),
                 2..=u8::MAX => forest
-                    .directory_rows()
-                    .iter()
+                    .checkpoint_cells()
+                    .directory
+                    .into_iter()
                     .find_map(|(path, entry)| match entry {
-                        DirectoryEntry::Live(uid) => Some(OperationFact::StreamDeleted {
-                            path: path.clone(),
-                            uid: *uid,
-                        }),
+                        DirectoryEntry::Live(uid) => {
+                            Some(OperationFact::StreamDeleted { path, uid })
+                        }
                         DirectoryEntry::Tombstone(_) => None,
                     })
                     .unwrap_or_else(|| create_for_index(forest, index, *batch)),
@@ -722,7 +694,7 @@ mod tests {
     fn create_for_index(forest: &Forest, index: usize, batch: u64) -> OperationFact {
         let path = directory_key(&format!("events/generated-{batch}-{index}"))
             .expect("generated path is canonical");
-        let uid = u64::try_from(forest.directory_rows().len())
+        let uid = u64::try_from(forest.checkpoint_cells().directory.len())
             .expect("the generated forest row count fits in u64")
             .checked_add(1)
             .and_then(|uid| StreamUid::try_from(uid).ok())

@@ -43,21 +43,20 @@ impl Seal {
         }
         validate_tree(&directory, StoreKind::Directory, generation)?;
         validate_tree(&ledger, StoreKind::Ledger, generation)?;
-        let mut identities = BTreeSet::new();
-        for tree in [&directory, &ledger] {
-            for table in tree.tables() {
-                if !identities.insert(table.object()) {
-                    return Err(SealError::DuplicateTableObject);
-                }
-            }
-        }
-        Ok(Self {
+        let seal = Self {
             partition,
             generation,
             replay,
             directory,
             ledger,
-        })
+        };
+        let mut identities = BTreeSet::new();
+        for table in seal.tables() {
+            if !identities.insert(table.object()) {
+                return Err(SealError::DuplicateTableObject);
+            }
+        }
+        Ok(seal)
     }
 
     #[must_use]
@@ -83,6 +82,13 @@ impl Seal {
     #[must_use]
     pub const fn ledger(&self) -> &TreeVersion {
         &self.ledger
+    }
+
+    /// Every table selected by this Seal, in Directory then Ledger manifest order.
+    pub fn tables(&self) -> impl Iterator<Item = &TableRef> {
+        [&self.directory, &self.ledger]
+            .into_iter()
+            .flat_map(TreeVersion::tables)
     }
 
     /// Build the exact claim successor, preserving the complete logical and
@@ -310,6 +316,49 @@ mod tests {
                 directory,
                 TreeVersion::empty(),
             )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn seal_tables_follow_directory_then_ledger_manifest_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let partition: PartitionId = "00112233-4455-6677-8899-aabbccddeeff".parse()?;
+        let owner = SealGeneration::genesis();
+        let generation = owner.successor()?;
+        let attempt = AttemptId::new(owner, 1);
+        let directory_object = TableObjectId::new(
+            FreshIdentity::new(generation, attempt, 0)?,
+            StoreKind::Directory,
+        );
+        let ledger_object = TableObjectId::new(
+            FreshIdentity::new(generation, attempt, 1)?,
+            StoreKind::Ledger,
+        );
+        let directory = TreeVersion::try_from(vec![SortedRun::try_from(vec![TableRef::new(
+            directory_object,
+            NonZeroU64::MIN,
+        )?])?])?;
+        let ledger = TreeVersion::try_from(vec![SortedRun::try_from(vec![TableRef::new(
+            ledger_object,
+            NonZeroU64::MIN,
+        )?])?])?;
+        let seal = Seal::new(
+            partition,
+            generation,
+            WalReplayPoint::Through {
+                batch: BatchId::try_from(1)?,
+                owner: OwnerToken::from(owner),
+            },
+            directory,
+            ledger,
+        )?;
+
+        assert_eq!(
+            vec![directory_object, ledger_object],
+            seal.tables()
+                .map(|table| table.object())
+                .collect::<Vec<_>>()
         );
         Ok(())
     }

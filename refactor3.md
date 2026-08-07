@@ -724,9 +724,10 @@ Each completed step compiles and passes `just ci` on its own.
 - An aggregate checkpoint-preparation resource budget when a concrete runtime
   first owns multiple partition engines. The present one-preparation-per-writer
   marker remains the only bound until that owner exists.
-- The carried follow-ups from `refactor2.md`: the Forest "emit all rows"
-  operation for `prepare.rs`, the one-Seal-owned walk, public error carriage
-  of `Fenced { observed }`.
+- Implemented after this refactor: the Forest full-checkpoint-cell operation,
+  the one-Seal-owned table walk, and public open-error carriage of
+  `Fenced { observed }`. The public close outcome does not expose its internal
+  WAL batch.
 - `collect.rs` interior simplification, if any, once it is the last complex
   writer-side effect implementation left.
 - Collection catch-up/coalescing: track the last collected Seal and collect

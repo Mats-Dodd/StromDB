@@ -44,7 +44,7 @@ pub use strom_domain::{
     CloseStreamOutcome, CreateOutcome, ExpiryPolicy, StreamContentType, StreamId, StreamIdError,
     StreamLifecycle, StreamStatus,
 };
-pub use strom_storage_engine::{CloseOutcome, OpenError, PartitionId, StreamError};
+pub use strom_storage_engine::{CloseOutcome, OpenError, PartitionId, SealGeneration, StreamError};
 
 use std::sync::Arc;
 

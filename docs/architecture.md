@@ -1046,18 +1046,27 @@ rules stay inside these concrete types so callers cannot bypass them.
 
 ## failure, fencing, routing, and shutdown
 
-Courant is fail-stop around uncertainty.
+StromDB is fail-stop around uncertainty.
 
 ```rust
 enum WriterExit {
     Shutdown,
+    Fenced { batch: BatchId },
+    Poisoned { batch: BatchId, detail: String },
+    Contradiction { batch: BatchId, detail: String },
+}
+
+enum OpenError {
+    Retryable { detail: String },
     Fenced { observed: SealGeneration },
-    Poisoned { coordinate: DurableCoordinate, detail: String },
-    Contradiction { coordinate: DurableCoordinate, detail: String },
+    Contradiction { detail: String },
 }
 ```
 
 - `Fenced` is normal ownership movement.
+- Bootstrap preserves the observed Seal generation in the public open error.
+- A writer exit records the WAL batch at which serving stopped.
+- `CloseOutcome` reports the fenced class but does not expose that batch.
 - `Poisoned` means an effect may have happened but this process lacks evidence
   to continue.
 - `Contradiction` means durable bytes violate the storage model.

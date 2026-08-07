@@ -175,7 +175,11 @@ async fn matching_claim_occupant_fences_without_granting_authority() -> TestResu
     put_seal(&backend, &head.claim_successor()?).await?;
     gate.release();
 
-    assert!(matches!(opening.await, Err(OpenError::Fenced)));
+    let expected = head.generation().successor()?;
+    assert!(matches!(
+        opening.await,
+        Err(OpenError::Fenced { observed }) if observed == expected
+    ));
     store.assert_called_once(Operation::Create, &claim_key)?;
     store.assert_called_once(Operation::Read, &claim_key)?;
     store.verify()?;

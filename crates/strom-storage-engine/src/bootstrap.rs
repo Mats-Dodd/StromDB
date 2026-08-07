@@ -479,11 +479,7 @@ pub(crate) async fn bootstrap(
 fn plan_bootstrap_sources(seal: &Seal) -> Result<BootstrapPlan, BootstrapExit> {
     let mut objects = 0usize;
     let mut bytes = 0u64;
-    for table in [seal.directory(), seal.ledger()]
-        .into_iter()
-        .flat_map(strom_storage_domain::TreeVersion::runs)
-        .flat_map(strom_storage_domain::SortedRun::tables)
-    {
+    for table in seal.tables() {
         objects = objects.checked_add(1).ok_or_else(bootstrap_source_bound)?;
         bytes = bytes
             .checked_add(table.object_bytes().get())

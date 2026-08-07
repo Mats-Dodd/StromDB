@@ -10,7 +10,7 @@ use strom_domain::{
 };
 use strom_object_store::ObjectStoreAdapter;
 use strom_storage_domain::{
-    DirectoryEntry, DirectoryKey, PartitionId, WRITER_INGRESS_COMMANDS_MAX,
+    DirectoryEntry, DirectoryKey, PartitionId, SealGeneration, WRITER_INGRESS_COMMANDS_MAX,
 };
 use strom_storage_protocol::{AdmissionRefusal, CommandEnvelope, CreateStream, Forest, WriterExit};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -199,8 +199,8 @@ impl Engine {
 pub enum OpenError {
     #[error("open should be retried: {detail}")]
     Retryable { detail: String },
-    #[error("another writer took the partition")]
-    Fenced,
+    #[error("another writer took the partition at Seal generation {observed:?}")]
+    Fenced { observed: SealGeneration },
     #[error("durable state contradicts the storage model: {detail}")]
     Contradiction { detail: String },
 }
@@ -238,7 +238,7 @@ pub enum CloseOutcome {
 fn open_error(exit: BootstrapExit) -> OpenError {
     match exit {
         BootstrapExit::Retryable { detail } => OpenError::Retryable { detail },
-        BootstrapExit::Fenced { observed: _ } => OpenError::Fenced,
+        BootstrapExit::Fenced { observed } => OpenError::Fenced { observed },
         BootstrapExit::Contradiction { detail } => OpenError::Contradiction { detail },
     }
 }

@@ -2,7 +2,9 @@
 
 use proptest::prelude::*;
 use strom_domain::{ExpiryPolicy, StreamContentType, StreamId, StreamLifecycle};
-use strom_storage_domain::{BatchId, DirectoryEntry, DirectoryKey, OperationFact, StreamUid};
+use strom_storage_domain::{
+    BatchId, DirectoryEntry, DirectoryKey, LedgerCell, OperationFact, StreamUid,
+};
 use strom_storage_protocol::{Applied, FoldContradiction, Forest};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -27,7 +29,6 @@ proptest! {
             prop_assert_eq!(forest.resolve(&path), Some(DirectoryEntry::Live(uid)));
             prop_assert!(forest.record(uid).is_some());
         }
-        prop_assert_eq!(forest.directory_rows().len(), count);
     }
 }
 
@@ -79,7 +80,6 @@ fn create_close_delete_follows_the_fact_effects() -> TestResult {
         "delete leaves permanent path occupancy"
     );
     assert_eq!(None, forest.record(uid));
-    assert_eq!(1, forest.directory_rows().len());
 
     let path_b = directory_key("events/b")?;
     let uid_2 = StreamUid::try_from(2)?;
@@ -91,6 +91,41 @@ fn create_close_delete_follows_the_fact_effects() -> TestResult {
         Some(DirectoryEntry::Live(uid_2)),
         forest.resolve(&path_b),
         "the dense successor counts tombstoned paths"
+    );
+    Ok(())
+}
+
+#[test]
+fn checkpoint_cells_emit_final_rows_without_ledger_deletes() -> TestResult {
+    let path_a = directory_key("events/a")?;
+    let path_b = directory_key("events/b")?;
+    let uid_a = StreamUid::try_from(1)?;
+    let uid_b = StreamUid::try_from(2)?;
+    let mut forest = Forest::empty();
+    forest.strict_fold(BatchId::try_from(1)?, &create(path_a.clone(), uid_a))?;
+    forest.strict_fold(BatchId::try_from(2)?, &create(path_b.clone(), uid_b))?;
+    forest.strict_fold(
+        BatchId::try_from(3)?,
+        &OperationFact::StreamDeleted {
+            path: path_a.clone(),
+            uid: uid_a,
+        },
+    )?;
+
+    let cells = forest.checkpoint_cells();
+    assert_eq!(
+        vec![
+            (path_a, DirectoryEntry::Tombstone(uid_a)),
+            (path_b, DirectoryEntry::Live(uid_b)),
+        ],
+        cells.directory
+    );
+    assert!(
+        matches!(
+            cells.ledger.as_slice(),
+            [(observed, LedgerCell::Value(_record))] if *observed == uid_b
+        ),
+        "a full checkpoint carries only the resident Ledger value"
     );
     Ok(())
 }
@@ -151,30 +186,14 @@ fn every_rejected_fact_leaves_the_forest_unchanged() -> TestResult {
 
     for (expected, fact) in rejected {
         let mut forest = base.clone();
-        let before = observe(
-            &forest,
-            [&path, &closed_path, &absent],
-            [uid, closed_uid, wrong_uid],
-        );
+        let before = forest.clone();
         assert_eq!(Err(expected), forest.strict_fold(batch, &fact));
         assert_eq!(
-            before,
-            observe(
-                &forest,
-                [&path, &closed_path, &absent],
-                [uid, closed_uid, wrong_uid]
-            ),
+            before, forest,
             "a rejected fold does not change observable state"
         );
     }
     Ok(())
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct Observation {
-    path_count: usize,
-    paths: Vec<Option<DirectoryEntry>>,
-    records: Vec<bool>,
 }
 
 fn directory_key(raw: &str) -> Result<DirectoryKey, Box<dyn std::error::Error>> {
@@ -188,16 +207,5 @@ const fn create(path: DirectoryKey, uid: StreamUid) -> OperationFact {
         content_type: StreamContentType::octet_stream(),
         expiry: ExpiryPolicy::None,
         lifecycle: StreamLifecycle::Open,
-    }
-}
-
-fn observe(forest: &Forest, paths: [&DirectoryKey; 3], uids: [StreamUid; 3]) -> Observation {
-    Observation {
-        path_count: forest.directory_rows().len(),
-        paths: paths.into_iter().map(|path| forest.resolve(path)).collect(),
-        records: uids
-            .into_iter()
-            .map(|uid| forest.record(uid).is_some())
-            .collect(),
     }
 }

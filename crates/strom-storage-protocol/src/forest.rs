@@ -215,6 +215,25 @@ impl Forest {
         ForestDelta { directory, ledger }
     }
 
+    /// All resident rows as cells for a full checkpoint base.
+    ///
+    /// A full base carries every final Directory entry and every resident
+    /// Ledger value. It carries no Ledger delete cells.
+    #[must_use]
+    pub fn checkpoint_cells(&self) -> ForestDelta {
+        let directory = self
+            .directory
+            .iter()
+            .map(|(key, entry)| (key.clone(), *entry))
+            .collect();
+        let ledger = self
+            .ledger
+            .iter()
+            .map(|(uid, record)| (*uid, LedgerCell::Value(record.clone())))
+            .collect();
+        ForestDelta { directory, ledger }
+    }
+
     #[must_use]
     pub fn resolve(&self, path: &DirectoryKey) -> Option<DirectoryEntry> {
         self.directory.get(path).copied()
@@ -251,16 +270,6 @@ impl Forest {
             .and_then(NonZeroU64::new)
             .expect("path_count below the V2 occupancy bound has a nonzero successor");
         Ok(StreamUid::from(successor))
-    }
-
-    #[must_use]
-    pub const fn directory_rows(&self) -> &OrdMap<DirectoryKey, DirectoryEntry> {
-        &self.directory
-    }
-
-    #[must_use]
-    pub const fn ledger_rows(&self) -> &OrdMap<StreamUid, StreamRecord> {
-        &self.ledger
     }
 
     #[must_use]
