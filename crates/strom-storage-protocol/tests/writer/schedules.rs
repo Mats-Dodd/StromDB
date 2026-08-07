@@ -42,6 +42,15 @@ proptest! {
     }
 }
 
+#[test]
+fn scripted_overlap_never_double_issues_machine_effect_slots() -> TestResult {
+    run_schedule(
+        WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER,
+        "effect-slots",
+        &[[1, 0], [1, 0], [1, 0], [0, 1], [0, 1]],
+    )
+}
+
 fn run_schedule(durable: u64, label: &str, choices: &[[u8; 2]]) -> TestResult {
     let mut machine = recovered_machine_at(durable)?;
     let mut outstanding = Vec::new();

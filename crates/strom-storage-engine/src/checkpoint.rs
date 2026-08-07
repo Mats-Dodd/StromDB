@@ -6,12 +6,11 @@ mod prepare;
 pub(crate) use collect::collect_advance;
 
 use futures::{StreamExt as _, stream};
-use strom_object_store::ObjectStoreAdapter;
-use strom_storage_domain::{EncodedAuthoritySeal, EncodedTable};
-use strom_storage_protocol::{PreparationOutcome, SealPublication, TypedStoreError};
+use strom_storage_domain::EncodedTable;
+use strom_storage_protocol::PreparationOutcome;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::store::{SealStore, TableEstablishment, TableStore};
+use crate::store::{TableEstablishment, TableStore};
 
 use self::prepare::prepare_checkpoint;
 
@@ -21,7 +20,7 @@ const CHECKPOINT_CHILD_CREATES_MAX: usize = 16;
 const CHECKPOINT_TABLE_CHANNEL_MAX: usize = 1;
 
 pub(crate) async fn prepare_checkpoint_effect(
-    adapter: ObjectStoreAdapter,
+    store: TableStore,
     input: strom_storage_protocol::CheckpointInput,
 ) -> PreparationOutcome {
     let (table_sender, table_receiver) = mpsc::channel(CHECKPOINT_TABLE_CHANNEL_MAX);
@@ -33,7 +32,6 @@ pub(crate) async fn prepare_checkpoint_effect(
         let _consumer_may_be_gone = prepared_sender.send(prepared);
     });
 
-    let store = TableStore::new(adapter);
     let table_result = establish_tables(&store, table_receiver).await;
     if let Err(join_error) = preparation.await {
         return PreparationOutcome::Contradiction {
@@ -57,13 +55,6 @@ pub(crate) async fn prepare_checkpoint_effect(
             detail: "checkpoint preparation ended without a result".into(),
         },
     }
-}
-
-pub(crate) async fn publish_authority(
-    adapter: ObjectStoreAdapter,
-    candidate: EncodedAuthoritySeal,
-) -> Result<SealPublication, TypedStoreError> {
-    SealStore::new(adapter).publish_authority(&candidate).await
 }
 
 async fn establish_tables(

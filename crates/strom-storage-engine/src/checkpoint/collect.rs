@@ -1,14 +1,17 @@
 //! Best-effort collection after an advancing Seal publication.
 
-use strom_object_store::ObjectStoreAdapter;
 use strom_storage_domain::{BatchId, PartitionId, Seal};
 
 use crate::store::{TableStore, WalStore, targeted_table_deletes};
 
-pub(crate) async fn collect_advance(adapter: ObjectStoreAdapter, source: Seal, successor: Seal) {
+pub(crate) async fn collect_advance(
+    wal_store: WalStore,
+    table_store: TableStore,
+    source: Seal,
+    successor: Seal,
+) {
     let (partition, first, cut) = plan_wal_collection(&source, &successor);
     let table_deletes = targeted_table_deletes(&source, &successor);
-    let wal_store = WalStore::new(adapter.clone());
     let mut batch = first;
     loop {
         match wal_store.read_wal(partition, batch).await {
@@ -31,7 +34,6 @@ pub(crate) async fn collect_advance(adapter: ObjectStoreAdapter, source: Seal, s
             .expect("a collection coordinate below its cut has a successor");
     }
 
-    let table_store = TableStore::new(adapter);
     for proof in table_deletes {
         if table_store.delete_table(proof).await.is_err() {
             return;
@@ -83,7 +85,7 @@ mod tests {
     use strom_object_store::test_support::{
         BackendFailure, Fault, FaultStore, Operation, Selection, Target,
     };
-    use strom_object_store::{CreateEvidence, ObjectKey, PutBody};
+    use strom_object_store::{CreateEvidence, ObjectKey, ObjectStoreAdapter, PutBody};
     use strom_storage_domain::{
         AttemptId, DirectoryKey, FreshIdentity, OperationFact, OwnerToken, SealGeneration, SealKey,
         SortedRun, StoreKind, StreamUid, TableKey, TableObjectId, TableRef, TreeVersion, WalBody,
@@ -105,7 +107,7 @@ mod tests {
     {
         let fixture = CollectionFixture::plant(CollectionState::new()?, None).await?;
 
-        collect_advance(
+        run_collection(
             fixture.adapter.clone(),
             fixture.source.clone(),
             fixture.successor.clone(),
@@ -162,7 +164,7 @@ mod tests {
             let (source, successor) = transition.seals(&fixture.source, &fixture.successor)?;
 
             let outcome =
-                tokio::spawn(collect_advance(fixture.adapter.clone(), source, successor)).await;
+                tokio::spawn(run_collection(fixture.adapter.clone(), source, successor)).await;
 
             assert!(
                 outcome
@@ -186,7 +188,7 @@ mod tests {
             "a collection fault targets an object authorized for deletion"
         );
         let fixture = CollectionFixture::plant(state, Some(fault)).await?;
-        collect_advance(
+        run_collection(
             fixture.adapter.clone(),
             fixture.source.clone(),
             fixture.successor.clone(),
@@ -196,7 +198,7 @@ mod tests {
         fixture.assert_preserved().await?;
         fixture.assert_state(&target, target_state).await?;
 
-        collect_advance(
+        run_collection(
             ObjectStoreAdapter::new(Arc::clone(&fixture.backend)),
             fixture.source.clone(),
             fixture.successor.clone(),
@@ -206,6 +208,16 @@ mod tests {
         fixture.assert_complete().await?;
         fixture.store.verify()?;
         Ok(())
+    }
+
+    async fn run_collection(adapter: ObjectStoreAdapter, source: Seal, successor: Seal) {
+        collect_advance(
+            WalStore::new(adapter.clone()),
+            TableStore::new(adapter),
+            source,
+            successor,
+        )
+        .await;
     }
 
     struct CollectionFixture {

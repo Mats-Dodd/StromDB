@@ -9,16 +9,15 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio_util::task::JoinMap;
 
-use crate::checkpoint::{collect_advance, prepare_checkpoint_effect, publish_authority};
+use crate::checkpoint::{collect_advance, prepare_checkpoint_effect};
 use crate::engine::PublishedView;
-use crate::store::WalStore;
-
-const WRITER_EFFECTS_MAX: usize = 3;
+use crate::store::{SealStore, TableStore, WalStore};
 
 struct Writer {
     machine: WriterMachine,
-    adapter: ObjectStoreAdapter,
+    seal_store: SealStore,
     wal_store: WalStore,
+    table_store: TableStore,
     view: watch::Sender<PublishedView>,
     effects: JoinMap<EffectKey, WriterEvent>,
 }
@@ -41,10 +40,11 @@ impl Writer {
     ) -> Self {
         Self {
             machine: WriterMachine::from_recovery(recovery),
+            seal_store: SealStore::new(adapter.clone()),
             wal_store: WalStore::new(adapter.clone()),
-            adapter,
+            table_store: TableStore::new(adapter),
             view,
-            effects: JoinMap::with_capacity(WRITER_EFFECTS_MAX),
+            effects: JoinMap::new(),
         }
     }
 
@@ -120,37 +120,34 @@ impl Writer {
                 });
             }
             WriterEffect::PrepareCheckpoint(input) => {
-                let adapter = self.adapter.clone();
+                let store = self.table_store.clone();
                 let ticket = input.ticket();
                 self.effects.spawn(key, async move {
                     WriterEvent::CheckpointPrepared {
                         ticket,
-                        outcome: prepare_checkpoint_effect(adapter, input).await,
+                        outcome: prepare_checkpoint_effect(store, input).await,
                     }
                 });
             }
             WriterEffect::PublishAuthority { ticket, candidate } => {
-                let adapter = self.adapter.clone();
+                let store = self.seal_store.clone();
                 self.effects.spawn(key, async move {
                     WriterEvent::SealPublished {
                         ticket,
-                        result: publish_authority(adapter, candidate).await,
+                        result: store.publish_authority(&candidate).await,
                     }
                 });
             }
             WriterEffect::Collect(input) => {
                 let (cut, source, successor) = input.into_parts();
-                let adapter = self.adapter.clone();
+                let wal_store = self.wal_store.clone();
+                let table_store = self.table_store.clone();
                 self.effects.spawn(key, async move {
-                    collect_advance(adapter, source, successor).await;
+                    collect_advance(wal_store, table_store, source, successor).await;
                     WriterEvent::CollectFinished { cut }
                 });
             }
         }
-        assert!(
-            self.effects.len() <= WRITER_EFFECTS_MAX,
-            "one WAL, checkpoint, and collector fit the effect budget"
-        );
     }
 
     fn execute_action(&mut self, action: WriterAction) {
