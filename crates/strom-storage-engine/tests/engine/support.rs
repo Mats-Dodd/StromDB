@@ -1,7 +1,11 @@
+use std::sync::Arc;
+
+use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt as _};
 use strom_common::{Entropy, Seed};
 use strom_domain::{CreateOutcome, ExpiryPolicy, StreamContentType, StreamId, StreamLifecycle};
 use strom_object_store::ObjectKey;
-use strom_storage_domain::{BatchId, SealGeneration, SealKey, WalKey};
+use strom_storage_domain::{BatchId, SealGeneration, SealKey, SealNamespace, WalKey, WalNamespace};
 use strom_storage_engine::{Engine, StreamError};
 
 pub(crate) type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -36,4 +40,39 @@ pub(crate) fn seal_key(generation: u64) -> ObjectKey {
         .to_string()
         .parse()
         .expect("Seal key spelling is a canonical object key")
+}
+
+pub(crate) fn seal_namespace() -> ObjectKey {
+    SealNamespace
+        .to_string()
+        .parse()
+        .expect("Seal namespace spelling is a canonical object key")
+}
+
+pub(crate) fn wal_namespace() -> ObjectKey {
+    WalNamespace
+        .to_string()
+        .parse()
+        .expect("WAL namespace spelling is a canonical object key")
+}
+
+pub(crate) async fn assert_object_present(
+    store: &Arc<dyn ObjectStore>,
+    key: &ObjectKey,
+) -> TestResult {
+    store.head(&Path::from(key.as_str())).await?;
+    Ok(())
+}
+
+pub(crate) async fn assert_object_absent(
+    store: &Arc<dyn ObjectStore>,
+    key: &ObjectKey,
+) -> TestResult {
+    match store.head(&Path::from(key.as_str())).await {
+        Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Ok(metadata) => {
+            Err(format!("expected durable object {key} to be absent, found {metadata:?}").into())
+        }
+        Err(error) => Err(error.into()),
+    }
 }

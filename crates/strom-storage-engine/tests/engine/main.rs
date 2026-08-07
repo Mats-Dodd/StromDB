@@ -1,5 +1,6 @@
 //! Behavioral claims for the public engine boundary.
 
+mod bootstrap;
 mod support;
 mod writer;
 
