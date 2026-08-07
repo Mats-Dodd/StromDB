@@ -3,11 +3,9 @@
 mod collect;
 mod prepare;
 
-pub(crate) use collect::collect_advance;
-
 use futures::{StreamExt as _, stream};
 use strom_storage_domain::EncodedTable;
-use strom_storage_protocol::PreparationOutcome;
+use strom_storage_protocol::{CheckpointInput, CollectionInput, PreparationOutcome};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::store::{TableEstablishment, TableStore};
@@ -19,10 +17,7 @@ const CHECKPOINT_CHILD_CREATES_MAX: usize = 16;
 // retaining a checkpoint's encoded tables in aggregate.
 const CHECKPOINT_TABLE_CHANNEL_MAX: usize = 1;
 
-pub(crate) async fn prepare_checkpoint_effect(
-    store: TableStore,
-    input: strom_storage_protocol::CheckpointInput,
-) -> PreparationOutcome {
+pub(crate) async fn prepare(tables: TableStore, input: CheckpointInput) -> PreparationOutcome {
     let (table_sender, table_receiver) = mpsc::channel(CHECKPOINT_TABLE_CHANNEL_MAX);
     let (prepared_sender, prepared_receiver) = oneshot::channel();
     let preparation = tokio::task::spawn_blocking(move || {
@@ -32,7 +27,7 @@ pub(crate) async fn prepare_checkpoint_effect(
         let _consumer_may_be_gone = prepared_sender.send(prepared);
     });
 
-    let table_result = establish_tables(&store, table_receiver).await;
+    let table_result = establish_tables(&tables, table_receiver).await;
     if let Err(join_error) = preparation.await {
         return PreparationOutcome::Contradiction {
             detail: format!("checkpoint preparation task failed: {join_error}"),
@@ -55,6 +50,14 @@ pub(crate) async fn prepare_checkpoint_effect(
             detail: "checkpoint preparation ended without a result".into(),
         },
     }
+}
+
+pub(crate) async fn collect(
+    wal: crate::store::WalStore,
+    tables: TableStore,
+    input: CollectionInput,
+) {
+    collect::collect(wal, tables, input).await;
 }
 
 async fn establish_tables(

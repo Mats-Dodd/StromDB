@@ -39,12 +39,6 @@ pub(super) fn prepare_checkpoint(
     let attempt = ticket.attempt();
     let partition = source.partition();
     let owner_claim = attempt.owner_claim();
-    let previous_cut = source.replay().batch();
-    if previous_cut.is_some_and(|previous| cut <= previous) {
-        return Err("checkpoint cut does not advance its source Seal"
-            .to_owned()
-            .into());
-    }
     let generation = source
         .generation()
         .successor()
@@ -135,35 +129,6 @@ fn can_append_delta(source: &Seal, delta: &ForestDelta) -> bool {
             .map(|(_uid, cell)| ledger_row_bytes(cell)),
     );
     select_delta(source, directory, ledger)
-}
-
-#[cfg(test)]
-fn plan_delta_rows(base: &Forest, snapshot: &Forest) -> PlannedRows {
-    let delta = snapshot.delta_since(base);
-    PlannedRows {
-        directory: chunk_rows(delta.directory, |_row| DIRECTORY_ROW_ENCODED_BYTES_MAX),
-        ledger: chunk_rows(delta.ledger, |(_uid, cell)| ledger_row_bytes(cell)),
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-struct PlannedRows {
-    directory: Vec<Vec<(StreamPath, DirectoryEntry)>>,
-    ledger: Vec<Vec<(StreamUid, LedgerCell)>>,
-}
-
-#[cfg(test)]
-fn chunk_rows<Row>(
-    rows: impl IntoIterator<Item = Row>,
-    row_bytes: impl Fn(&Row) -> u64,
-) -> Vec<Vec<Row>> {
-    let mut chunks = Vec::new();
-    for_each_chunk(rows, row_bytes, |chunk, _estimate| {
-        chunks.push(chunk);
-        true
-    });
-    chunks
 }
 
 fn account_rows(rows: impl IntoIterator<Item = u64>) -> ChunkAccounting {
@@ -404,18 +369,20 @@ fn assemble_checkpoint_seal(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::num::NonZeroU64;
 
     use proptest::prelude::*;
     use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
-    use strom_storage_domain::{OperationFact, StreamUid};
+    use strom_storage_domain::{
+        OperationFact, StreamRecord, StreamUid, decode_directory_sst, decode_ledger_sst,
+    };
 
     use super::*;
 
     proptest! {
         #[test]
-        fn generated_delta_rows_transform_the_exact_base_into_the_snapshot(
+        fn production_checkpoint_materializes_the_frozen_snapshot(
             actions in prop::collection::vec(any::<u8>(), 1..80),
             raw_split in any::<usize>(),
         ) {
@@ -430,38 +397,26 @@ mod tests {
             apply_actions(&mut base, base_actions, &mut batch);
             let mut snapshot = base.clone();
             apply_actions(&mut snapshot, suffix_actions, &mut batch);
+            let cut = BatchId::try_from(
+                batch.checked_sub(1).expect("generated history has a cut")
+            ).expect("generated cut is nonzero");
+            let source = source_for_base(&base, partition())
+                .expect("generated base has a legal source Seal");
+            let ticket = strom_storage_protocol::CheckpointTicket::new(
+                source.generation(),
+                cut,
+                AttemptId::new(SealGeneration::genesis(), 0),
+            );
+            let (prepared, tables) = prepare_checkpoint_for_test(CheckpointInput::new(
+                ticket,
+                source.clone(),
+                base.clone(),
+                snapshot.clone(),
+            )).expect("generated checkpoint preparation succeeds");
 
-            let rows = plan_delta_rows(&base, &snapshot);
-            let base_cells = base.checkpoint_cells();
-            let mut directory = base_cells.directory.into_iter().collect::<BTreeMap<_, _>>();
-            for (key, entry) in rows.directory.into_iter().flatten() {
-                directory.insert(key, entry);
-            }
-            let mut ledger = base_cells
-                .ledger
-                .into_iter()
-                .collect::<BTreeMap<_, _>>();
-            for (uid, cell) in rows.ledger.into_iter().flatten() {
-                match cell {
-                    LedgerCell::Value(_) => {
-                        ledger.insert(uid, cell);
-                    }
-                    LedgerCell::Delete => {
-                        ledger.remove(&uid);
-                    }
-                }
-            }
-            let snapshot_cells = snapshot.checkpoint_cells();
-            let expected_directory = snapshot_cells
-                .directory
-                .into_iter()
-                .collect::<BTreeMap<_, _>>();
-            let expected_ledger = snapshot_cells
-                .ledger
-                .into_iter()
-                .collect::<BTreeMap<_, _>>();
-            prop_assert_eq!(directory, expected_directory);
-            prop_assert_eq!(ledger, expected_ledger);
+            let expected = evaluated_cells(&snapshot);
+            let evaluated = evaluate_successor(&source, &prepared, &base, &tables);
+            prop_assert_eq!(evaluated, expected);
         }
     }
 
@@ -489,56 +444,30 @@ mod tests {
             },
         )?;
 
-        let rows = plan_delta_rows(&Forest::empty(), &snapshot);
-        assert_eq!(
-            vec![vec![(path, DirectoryEntry::Tombstone(uid))]],
-            rows.directory
-        );
-        assert!(rows.ledger.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn no_candidate_is_constructed_at_the_source_cut() -> Result<(), Box<dyn std::error::Error>> {
-        let partition = partition();
-        let source = Seal::new(
-            partition,
-            SealGeneration::genesis(),
-            WalReplayPoint::Genesis,
-            TreeVersion::empty(),
-            TreeVersion::empty(),
-        )?;
-        let owner_claim = source.generation().successor()?;
-        let source = source.claim_successor()?;
-        let cut = BatchId::try_from(1)?;
-        let source = Seal::new(
-            partition,
-            source.generation(),
-            WalReplayPoint::Through {
-                batch: cut,
-                owner: OwnerToken::from(SealGeneration::genesis()),
-            },
-            TreeVersion::empty(),
-            TreeVersion::empty(),
-        )?;
+        let base = Forest::empty();
+        let source = source_for_base(&base, partition())?;
         let ticket = strom_storage_protocol::CheckpointTicket::new(
             source.generation(),
-            cut,
-            AttemptId::new(owner_claim, 0),
+            BatchId::try_from(2)?,
+            AttemptId::new(SealGeneration::genesis(), 0),
         );
-        let result = prepare_checkpoint_for_test(CheckpointInput::new(
+        let (prepared, tables) = prepare_checkpoint_for_test(CheckpointInput::new(
             ticket,
-            source,
-            Forest::empty(),
-            Forest::empty(),
-        ));
-        assert!(result.is_err(), "a same-cut advance has no candidate");
+            source.clone(),
+            base.clone(),
+            snapshot.clone(),
+        ))?;
+        assert_eq!(
+            evaluated_cells(&snapshot),
+            evaluate_successor(&source, &prepared, &base, &tables)
+        );
         Ok(())
     }
 
     #[test]
     fn one_run_beyond_the_tree_bound_rewrites_every_nonempty_tree()
     -> Result<(), Box<dyn std::error::Error>> {
+        let path = stream_path("events/a")?;
         let partition = partition();
         let owner_claim = SealGeneration::try_from(2)?;
         let source_generation = SealGeneration::try_from(3)?;
@@ -564,7 +493,6 @@ mod tests {
             TreeVersion::try_from(runs)?,
             TreeVersion::empty(),
         )?;
-        let path = stream_path("events/a")?;
         let uid = StreamUid::try_from(1)?;
         let mut snapshot = Forest::empty();
         snapshot.strict_fold(
@@ -709,14 +637,60 @@ mod tests {
         }
     }
 
+    fn stream_path(raw: &str) -> Result<StreamPath, Box<dyn std::error::Error>> {
+        Ok(raw.parse()?)
+    }
+
+    fn source_for_base(
+        base: &Forest,
+        partition: PartitionId,
+    ) -> Result<Seal, Box<dyn std::error::Error>> {
+        let generation = SealGeneration::try_from(2)?;
+        let cells = base.checkpoint_cells();
+        let directory = retained_tree(
+            generation,
+            StoreKind::Directory,
+            !cells.directory.is_empty(),
+        )?;
+        let ledger = retained_tree(generation, StoreKind::Ledger, !cells.ledger.is_empty())?;
+        Ok(Seal::new(
+            partition,
+            generation,
+            WalReplayPoint::Genesis,
+            directory,
+            ledger,
+        )?)
+    }
+
+    fn retained_tree(
+        generation: SealGeneration,
+        store: StoreKind,
+        populated: bool,
+    ) -> Result<TreeVersion, Box<dyn std::error::Error>> {
+        if !populated {
+            return Ok(TreeVersion::empty());
+        }
+        let ordinal = match store {
+            StoreKind::Directory => 0,
+            StoreKind::Ledger => 1,
+            StoreKind::Tally => 2,
+            StoreKind::Annals => 3,
+        };
+        let fresh = FreshIdentity::new(
+            generation,
+            AttemptId::new(SealGeneration::genesis(), 0),
+            ordinal,
+        )?;
+        let table = TableRef::new(TableObjectId::new(fresh, store), NonZeroU64::MIN)?;
+        Ok(TreeVersion::try_from(vec![SortedRun::try_from(vec![
+            table,
+        ])?])?)
+    }
+
     fn partition() -> PartitionId {
         "00112233-4455-6677-8899-aabbccddeeff"
             .parse()
             .expect("test partition is canonical")
-    }
-
-    fn stream_path(raw: &str) -> Result<StreamPath, Box<dyn std::error::Error>> {
-        Ok(raw.parse()?)
     }
 
     fn prepare_checkpoint_for_test(
@@ -729,6 +703,172 @@ mod tests {
         })?
         .expect("the test table consumer remains open");
         Ok((*prepared, tables))
+    }
+
+    type EvaluatedCells = (
+        BTreeMap<StreamPath, DirectoryEntry>,
+        BTreeMap<StreamUid, StreamRecord>,
+    );
+
+    fn evaluated_cells(forest: &Forest) -> EvaluatedCells {
+        let cells = forest.checkpoint_cells();
+        let directory = cells.directory.into_iter().collect();
+        let ledger = cells
+            .ledger
+            .into_iter()
+            .map(|(uid, cell)| {
+                assert!(
+                    matches!(cell, LedgerCell::Value(_)),
+                    "a resident forest has no Ledger delete cells"
+                );
+                let record = forest
+                    .record(uid)
+                    .expect("a resident Ledger value names its record")
+                    .clone();
+                (uid, record)
+            })
+            .collect();
+        (directory, ledger)
+    }
+
+    fn evaluate_successor(
+        source: &Seal,
+        prepared: &PreparedCheckpoint,
+        base: &Forest,
+        tables: &[EncodedTable],
+    ) -> EvaluatedCells {
+        let successor = prepared.successor();
+        let base_cells = base.checkpoint_cells();
+        let directory = evaluate_directory(
+            successor.partition(),
+            source.directory(),
+            successor.directory(),
+            base_cells.directory.into_iter().collect(),
+            tables,
+        );
+        let ledger = evaluate_ledger(
+            successor.partition(),
+            source.ledger(),
+            successor.ledger(),
+            base_cells
+                .ledger
+                .into_iter()
+                .map(|(uid, cell)| {
+                    assert!(
+                        matches!(cell, LedgerCell::Value(_)),
+                        "a retained base has no Ledger delete cells"
+                    );
+                    let record = base
+                        .record(uid)
+                        .expect("a retained Ledger value names its resident record")
+                        .clone();
+                    (uid, record)
+                })
+                .collect(),
+            tables,
+        );
+        (directory, ledger)
+    }
+
+    fn evaluate_directory(
+        partition: PartitionId,
+        source: &TreeVersion,
+        successor: &TreeVersion,
+        base: BTreeMap<StreamPath, DirectoryEntry>,
+        tables: &[EncodedTable],
+    ) -> BTreeMap<StreamPath, DirectoryEntry> {
+        let (carried, fresh) = resolve_tree(source, successor, StoreKind::Directory, tables)
+            .expect("every successor Directory reference resolves");
+        let mut rows = if carried { base } else { BTreeMap::new() };
+        for table in fresh {
+            let key = TableKey::new(table.table().object());
+            for (path, entry) in decode_directory_sst(partition, &key, table.bytes())
+                .expect("production Directory tables pass their checked decoder")
+            {
+                rows.insert(path, entry);
+            }
+        }
+        rows
+    }
+
+    fn evaluate_ledger(
+        partition: PartitionId,
+        source: &TreeVersion,
+        successor: &TreeVersion,
+        base: BTreeMap<StreamUid, StreamRecord>,
+        tables: &[EncodedTable],
+    ) -> BTreeMap<StreamUid, StreamRecord> {
+        let (carried, fresh) = resolve_tree(source, successor, StoreKind::Ledger, tables)
+            .expect("every successor Ledger reference resolves");
+        let mut rows = if carried { base } else { BTreeMap::new() };
+        for table in fresh {
+            let key = TableKey::new(table.table().object());
+            for (uid, cell) in decode_ledger_sst(partition, &key, table.bytes())
+                .expect("production Ledger tables pass their checked decoder")
+            {
+                match cell {
+                    LedgerCell::Value(record) => {
+                        rows.insert(uid, record);
+                    }
+                    LedgerCell::Delete => {
+                        rows.remove(&uid);
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    fn resolve_tree<'tables>(
+        source: &TreeVersion,
+        successor: &TreeVersion,
+        store: StoreKind,
+        tables: &'tables [EncodedTable],
+    ) -> Result<(bool, Vec<&'tables EncodedTable>), &'static str> {
+        let source_objects = source
+            .runs()
+            .iter()
+            .flat_map(SortedRun::tables)
+            .map(|table| table.object())
+            .collect::<BTreeSet<_>>();
+        let captured = tables
+            .iter()
+            .filter(|table| table.table().object().store() == store)
+            .map(|table| (table.table().object(), table))
+            .collect::<BTreeMap<_, _>>();
+        let mut carried = false;
+        let mut used = BTreeSet::new();
+        let mut fresh = Vec::new();
+        for run in successor.runs().iter().rev() {
+            for reference in run.tables() {
+                let object = reference.object();
+                if source_objects.contains(&object) {
+                    carried = true;
+                } else if let Some(table) = captured.get(&object) {
+                    assert_eq!(
+                        reference,
+                        &table.table(),
+                        "a captured table resolves its exact successor reference"
+                    );
+                    assert!(used.insert(object), "a fresh table resolves exactly once");
+                    fresh.push(*table);
+                } else {
+                    return Err("a successor table is neither carried source nor captured fresh");
+                }
+            }
+        }
+        assert_eq!(
+            used.len(),
+            captured.len(),
+            "every captured fresh table is selected exactly once"
+        );
+        if carried {
+            assert!(
+                successor.runs().ends_with(source.runs()),
+                "a carried source tree is the exact older manifest suffix"
+            );
+        }
+        Ok((carried, fresh))
     }
 
     fn seal_with_directory_tables(

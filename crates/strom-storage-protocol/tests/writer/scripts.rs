@@ -5,8 +5,9 @@ use strom_domain::{
     CloseStreamOutcome, CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamTtl,
 };
 use strom_storage_domain::{
-    AttemptId, BatchId, OperationFact, Seal, StreamUid, TreeVersion, WAL_RUN_FACTS_MAX,
-    WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WAL_SUFFIX_COORDINATES_MAX_V2, WalReplayPoint,
+    AttemptId, BatchId, OperationFact, Seal, SealGeneration, StreamUid, TreeVersion,
+    WAL_RUN_FACTS_MAX, WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WAL_SUFFIX_COORDINATES_MAX_V2,
+    WalReplayPoint,
 };
 use strom_storage_protocol::{
     AdmissionRefusal, Applied, CheckpointTicket, CommandEnvelope, CreateStream, Forest,
@@ -643,10 +644,9 @@ fn authored_checkpoint_publication_preserves_the_durable_view_and_starts_collect
     let WriterEffect::Collect(input) = effects.pop().ok_or("collection starts")? else {
         return Err("the checkpoint starts collection".into());
     };
-    let (cut, _source, observed_successor) = input.into_parts();
     assert!(effects.is_empty());
-    assert_eq!(ticket.cut(), cut);
-    assert_eq!(successor, observed_successor);
+    assert_eq!(ticket.cut(), input.cut());
+    assert_eq!(&successor, input.successor());
     Ok(())
 }
 
@@ -715,9 +715,34 @@ fn invalid_completions_panic_before_consuming_the_issued_effect() -> TestResult 
 fn malformed_prepared_checkpoints_fail_before_they_become_events() -> TestResult {
     let (_machine, ticket, input) = machine_with_preparation()?;
     let (_ticket, source, _base, snapshot) = input.into_parts();
-    let wrong_successor = Seal::new(
+    let valid_successor = Seal::new(
         source.partition(),
         source.generation().successor()?,
+        WalReplayPoint::Through {
+            batch: ticket.cut(),
+            owner: strom_storage_domain::OwnerToken::from(ticket.attempt().owner_claim()),
+        },
+        TreeVersion::empty(),
+        TreeVersion::empty(),
+    )?;
+    let foreign_partition = "11112222-3333-4444-8888-9999aaaabbbb".parse()?;
+    let cross_partition = Seal::new(
+        foreign_partition,
+        valid_successor.generation(),
+        valid_successor.replay(),
+        TreeVersion::empty(),
+        TreeVersion::empty(),
+    )?;
+    let skipped_generation = Seal::new(
+        source.partition(),
+        valid_successor.generation().successor()?,
+        valid_successor.replay(),
+        TreeVersion::empty(),
+        TreeVersion::empty(),
+    )?;
+    let wrong_cut = Seal::new(
+        source.partition(),
+        valid_successor.generation(),
         WalReplayPoint::Through {
             batch: ticket.cut().successor()?,
             owner: strom_storage_domain::OwnerToken::from(ticket.attempt().owner_claim()),
@@ -725,14 +750,39 @@ fn malformed_prepared_checkpoints_fail_before_they_become_events() -> TestResult
         TreeVersion::empty(),
         TreeVersion::empty(),
     )?;
-    let candidate = strom_storage_domain::EncodedAuthoritySeal::try_from(&wrong_successor)?;
-    assert!(
-        catch_unwind(AssertUnwindSafe(|| {
-            let _prepared =
-                PreparedCheckpoint::new(ticket, source, wrong_successor, snapshot, candidate);
-        }))
-        .is_err()
-    );
+    let genesis_successor = Seal::new(
+        source.partition(),
+        valid_successor.generation(),
+        WalReplayPoint::Genesis,
+        TreeVersion::empty(),
+        TreeVersion::empty(),
+    )?;
+    let nonadvancing_source = Seal::new(
+        source.partition(),
+        source.generation(),
+        WalReplayPoint::Through {
+            batch: ticket.cut(),
+            owner: strom_storage_domain::OwnerToken::from(SealGeneration::genesis()),
+        },
+        source.directory().clone(),
+        source.ledger().clone(),
+    )?;
+    for (source, successor) in [
+        (source.clone(), cross_partition),
+        (source.clone(), skipped_generation),
+        (source.clone(), wrong_cut),
+        (source.clone(), genesis_successor),
+        (nonadvancing_source, valid_successor),
+    ] {
+        let candidate = strom_storage_domain::EncodedAuthoritySeal::try_from(&successor)?;
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _prepared =
+                    PreparedCheckpoint::new(ticket, source, successor, snapshot.clone(), candidate);
+            }))
+            .is_err()
+        );
+    }
     Ok(())
 }
 

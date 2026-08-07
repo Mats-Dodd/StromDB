@@ -3,9 +3,10 @@
 use std::collections::BTreeSet;
 use strom_object_store::{ByteBound, CreateEvidence, ObjectStoreAdapter, PutBody};
 use strom_storage_domain::{
-    DecodedTable, EncodedTable, PartitionId, Seal, StoreKind, TableKey, TableObjectId, TableRef,
+    DecodedTable, EncodedTable, PartitionId, StoreKind, TableKey, TableObjectId, TableRef,
     decode_directory_sst, decode_ledger_sst,
 };
+use strom_storage_protocol::CollectionInput;
 
 use super::{TypedStoreError, object_key, typed_store_contradiction, typed_store_error};
 
@@ -26,6 +27,23 @@ pub(crate) enum TableEstablishment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AuthorizedTableDelete {
     object: TableObjectId,
+}
+
+impl AuthorizedTableDelete {
+    pub(crate) fn dropped_by(input: &CollectionInput) -> Vec<Self> {
+        let successor_objects: BTreeSet<TableObjectId> = input
+            .successor()
+            .tables()
+            .map(|table| table.object())
+            .collect();
+        input
+            .source()
+            .tables()
+            .map(|table| table.object())
+            .filter(|object| !successor_objects.contains(object))
+            .map(|object| Self { object })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -163,37 +181,6 @@ impl TableStore {
             ))),
         }
     }
-}
-
-pub(crate) fn targeted_table_deletes(
-    source: &Seal,
-    successor: &Seal,
-) -> Vec<AuthorizedTableDelete> {
-    assert_eq!(
-        source.partition(),
-        successor.partition(),
-        "one advance keeps the partition identity"
-    );
-    assert!(
-        source.generation() < successor.generation(),
-        "targeted collection compares a source with its advancing successor"
-    );
-    assert_eq!(
-        source
-            .generation()
-            .successor()
-            .expect("an observed successor proves the source generation is not exhausted"),
-        successor.generation(),
-        "targeted collection requires an exact Seal successor pair"
-    );
-    let successor_objects: BTreeSet<TableObjectId> =
-        successor.tables().map(|table| table.object()).collect();
-    source
-        .tables()
-        .map(|table| table.object())
-        .filter(|object| !successor_objects.contains(object))
-        .map(|object| AuthorizedTableDelete { object })
-        .collect()
 }
 
 #[cfg(test)]

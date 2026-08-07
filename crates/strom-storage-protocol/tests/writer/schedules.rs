@@ -175,9 +175,9 @@ fn complete_generated(
             ticket,
             result: seal_result(choice[1]),
         },
-        Outstanding::Effect(WriterEffect::Collect(input)) => WriterEvent::CollectFinished {
-            cut: input.into_parts().0,
-        },
+        Outstanding::Effect(WriterEffect::Collect(input)) => {
+            WriterEvent::CollectFinished { cut: input.cut() }
+        }
         Outstanding::Cancelling(input) => cancellation_event(input, choice[1])?,
     };
     observe_step(machine.handle(event), outstanding)

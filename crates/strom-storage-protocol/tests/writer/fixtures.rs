@@ -217,9 +217,7 @@ pub(super) fn complete_success(effect: WriterEffect) -> TestResult<WriterEvent> 
             ticket,
             result: Ok(SealPublication::Authored),
         }),
-        WriterEffect::Collect(input) => Ok(WriterEvent::CollectFinished {
-            cut: input.into_parts().0,
-        }),
+        WriterEffect::Collect(input) => Ok(WriterEvent::CollectFinished { cut: input.cut() }),
     }
 }
 
@@ -321,7 +319,7 @@ pub(super) fn collection_cut(step: WriterStep) -> TestResult<BatchId> {
     outputs
         .into_iter()
         .find_map(|output| match output {
-            WriterOutput::Effect(WriterEffect::Collect(input)) => Some(input.into_parts().0),
+            WriterOutput::Effect(WriterEffect::Collect(input)) => Some(input.cut()),
             WriterOutput::Effect(
                 WriterEffect::EstablishWal(_)
                 | WriterEffect::PrepareCheckpoint(_)

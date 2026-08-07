@@ -11,7 +11,7 @@ use strom_storage_domain::{SEAL_ENCODED_BYTES_MAX, WAL_ENCODED_BYTES_MAX};
 pub(crate) use strom_storage_protocol::{SealPublication, TypedStoreError, WalEstablishment};
 
 pub(crate) use seal::SealStore;
-pub(crate) use table::{TableEstablishment, TableStore, targeted_table_deletes};
+pub(crate) use table::{AuthorizedTableDelete, TableEstablishment, TableStore};
 pub(crate) use wal::{ObservedWal, WalStore};
 
 fn typed_store_error(error: StoreError) -> TypedStoreError {

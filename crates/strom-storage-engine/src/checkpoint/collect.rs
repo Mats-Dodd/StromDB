@@ -1,17 +1,22 @@
 //! Best-effort collection after an advancing Seal publication.
 
-use strom_storage_domain::{BatchId, PartitionId, Seal};
+use strom_storage_domain::BatchId;
+use strom_storage_protocol::CollectionInput;
 
-use crate::store::{TableStore, WalStore, targeted_table_deletes};
+use crate::store::{AuthorizedTableDelete, TableStore, WalStore};
 
-pub(crate) async fn collect_advance(
-    wal_store: WalStore,
-    table_store: TableStore,
-    source: Seal,
-    successor: Seal,
-) {
-    let (partition, first, cut) = plan_wal_collection(&source, &successor);
-    let table_deletes = targeted_table_deletes(&source, &successor);
+pub(super) async fn collect(wal_store: WalStore, table_store: TableStore, input: CollectionInput) {
+    let partition = input.source().partition();
+    let cut = input.cut();
+    let first = input.source().replay().batch().map_or_else(
+        || BatchId::try_from(1).expect("batch one is a legal WAL coordinate"),
+        |previous| {
+            previous
+                .successor()
+                .expect("a source cut below its prepared successor cut has a successor")
+        },
+    );
+    let table_deletes = AuthorizedTableDelete::dropped_by(&input);
     let mut batch = first;
     loop {
         match wal_store.read_wal(partition, batch).await {
@@ -41,39 +46,6 @@ pub(crate) async fn collect_advance(
     }
 }
 
-fn plan_wal_collection(source: &Seal, successor: &Seal) -> (PartitionId, BatchId, BatchId) {
-    assert_eq!(
-        source.partition(),
-        successor.partition(),
-        "one advancing Seal transition keeps the partition identity"
-    );
-    assert_eq!(
-        source
-            .generation()
-            .successor()
-            .expect("an advancing successor proves the source generation is not exhausted"),
-        successor.generation(),
-        "collection requires an exact Seal successor pair"
-    );
-    let cut = successor
-        .replay()
-        .batch()
-        .expect("an advancing successor Seal has a WAL cut");
-    let first = match source.replay().batch() {
-        None => BatchId::try_from(1).expect("batch one is a legal WAL coordinate"),
-        Some(previous) => {
-            assert!(
-                previous < cut,
-                "an advancing successor Seal has a strictly greater WAL cut"
-            );
-            previous
-                .successor()
-                .expect("a WAL cut below its successor cut has a successor coordinate")
-        }
-    };
-    (source.partition(), first, cut)
-}
-
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
@@ -87,19 +59,25 @@ mod tests {
     };
     use strom_object_store::{CreateEvidence, ObjectKey, ObjectStoreAdapter, PutBody};
     use strom_storage_domain::{
-        AttemptId, FreshIdentity, OperationFact, OwnerToken, SealGeneration, SealKey, SortedRun,
-        StoreKind, StreamUid, TableKey, TableObjectId, TableRef, TreeVersion, WalBody, WalFacts,
-        WalKey, WalObject, WalReplayPoint, encode_seal, encode_wal,
+        AttemptId, DecodedTable, EncodedAuthoritySeal, FreshIdentity, OperationFact, OwnerToken,
+        PartitionId, Seal, SealGeneration, SealKey, SortedRun, StoreKind, StreamRecord, StreamUid,
+        TableKey, TableObjectId, TableRef, TreeVersion, WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER,
+        WalBody, WalFacts, WalKey, WalObject, WalReplayPoint, encode_seal, encode_wal,
+    };
+    use strom_storage_protocol::{
+        BootstrapEffect, BootstrapEvent, BootstrapMachine, BootstrapStep, CollectionInput,
+        PreparationOutcome, PreparedCheckpoint, SealPublication, WalEstablishment, WriterEffect,
+        WriterEvent, WriterMachine, WriterOutput,
     };
 
     use super::*;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
-    const COVERED_RUN_BATCHES: [u64; 2] = [1, 4];
+    const COVERED_RUN_BATCHES: [u64; 2] = [1, CUT_BATCH];
     const FENCE_BATCH: u64 = 2;
-    const CUT_BATCH: u64 = 4;
-    const AFTER_CUT_BATCH: u64 = 5;
+    const CUT_BATCH: u64 = WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER;
+    const AFTER_CUT_BATCH: u64 = CUT_BATCH + 1;
     const TABLE_MARKER: &[u8] = b"collection table";
 
     #[tokio::test]
@@ -107,12 +85,7 @@ mod tests {
     {
         let fixture = CollectionFixture::plant(CollectionState::new()?, None).await?;
 
-        run_collection(
-            fixture.adapter.clone(),
-            fixture.source.clone(),
-            fixture.successor.clone(),
-        )
-        .await;
+        run_collection(fixture.adapter.clone(), &fixture.state).await?;
 
         fixture.assert_complete().await?;
         for batch in COVERED_RUN_BATCHES {
@@ -152,31 +125,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn invalid_seal_transitions_are_rejected_before_any_delete() -> TestResult {
-        let fixture = CollectionFixture::plant(CollectionState::new()?, None).await?;
-        for transition in [
-            InvalidTransition::CrossPartition,
-            InvalidTransition::SkippedGeneration,
-            InvalidTransition::NonAdvancingCut,
-            InvalidTransition::GenesisSuccessor,
-        ] {
-            let (source, successor) = transition.seals(&fixture.source, &fixture.successor)?;
-
-            let outcome =
-                tokio::spawn(run_collection(fixture.adapter.clone(), source, successor)).await;
-
-            assert!(
-                outcome
-                    .expect_err("an invalid collection transition panics")
-                    .is_panic(),
-                "an invalid collection transition fails as an in-process invariant: {transition:?}"
-            );
-            fixture.assert_unchanged().await?;
-        }
-        Ok(())
-    }
-
     async fn check_delete_failure(
         state: CollectionState,
         target: ObjectKey,
@@ -188,44 +136,37 @@ mod tests {
             "a collection fault targets an object authorized for deletion"
         );
         let fixture = CollectionFixture::plant(state, Some(fault)).await?;
-        run_collection(
-            fixture.adapter.clone(),
-            fixture.source.clone(),
-            fixture.successor.clone(),
-        )
-        .await;
+        run_collection(fixture.adapter.clone(), &fixture.state).await?;
 
         fixture.assert_preserved().await?;
         fixture.assert_state(&target, target_state).await?;
 
         run_collection(
             ObjectStoreAdapter::new(Arc::clone(&fixture.backend)),
-            fixture.source.clone(),
-            fixture.successor.clone(),
+            &fixture.state,
         )
-        .await;
+        .await?;
 
         fixture.assert_complete().await?;
         fixture.store.verify()?;
         Ok(())
     }
 
-    async fn run_collection(adapter: ObjectStoreAdapter, source: Seal, successor: Seal) {
-        collect_advance(
+    async fn run_collection(adapter: ObjectStoreAdapter, state: &CollectionState) -> TestResult {
+        collect(
             WalStore::new(adapter.clone()),
             TableStore::new(adapter),
-            source,
-            successor,
+            mint_collection_input(state)?,
         )
         .await;
+        Ok(())
     }
 
     struct CollectionFixture {
         store: FaultStore,
         backend: Arc<dyn ObjectStore>,
         adapter: ObjectStoreAdapter,
-        source: Seal,
-        successor: Seal,
+        state: CollectionState,
         dead: Vec<ObjectKey>,
         preserved: Vec<ObjectKey>,
     }
@@ -256,8 +197,7 @@ mod tests {
                 store,
                 backend,
                 adapter,
-                source: state.source,
-                successor: state.successor,
+                state: state.clone(),
                 dead: state.dead,
                 preserved: state.preserved,
             })
@@ -266,13 +206,6 @@ mod tests {
         async fn assert_complete(&self) -> TestResult {
             for key in &self.dead {
                 self.assert_state(key, ObjectState::Absent).await?;
-            }
-            self.assert_preserved().await
-        }
-
-        async fn assert_unchanged(&self) -> TestResult {
-            for key in &self.dead {
-                self.assert_state(key, ObjectState::Present).await?;
             }
             self.assert_preserved().await
         }
@@ -297,6 +230,7 @@ mod tests {
 
     #[derive(Clone)]
     struct CollectionState {
+        head: Seal,
         source: Seal,
         successor: Seal,
         covered_runs: Vec<WalObject>,
@@ -310,28 +244,29 @@ mod tests {
     impl CollectionState {
         fn new() -> TestResult<Self> {
             let partition = partition();
-            let source_generation = SealGeneration::genesis().successor()?;
+            let head_generation = SealGeneration::try_from(CUT_BATCH)?;
+            let source_generation = head_generation.successor()?;
             let successor_generation = source_generation.successor()?;
             let dropped_directory = table_ref(
-                source_generation,
+                head_generation,
                 SealGeneration::genesis(),
                 0,
                 StoreKind::Directory,
             )?;
             let carried_directory = table_ref(
-                source_generation,
+                head_generation,
                 SealGeneration::genesis(),
                 1,
                 StoreKind::Directory,
             )?;
             let dropped_ledger = table_ref(
-                source_generation,
+                head_generation,
                 SealGeneration::genesis(),
                 0,
                 StoreKind::Ledger,
             )?;
             let carried_ledger = table_ref(
-                source_generation,
+                head_generation,
                 SealGeneration::genesis(),
                 1,
                 StoreKind::Ledger,
@@ -354,13 +289,14 @@ mod tests {
                 1,
                 StoreKind::Directory,
             )?;
-            let source = Seal::new(
+            let head = Seal::new(
                 partition,
-                source_generation,
+                head_generation,
                 WalReplayPoint::Genesis,
                 tree([dropped_directory, carried_directory])?,
                 tree([dropped_ledger, carried_ledger])?,
             )?;
+            let source = head.claim_successor()?;
             let owner = OwnerToken::from(source_generation);
             let successor = Seal::new(
                 partition,
@@ -412,6 +348,7 @@ mod tests {
                 object_key(SealKey::from(successor_generation)),
             ];
             Ok(Self {
+                head,
                 source,
                 successor,
                 covered_runs,
@@ -430,66 +367,158 @@ mod tests {
         Absent,
     }
 
-    #[derive(Debug, Clone, Copy)]
-    enum InvalidTransition {
-        CrossPartition,
-        SkippedGeneration,
-        NonAdvancingCut,
-        GenesisSuccessor,
-    }
-
-    impl InvalidTransition {
-        fn seals(self, source: &Seal, successor: &Seal) -> TestResult<(Seal, Seal)> {
-            let (source, successor) = match self {
-                Self::CrossPartition => {
-                    let partition = "11112222-3333-4444-8888-9999aaaabbbb".parse()?;
-                    let invalid = Seal::new(
-                        partition,
-                        successor.generation(),
-                        successor.replay(),
-                        successor.directory().clone(),
-                        successor.ledger().clone(),
-                    )?;
-                    (source.clone(), invalid)
-                }
-                Self::SkippedGeneration => {
-                    let generation = successor.generation().successor()?;
-                    let invalid = Seal::new(
-                        successor.partition(),
-                        generation,
-                        successor.replay(),
-                        successor.directory().clone(),
-                        successor.ledger().clone(),
-                    )?;
-                    (source.clone(), invalid)
-                }
-                Self::NonAdvancingCut => {
-                    let cut = BatchId::try_from(CUT_BATCH)?;
-                    let invalid_source = Seal::new(
-                        source.partition(),
-                        source.generation(),
-                        WalReplayPoint::Through {
-                            batch: cut,
-                            owner: OwnerToken::from(SealGeneration::genesis()),
-                        },
-                        source.directory().clone(),
-                        source.ledger().clone(),
-                    )?;
-                    (invalid_source, successor.clone())
-                }
-                Self::GenesisSuccessor => {
-                    let invalid = Seal::new(
-                        successor.partition(),
-                        successor.generation(),
-                        WalReplayPoint::Genesis,
-                        successor.directory().clone(),
-                        successor.ledger().clone(),
-                    )?;
-                    (source.clone(), invalid)
+    fn mint_collection_input(state: &CollectionState) -> TestResult<CollectionInput> {
+        let mut bootstrap = BootstrapMachine::new();
+        let step = bootstrap.handle(BootstrapEvent::Started {
+            genesis_partition: state.head.partition(),
+        });
+        assert!(matches!(
+            step,
+            BootstrapStep::Effect(BootstrapEffect::ObserveHead)
+        ));
+        let step = bootstrap.handle(BootstrapEvent::HeadObserved(Some(state.head.generation())));
+        assert!(matches!(
+            step,
+            BootstrapStep::Effect(BootstrapEffect::ReadSeal { .. })
+        ));
+        let step = bootstrap.handle(BootstrapEvent::SealRead(Some(state.head.clone())));
+        assert!(matches!(
+            step,
+            BootstrapStep::Effect(BootstrapEffect::PublishClaim(_))
+        ));
+        let mut step = bootstrap.handle(BootstrapEvent::ClaimPublished(SealPublication::Authored));
+        loop {
+            let BootstrapStep::Effect(BootstrapEffect::ReadTable { table, .. }) = step else {
+                break;
+            };
+            let ordinal = table.object().fresh().ordinal();
+            let uid = StreamUid::try_from(u64::from(ordinal) + 1)?;
+            let decoded = match table.object().store() {
+                StoreKind::Directory => DecodedTable::Directory(vec![(
+                    stream_path(&format!("collection/base-{ordinal}"))?,
+                    strom_storage_domain::DirectoryEntry::Live(uid),
+                )]),
+                StoreKind::Ledger => DecodedTable::Ledger(vec![(
+                    uid,
+                    strom_storage_domain::LedgerCell::Value(StreamRecord::new(
+                        StreamContentType::octet_stream(),
+                        ExpiryPolicy::None,
+                        StreamLifecycle::Open,
+                        BatchId::try_from(1)?,
+                    )),
+                )]),
+                StoreKind::Tally | StoreKind::Annals => {
+                    return Err("collection fixture selected an unsupported table".into());
                 }
             };
-            Ok((source, successor))
+            step = bootstrap.handle(BootstrapEvent::TableRead { table, decoded });
         }
+        assert!(matches!(
+            step,
+            BootstrapStep::Effect(BootstrapEffect::ObserveWalTail)
+        ));
+        let tail = BatchId::try_from(CUT_BATCH - 1)?;
+        let step = bootstrap.handle(BootstrapEvent::WalTailObserved(Some(tail)));
+        assert!(matches!(
+            step,
+            BootstrapStep::Effect(BootstrapEffect::ReadWal { batch, .. }) if batch == tail
+        ));
+        let step = bootstrap.handle(BootstrapEvent::WalRead(Some(WalObject::new(
+            state.head.partition(),
+            tail,
+            OwnerToken::from(SealGeneration::genesis()),
+            WalBody::Fence,
+        ))));
+        assert!(matches!(
+            step,
+            BootstrapStep::Effect(BootstrapEffect::EstablishFence(_))
+        ));
+        let mut step =
+            bootstrap.handle(BootstrapEvent::FenceEstablished(WalEstablishment::Durable));
+        for raw_batch in 1..=CUT_BATCH {
+            let batch = BatchId::try_from(raw_batch)?;
+            assert!(
+                matches!(
+                    step,
+                    BootstrapStep::Effect(BootstrapEffect::ReadWal { batch: requested, .. })
+                        if requested == batch
+                ),
+                "bootstrap expected replay batch {raw_batch}, got {step:?}"
+            );
+            step = bootstrap.handle(BootstrapEvent::WalRead(Some(WalObject::new(
+                state.head.partition(),
+                batch,
+                if raw_batch == CUT_BATCH {
+                    OwnerToken::from(state.source.generation())
+                } else {
+                    OwnerToken::from(SealGeneration::try_from(raw_batch)?)
+                },
+                WalBody::Fence,
+            ))));
+        }
+        assert!(matches!(
+            step,
+            BootstrapStep::Effect(BootstrapEffect::ObserveHead)
+        ));
+        let BootstrapStep::Complete(recovery) = bootstrap.handle(BootstrapEvent::HeadObserved(
+            Some(state.source.generation()),
+        )) else {
+            return Err("collection fixture did not complete bootstrap".into());
+        };
+
+        let mut writer = WriterMachine::from_recovery(recovery);
+        let (outputs, exit) = writer.handle(WriterEvent::Started).into_parts();
+        assert_eq!(None, exit);
+        let mut preparations = outputs.into_iter().filter_map(|output| match output {
+            WriterOutput::Effect(WriterEffect::PrepareCheckpoint(input)) => Some(input),
+            WriterOutput::Effect(
+                WriterEffect::EstablishWal(_)
+                | WriterEffect::PublishAuthority { .. }
+                | WriterEffect::Collect(_),
+            )
+            | WriterOutput::Action(_) => None,
+        });
+        let input = preparations
+            .next()
+            .ok_or("collection fixture did not issue checkpoint preparation")?;
+        assert!(preparations.next().is_none());
+        let ticket = input.ticket();
+        let (_ticket, source, _base, snapshot) = input.into_parts();
+        assert_eq!(&source, &state.source);
+        let candidate = EncodedAuthoritySeal::try_from(&state.successor)?;
+        let prepared =
+            PreparedCheckpoint::new(ticket, source, state.successor.clone(), snapshot, candidate);
+        let (outputs, exit) = writer
+            .handle(WriterEvent::CheckpointPrepared {
+                ticket,
+                outcome: PreparationOutcome::Prepared(Box::new(prepared)),
+            })
+            .into_parts();
+        assert_eq!(None, exit);
+        assert!(outputs.iter().any(|output| matches!(
+            output,
+            WriterOutput::Effect(WriterEffect::PublishAuthority { ticket: issued, .. })
+                if *issued == ticket
+        )));
+        let (outputs, exit) = writer
+            .handle(WriterEvent::SealPublished {
+                ticket,
+                result: Ok(SealPublication::Authored),
+            })
+            .into_parts();
+        assert_eq!(None, exit);
+        outputs
+            .into_iter()
+            .find_map(|output| match output {
+                WriterOutput::Effect(WriterEffect::Collect(input)) => Some(input),
+                WriterOutput::Effect(
+                    WriterEffect::EstablishWal(_)
+                    | WriterEffect::PrepareCheckpoint(_)
+                    | WriterEffect::PublishAuthority { .. },
+                )
+                | WriterOutput::Action(_) => None,
+            })
+            .ok_or_else(|| "authored publication did not mint collection authority".into())
     }
 
     fn wal_run(partition: PartitionId, batch: u64, owner: OwnerToken) -> TestResult<WalObject> {

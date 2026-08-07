@@ -188,6 +188,13 @@ impl PreparedCheckpoint {
             successor.replay(),
             "a prepared checkpoint publishes its planned WAL cut and owner"
         );
+        assert!(
+            source
+                .replay()
+                .batch()
+                .is_none_or(|source_cut| source_cut < ticket.cut),
+            "a prepared checkpoint strictly advances its source replay cut"
+        );
         assert_eq!(
             candidate.seal(),
             &successor,
@@ -262,7 +269,10 @@ pub enum WriterEffect {
     Collect(CollectionInput),
 }
 
-/// One validated leak-only collection transition.
+/// Authority to collect objects made unreachable by one authored advance.
+///
+/// Minted only after publication of the exact prepared successor returns
+/// [`SealPublication::Authored`].
 #[derive(Debug)]
 pub struct CollectionInput {
     cut: BatchId,
@@ -271,22 +281,40 @@ pub struct CollectionInput {
 }
 
 impl CollectionInput {
-    fn new(cut: BatchId, source: Seal, successor: Seal) -> Self {
-        assert_eq!(
-            Some(cut),
-            successor.replay().batch(),
-            "collection names its advancing successor's exact replay cut"
-        );
-        Self {
-            cut,
+    fn from_authored(prepared: PreparedCheckpoint) -> (Forest, Self) {
+        let PreparedCheckpoint {
             source,
             successor,
-        }
+            snapshot,
+            candidate: _,
+        } = prepared;
+        let cut = successor
+            .replay()
+            .batch()
+            .expect("a prepared advancing successor has a replay cut");
+        (
+            snapshot,
+            Self {
+                cut,
+                source,
+                successor,
+            },
+        )
     }
 
     #[must_use]
-    pub fn into_parts(self) -> (BatchId, Seal, Seal) {
-        (self.cut, self.source, self.successor)
+    pub const fn cut(&self) -> BatchId {
+        self.cut
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &Seal {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn successor(&self) -> &Seal {
+        &self.successor
     }
 }
 
@@ -723,21 +751,14 @@ impl WriterMachine {
         );
         match result {
             Ok(SealPublication::Authored) => {
-                let PreparedCheckpoint {
-                    source,
-                    successor,
-                    snapshot,
-                    candidate: _,
-                } = *prepared;
-                self.install_prepared(ticket, &source, &successor, snapshot);
+                let (snapshot, input) = CollectionInput::from_authored(*prepared);
+                self.install_prepared(input.source(), input.successor(), snapshot);
                 outputs.push(WriterOutput::Action(WriterAction::PublishView(
                     self.durable.clone(),
                 )));
                 if self.ingress_open && self.collector.is_none() {
-                    self.collector = Some(ticket.cut);
-                    outputs.push(WriterOutput::Effect(WriterEffect::Collect(
-                        CollectionInput::new(ticket.cut, source, successor),
-                    )));
+                    self.collector = Some(input.cut());
+                    outputs.push(WriterOutput::Effect(WriterEffect::Collect(input)));
                 }
                 None
             }
@@ -994,39 +1015,10 @@ impl WriterMachine {
         Some(input)
     }
 
-    fn install_prepared(
-        &mut self,
-        ticket: CheckpointTicket,
-        source: &Seal,
-        successor: &Seal,
-        snapshot: Forest,
-    ) {
-        assert_eq!(
-            ticket.source,
-            source.generation(),
-            "a checkpoint install advances its planned source Seal"
-        );
+    fn install_prepared(&mut self, source: &Seal, successor: &Seal, snapshot: Forest) {
         assert_eq!(
             &self.seal, source,
             "a checkpoint install returns its exact planned source Seal"
-        );
-        assert_eq!(
-            self.partition(),
-            successor.partition(),
-            "a checkpoint successor retains the writer partition"
-        );
-        assert_eq!(
-            source.generation().successor(),
-            Ok(successor.generation()),
-            "a checkpoint successor is one exact Seal generation"
-        );
-        assert_eq!(
-            WalReplayPoint::Through {
-                batch: ticket.cut,
-                owner: self.claim.owner(),
-            },
-            successor.replay(),
-            "a checkpoint install publishes its planned WAL cut and owner"
         );
         self.seal = successor.clone();
         self.base = snapshot;

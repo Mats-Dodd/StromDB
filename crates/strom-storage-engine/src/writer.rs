@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio_util::task::JoinMap;
 
-use crate::checkpoint::{collect_advance, prepare_checkpoint_effect};
+use crate::checkpoint;
 use crate::engine::PublishedView;
 use crate::store::{SealStore, TableStore, WalStore};
 
@@ -125,7 +125,7 @@ impl Writer {
                 self.effects.spawn(key, async move {
                     WriterEvent::CheckpointPrepared {
                         ticket,
-                        outcome: prepare_checkpoint_effect(store, input).await,
+                        outcome: checkpoint::prepare(store, input).await,
                     }
                 });
             }
@@ -139,11 +139,11 @@ impl Writer {
                 });
             }
             WriterEffect::Collect(input) => {
-                let (cut, source, successor) = input.into_parts();
+                let cut = input.cut();
                 let wal_store = self.wal_store.clone();
                 let table_store = self.table_store.clone();
                 self.effects.spawn(key, async move {
-                    collect_advance(wal_store, table_store, source, successor).await;
+                    checkpoint::collect(wal_store, table_store, input).await;
                     WriterEvent::CollectFinished { cut }
                 });
             }
