@@ -18,6 +18,7 @@ use crate::store::{
     EncodedSeal, EncodedWal, SealStore, SealStoreError, TableRows, TableStore, TableStoreError,
     WalStore, WalStoreError,
 };
+use crate::writer::WriterState;
 
 /// Why a partition did not become Ready.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -32,22 +33,7 @@ pub(crate) enum BootstrapExit {
 
 #[derive(Debug)]
 pub(crate) struct Ready {
-    partition: PartitionId,
-    claim: AuthoredClaim,
-    seal: Seal,
-    base: Forest,
-    forest: Forest,
-    durable_batch: BatchId,
-    next_batch: BatchId,
-}
-
-pub(crate) struct WriterSeed {
-    pub(crate) claim: AuthoredClaim,
-    pub(crate) seal: Seal,
-    pub(crate) base: Forest,
-    pub(crate) forest: Forest,
-    pub(crate) durable_batch: BatchId,
-    pub(crate) next_batch: BatchId,
+    state: WriterState,
 }
 
 #[derive(Debug)]
@@ -57,6 +43,13 @@ pub(crate) struct AuthoredClaim {
 }
 
 impl AuthoredClaim {
+    pub(crate) fn new(generation: SealGeneration) -> Self {
+        Self {
+            generation,
+            owner: OwnerToken::from(generation),
+        }
+    }
+
     pub(crate) const fn generation(&self) -> SealGeneration {
         self.generation
     }
@@ -68,22 +61,15 @@ impl AuthoredClaim {
 
 impl Ready {
     pub(crate) const fn partition(&self) -> PartitionId {
-        self.partition
+        self.state.partition()
     }
 
     pub(crate) const fn forest(&self) -> &Forest {
-        &self.forest
+        self.state.durable_forest()
     }
 
-    pub(crate) fn into_writer_seed(self) -> WriterSeed {
-        WriterSeed {
-            claim: self.claim,
-            seal: self.seal,
-            base: self.base,
-            forest: self.forest,
-            durable_batch: self.durable_batch,
-            next_batch: self.next_batch,
-        }
+    pub(crate) fn into_state(self) -> WriterState {
+        self.state
     }
 }
 
@@ -241,10 +227,7 @@ pub(crate) async fn bootstrap(
                 CreateEvidence::Direct => {
                     let generation = candidate.generation();
                     BootstrapPhase::LoadAdmissionBase {
-                        claim: AuthoredClaim {
-                            generation,
-                            owner: OwnerToken::from(generation),
-                        },
+                        claim: AuthoredClaim::new(generation),
                         seal: candidate,
                         plan,
                     }
@@ -490,15 +473,22 @@ pub(crate) async fn bootstrap(
                     .map_err(map_seal_error)?;
                 match newest {
                     Some(observed) if observed == replayed.claim.generation => {
+                        let partition =
+                            partition.expect("ReadHead discovers the partition identity");
+                        assert_eq!(
+                            partition,
+                            replayed.seal.partition(),
+                            "the discovered partition matches the selected Seal"
+                        );
                         BootstrapPhase::Ready(Ready {
-                            partition: partition
-                                .expect("ReadHead discovers the partition identity"),
-                            claim: replayed.claim,
-                            seal: replayed.seal,
-                            base: replayed.base,
-                            forest: replayed.forest,
-                            durable_batch: replayed.durable_batch,
-                            next_batch: replayed.next_batch,
+                            state: WriterState::new(
+                                replayed.claim,
+                                replayed.seal,
+                                replayed.base,
+                                replayed.forest,
+                                replayed.durable_batch,
+                                replayed.next_batch,
+                            ),
                         })
                     }
                     Some(observed) if observed > replayed.claim.generation => {

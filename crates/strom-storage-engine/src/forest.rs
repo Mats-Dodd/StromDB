@@ -3,6 +3,8 @@
 mod directory;
 mod ledger;
 
+use std::num::NonZeroU64;
+
 use directory::ResidentDirectory;
 use imbl::OrdMap;
 use ledger::ResidentLedger;
@@ -11,8 +13,6 @@ use strom_storage_domain::{
     BatchId, DirectoryEntry, DirectoryKey, OperationFact, PARTITION_PATH_OCCUPANCIES_MAX_V2,
     StreamRecord, StreamUid,
 };
-
-use crate::admission::decide_successor_uid;
 
 /// Resident Directory and Ledger under the no-forks cross-store invariants.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,7 +172,7 @@ impl Forest {
                 if self.directory.get(path).is_some() {
                     return Err(FoldContradiction::PathOccupied);
                 }
-                let expected_uid = decide_successor_uid(self.path_count())?;
+                let expected_uid = self.successor_uid()?;
                 if *uid != expected_uid {
                     return Err(FoldContradiction::UidNotDenseSuccessor);
                 }
@@ -233,12 +233,34 @@ impl Forest {
         u64::try_from(self.directory.len()).expect("directory row count fits in u64")
     }
 
+    /// Allocate the next dense stream identity after proving path capacity.
+    pub(crate) fn successor_uid(&self) -> Result<StreamUid, FoldContradiction> {
+        Self::successor_uid_after(self.path_count())
+    }
+
+    fn successor_uid_after(path_count: u64) -> Result<StreamUid, FoldContradiction> {
+        if path_count >= PARTITION_PATH_OCCUPANCIES_MAX_V2 {
+            return Err(FoldContradiction::PathCapacityExhausted);
+        }
+        let successor = path_count
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .expect("path_count below the V2 occupancy bound has a nonzero successor");
+        Ok(StreamUid::from(successor))
+    }
+
     pub(crate) const fn directory_rows(&self) -> &OrdMap<DirectoryKey, DirectoryEntry> {
         self.directory.rows()
     }
 
     pub(crate) const fn ledger_rows(&self) -> &OrdMap<StreamUid, StreamRecord> {
         self.ledger.rows()
+    }
+
+    #[must_use]
+    pub(crate) fn shares_roots_with(&self, other: &Self) -> bool {
+        self.directory.rows().ptr_eq(other.directory.rows())
+            && self.ledger.rows().ptr_eq(other.ledger.rows())
     }
 }
 
@@ -274,6 +296,25 @@ mod tests {
     use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
 
     use super::*;
+
+    #[test]
+    fn successor_allocation_accepts_the_last_slot_and_refuses_capacity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let last_slot = PARTITION_PATH_OCCUPANCIES_MAX_V2
+            .checked_sub(1)
+            .expect("the V2 occupancy bound is nonzero");
+        assert_eq!(
+            Ok(StreamUid::try_from(PARTITION_PATH_OCCUPANCIES_MAX_V2)?),
+            Forest::successor_uid_after(last_slot),
+            "the final lifetime occupancy has one dense successor"
+        );
+        assert_eq!(
+            Err(FoldContradiction::PathCapacityExhausted),
+            Forest::successor_uid_after(PARTITION_PATH_OCCUPANCIES_MAX_V2),
+            "capacity is refused before successor arithmetic"
+        );
+        Ok(())
+    }
 
     #[test]
     fn merged_constructor_enumerates_every_cross_store_contradiction()

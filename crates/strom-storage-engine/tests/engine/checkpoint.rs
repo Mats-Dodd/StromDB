@@ -95,7 +95,7 @@ async fn applied_child_with_a_lost_reply_reconciles_and_publishes() -> TestResul
 }
 
 #[tokio::test]
-async fn absent_child_reconciliation_abandons_and_reopens_from_wal() -> TestResult {
+async fn abandoned_checkpoint_clears_matching_state_and_shell_tickets_before_retry() -> TestResult {
     let keys = observe_checkpoint_keys().await?;
     let directory = keys.directory;
     let retry_directory = checkpoint_table_key_at_attempt(&directory, 1);

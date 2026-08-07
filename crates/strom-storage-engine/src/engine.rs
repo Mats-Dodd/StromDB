@@ -16,9 +16,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::Forest;
-use crate::admission::{AdmissionRefusal, CreateStream};
 use crate::bootstrap::{BootstrapExit, bootstrap};
-use crate::writer::{CommandEnvelope, WriterExit, spawn_writer};
+use crate::writer::{AdmissionRefusal, CommandEnvelope, CreateStream, WriterExit, spawn_writer};
 
 #[derive(Debug, Clone)]
 pub(crate) struct PublishedView {
@@ -28,6 +27,10 @@ pub(crate) struct PublishedView {
 impl PublishedView {
     pub(crate) const fn new(forest: Forest) -> Self {
         Self { forest }
+    }
+
+    pub(crate) const fn forest(&self) -> &Forest {
+        &self.forest
     }
 
     fn stream(&self, id: &StreamId) -> StreamStatus {

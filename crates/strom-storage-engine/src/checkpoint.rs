@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::{StreamExt as _, stream};
 use strom_object_store::{CreateEvidence, ObjectStoreAdapter};
-use strom_storage_domain::{AttemptId, BatchId, Seal, WalReplayPoint};
+use strom_storage_domain::{AttemptId, BatchId, Seal};
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use crate::Forest;
@@ -48,10 +48,6 @@ pub(crate) struct PreparedCheckpoint {
 }
 
 impl PreparedCheckpoint {
-    pub(crate) const fn cut(&self) -> Option<BatchId> {
-        advancing_batch(self.successor.replay())
-    }
-
     pub(crate) fn into_install(self) -> CheckpointInstall {
         CheckpointInstall {
             source: self.source,
@@ -62,9 +58,9 @@ impl PreparedCheckpoint {
 }
 
 pub(crate) struct CheckpointInstall {
-    pub(crate) source: Seal,
-    pub(crate) successor: Seal,
-    pub(crate) snapshot: Forest,
+    pub(super) source: Seal,
+    pub(super) successor: Seal,
+    pub(super) snapshot: Forest,
 }
 
 #[derive(Debug)]
@@ -261,12 +257,5 @@ async fn establish_table(
         Err(TableStoreError::Contradiction { detail }) => {
             Err(EstablishTableError::Contradiction { detail })
         }
-    }
-}
-
-const fn advancing_batch(replay: WalReplayPoint) -> Option<BatchId> {
-    match replay {
-        WalReplayPoint::Through { batch, owner: _ } => Some(batch),
-        WalReplayPoint::Genesis => None,
     }
 }

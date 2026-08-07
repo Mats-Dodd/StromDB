@@ -170,7 +170,7 @@ async fn failed_wal_reconciliation_poisoned_without_resend() -> TestResult {
 }
 
 #[tokio::test]
-async fn wal_commit_becomes_visible_with_the_success_reply() -> TestResult {
+async fn wal_commit_is_published_before_the_success_reply_is_released() -> TestResult {
     let wal_key = wal_key(2);
     let gate = Gate::new();
     let store = FaultStore::new().gate(Selection::create(Target::Key(wal_key)), gate.clone())?;
@@ -230,7 +230,7 @@ async fn successor_writer_fences_the_previous_writer_and_preserves_its_own_work(
 }
 
 #[tokio::test]
-async fn shutdown_waits_for_an_active_wal_flight() -> TestResult {
+async fn wal_run_retains_matching_state_and_shell_flights_until_completion() -> TestResult {
     let gate = Gate::new();
     let store = FaultStore::new().gate(Selection::create(Target::Key(wal_key(2))), gate.clone())?;
     let id: StreamId = "events/shutdown".parse()?;
