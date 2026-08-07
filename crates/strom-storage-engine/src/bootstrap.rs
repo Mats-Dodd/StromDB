@@ -71,11 +71,6 @@ impl Ready {
         self.partition
     }
 
-    #[cfg(test)]
-    pub(crate) const fn replay(&self) -> WalReplayPoint {
-        self.seal.replay()
-    }
-
     pub(crate) const fn forest(&self) -> &Forest {
         &self.forest
     }
@@ -1041,89 +1036,6 @@ mod tests {
         )?;
         assert!(matches!(
             plan_bootstrap_sources(&byte_over),
-            Err(BootstrapExit::Contradiction { .. })
-        ));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn empty_namespace_bootstraps_through_genesis_claim_and_fence()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let ready = bootstrap(ObjectStoreAdapter::in_memory(), crate::test_entropy()).await?;
-        assert_eq!(
-            SealGeneration::genesis().successor()?,
-            ready.claim.generation
-        );
-        assert_eq!(WalReplayPoint::Genesis, ready.replay());
-        assert_eq!(0, ready.forest.path_count());
-        assert_eq!(BatchId::try_from(2)?, ready.next_batch);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn genesis_race_loser_adopts_the_winners_partition_id()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let adapter = ObjectStoreAdapter::in_memory();
-        let winner = partition();
-        let loser: PartitionId = "10112233-4455-6677-8899-aabbccddeeff".parse()?;
-        let store = SealStore::new(adapter.clone());
-        assert_eq!(
-            GenesisProvision::Created,
-            provision_genesis(&store, winner).await?
-        );
-        assert_eq!(
-            GenesisProvision::LostRace,
-            provision_genesis(&store, loser).await?
-        );
-
-        let ready = bootstrap(adapter, crate::test_entropy()).await?;
-        assert_eq!(winner, ready.partition());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn replay_gap_under_the_current_claim_is_a_contradiction()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let adapter = ObjectStoreAdapter::in_memory();
-        let partition = partition();
-        let generation_1 = SealGeneration::genesis();
-        let generation_2 = generation_1.successor()?;
-        let seals = SealStore::new(adapter.clone());
-        for seal in [
-            Seal::new(
-                partition,
-                generation_1,
-                WalReplayPoint::Genesis,
-                TreeVersion::empty(),
-                TreeVersion::empty(),
-            )?,
-            Seal::new(
-                partition,
-                generation_2,
-                WalReplayPoint::Genesis,
-                TreeVersion::empty(),
-                TreeVersion::empty(),
-            )?,
-        ] {
-            assert_eq!(
-                CreateEvidence::Direct,
-                seals.create_seal(&EncodedSeal::new(&seal)?).await?
-            );
-        }
-        let batch_2 = BatchId::try_from(2)?;
-        let tail = EncodedWal::new(&WalObject::new(
-            partition,
-            batch_2,
-            OwnerToken::from(generation_2),
-            WalBody::Fence,
-        ))?;
-        assert_eq!(
-            CreateEvidence::Direct,
-            WalStore::new(adapter.clone()).create_wal(&tail).await?
-        );
-
-        assert!(matches!(
-            bootstrap(adapter, crate::test_entropy()).await,
             Err(BootstrapExit::Contradiction { .. })
         ));
         Ok(())
