@@ -587,8 +587,7 @@ fn suffix_shedding_refuses_new_facts_without_changing_durable_state() -> TestRes
             },
         )
     );
-    let mut machine =
-        recovered_machine_at_with_forest(WAL_SUFFIX_COORDINATES_MAX_V2 - 1, forest.clone())?;
+    let mut machine = recovered_machine_at_with_forest(WAL_SUFFIX_COORDINATES_MAX_V2 - 1, &forest)?;
     let (outputs, exit) = machine.handle(WriterEvent::Started).into_parts();
     assert_eq!(None, exit);
     let (first, _input) = take_preparation(outputs).ok_or("the bounded suffix is due")?;

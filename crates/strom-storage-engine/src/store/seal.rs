@@ -7,18 +7,12 @@ use strom_storage_domain::{
     EncodedAuthoritySeal, EncodedGenesisSeal, SEAL_ENCODED_BYTES_MAX, Seal, SealGeneration,
     SealKey, SealNamespace, decode_seal,
 };
+use strom_storage_protocol::GenesisEstablishment;
 
 use super::{
     SealPublication, TypedStoreError, newest_keys_bound, object_key, typed_store_contradiction,
     typed_store_error,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GenesisEstablishment {
-    Established,
-    LostRace,
-    Unresolved,
-}
 
 /// Typed Seal namespace over the raw object-store adapter.
 #[derive(Debug, Clone)]

@@ -1,6 +1,6 @@
 [package]
 name = "strom-storage-engine"
-description = "StromDB storage engine: writer, bootstrap, admission, forest, stores"
+description = "StromDB storage engine: typed stores and protocol effect interpreters"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,6 @@ repository.workspace = true
 [dependencies]
 bytes = { workspace = true }
 futures = { workspace = true }
-imbl = { workspace = true }
 object_store = { workspace = true }
 rand = { workspace = true }
 strom-common = { path = "../strom-common", version = "0.1.0" }

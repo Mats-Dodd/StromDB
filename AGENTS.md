@@ -20,17 +20,17 @@ workspace package metadata and lint configuration.
 strom-common            clock and entropy seams
 strom-domain            Durable Streams protocol vocabulary
 strom-storage-domain    storage vocabulary and durable codecs
-strom-storage-protocol  pure writer machine, admission, forest and fold
+strom-storage-protocol  pure bootstrap/writer machines, admission, forest and fold
 strom-object-store      object-store adapter (opaque bytes)
-strom-storage-engine    bootstrap, typed stores, effects and writer interpreter
+strom-storage-engine    typed stores and bootstrap/writer effect interpreters
 strom-db                the embeddable library; the public API
 ```
 
 Layering: Durable Streams types stay in `strom-domain`; durable spelling and
 encoded candidates stay in `strom-storage-domain`; opaque object I/O stays in
-`strom-object-store`; `strom-storage-protocol` owns the pure writer correctness
-machine and cannot name either adapter or stores; the engine owns bootstrap,
-typed stores, effect execution, and the thin writer interpreter; `strom-db`
+`strom-object-store`; `strom-storage-protocol` owns the pure bootstrap and
+writer correctness machines and cannot name either adapter or stores; the
+engine owns typed stores and thin effect interpreters; `strom-db`
 exposes the `Db` handle and re-exports the vocabulary callers must name.
 
 As you work on this codebase, if you encounter any friction in the development environment you can record it in [docs/nits.md](docs/nits.md).  Contributors will review these to help improve the lives of all devs and "make the world a better place".

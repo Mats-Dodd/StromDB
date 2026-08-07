@@ -26,8 +26,14 @@ pub(crate) struct ObservedWal {
 
 impl ObservedWal {
     #[must_use]
+    #[cfg(test)]
     pub(crate) const fn object(&self) -> &WalObject {
         &self.object
+    }
+
+    #[must_use]
+    pub(crate) fn into_object(self) -> WalObject {
+        self.object
     }
 
     #[must_use]

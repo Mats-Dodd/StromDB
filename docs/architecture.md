@@ -943,26 +943,32 @@ This is explicitly deffered to a followup RFC
 
 ## bootstrap state machine
 
-Bootstrap is an explicit event-driven machine, not one helper with hidden
-retries:
+Bootstrap is a pure event-driven machine in `strom-storage-protocol`. The
+engine is a sequential interpreter: it executes exactly one requested effect,
+returns the typed completion as an event, and repeats until the machine returns
+`WriterRecovery` or `BootstrapExit`.
 
 ```rust
-enum BootstrapPhase {
-    DiscoverHead,
-    ReadHead { generation: SealGeneration },
-    PublishClaim { prepared: PreparedClaim },
-    LoadAdmissionBase { claim: AuthoredClaim },
-    PlaceFence { claim: AuthoredClaim, candidate: BatchId },
-    Replay { next: BatchId, fence: BatchId },
-    RefreshAnomaly,
-    FinalRefresh,
-    Ready,
+fn handle(&mut self, event: BootstrapEvent) -> BootstrapStep;
+
+enum BootstrapStep {
+    Effect(BootstrapEffect),
+    Complete(WriterRecovery),
+    Exit(BootstrapExit),
 }
 ```
 
-The implementation may split effect-start and effect-completion variants to
-satisfy borrowing, but it does not hide transitions or retry indefinitely
-inside adapters.
+Events contain decided store observations: newest Seal generation, genesis or
+claim publication, one decoded Seal or table, newest surviving WAL batch, one
+decoded WAL object, and FENCE establishment. Effects name those same exact
+store operations. Bootstrap is sequential, so it has neither effect keys nor
+a join set.
+
+The machine owns genesis-race policy, source planning and merging, first-hole
+selection, tail-owner validation, strict replay, anomaly classification, and
+the final refresh. Typed stores own key construction, bounded reads, exact
+identity decoding, and create reconciliation. No adapter or interpreter helper
+contains a hidden bootstrap retry or transition.
 
 Bootstrap performs the bounded Seal decode and structural capacity checks
 before competing for ownership. The same GET supplies the complete manifest;
@@ -981,6 +987,11 @@ The partition does not accept traffic until:
 - strict replay reached that fence with the claimed owner;
 - the final newest-generation observation still matches; and
 - the recovered PublishedView is installed.
+
+The terminal `WriterRecovery` owns the authored claim, claimed Seal, Seal-base
+forest, replayed durable forest, and durable FENCE batch. `WriterMachine`
+consumes that single value and derives the next RUN coordinate as the exact
+successor of the durable FENCE.
 
 Missing current children, corruption, contradictory counts, or an over-bound
 current source make the partition unready. Recovery never interprets absence

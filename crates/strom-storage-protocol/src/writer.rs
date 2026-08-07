@@ -355,15 +355,46 @@ pub enum WriterExit {
 }
 
 /// Proof that bootstrap directly authored the live claim Seal.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
+#[expect(
+    missing_copy_implementations,
+    reason = "the authority witness is deliberately linear even though its representation is Copy"
+)]
 pub struct AuthoredClaim {
     generation: SealGeneration,
     owner: OwnerToken,
 }
 
+/// Complete proven handoff from bootstrap into the live writer.
+#[derive(Debug)]
+pub struct WriterRecovery {
+    pub(crate) claim: AuthoredClaim,
+    pub(crate) seal: Seal,
+    pub(crate) base: Forest,
+    pub(crate) durable: Forest,
+    pub(crate) durable_batch: BatchId,
+}
+
+impl WriterRecovery {
+    #[must_use]
+    pub const fn partition(&self) -> PartitionId {
+        self.seal.partition()
+    }
+
+    #[must_use]
+    pub const fn durable_forest(&self) -> &Forest {
+        &self.durable
+    }
+
+    #[must_use]
+    pub const fn durable_batch(&self) -> BatchId {
+        self.durable_batch
+    }
+}
+
 impl AuthoredClaim {
     #[must_use]
-    pub fn new(generation: SealGeneration) -> Self {
+    pub(crate) fn new(generation: SealGeneration) -> Self {
         Self {
             generation,
             owner: OwnerToken::from(generation),
@@ -434,26 +465,29 @@ impl WriterMachine {
     ///
     /// # Panics
     ///
-    /// Panics unless `next_batch` exactly follows `durable_batch`, and the
-    /// durable head is at or beyond the Seal replay cut.
+    /// Panics unless the recovery claim names its Seal and the durable head is
+    /// at or beyond the Seal replay cut with a successor coordinate available.
     #[must_use]
-    pub fn from_recovery(
-        claim: AuthoredClaim,
-        seal: Seal,
-        base: Forest,
-        forest: Forest,
-        durable_batch: BatchId,
-        next_batch: BatchId,
-    ) -> Self {
+    pub fn from_recovery(recovery: WriterRecovery) -> Self {
+        let WriterRecovery {
+            claim,
+            seal,
+            base,
+            durable: forest,
+            durable_batch,
+        } = recovery;
         assert_eq!(
-            Ok(next_batch),
-            durable_batch.successor(),
-            "next_batch is the exact successor of the durable WAL head"
+            claim.generation(),
+            seal.generation(),
+            "the recovered claim names the recovered Seal"
         );
         assert!(
             seal.replay().batch().is_none_or(|cut| durable_batch >= cut),
             "the durable WAL head never precedes the replay cut"
         );
+        let next_batch = durable_batch
+            .successor()
+            .expect("bootstrap proves a successor coordinate after its durable FENCE");
         Self {
             started: false,
             claim,

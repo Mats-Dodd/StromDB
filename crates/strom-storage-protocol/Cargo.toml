@@ -1,6 +1,6 @@
 [package]
 name = "strom-storage-protocol"
-description = "Pure writer correctness protocol and resident forest for StromDB"
+description = "Pure bootstrap and writer correctness protocol and resident forest for StromDB"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

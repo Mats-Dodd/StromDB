@@ -3,13 +3,12 @@
 use strom_object_store::ObjectStoreAdapter;
 use strom_storage_protocol::{
     Completion, EffectKey, WRITER_OUTPUTS_PER_STEP_MAX, WriterAction, WriterEffect, WriterEvent,
-    WriterExit, WriterMachine, WriterOutput, WriterStep,
+    WriterExit, WriterMachine, WriterOutput, WriterRecovery, WriterStep,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio_util::task::JoinMap;
 
-use crate::bootstrap::Ready;
 use crate::checkpoint::{collect_advance, prepare_checkpoint_effect, publish_authority};
 use crate::engine::PublishedView;
 use crate::store::WalStore;
@@ -26,18 +25,22 @@ struct Writer {
 
 pub(crate) fn spawn_writer(
     adapter: ObjectStoreAdapter,
-    ready: Ready,
+    recovery: WriterRecovery,
     ingress: mpsc::Receiver<strom_storage_protocol::CommandEnvelope>,
     view: watch::Sender<PublishedView>,
 ) -> JoinHandle<WriterExit> {
-    let writer = Writer::new(adapter, ready, view);
+    let writer = Writer::new(adapter, recovery, view);
     tokio::spawn(writer.run(ingress))
 }
 
 impl Writer {
-    fn new(adapter: ObjectStoreAdapter, ready: Ready, view: watch::Sender<PublishedView>) -> Self {
+    fn new(
+        adapter: ObjectStoreAdapter,
+        recovery: WriterRecovery,
+        view: watch::Sender<PublishedView>,
+    ) -> Self {
         Self {
-            machine: ready.into_machine(),
+            machine: WriterMachine::from_recovery(recovery),
             wal_store: WalStore::new(adapter.clone()),
             adapter,
             view,
@@ -210,9 +213,13 @@ mod tests {
 
     use strom_domain::{CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle};
     use strom_storage_domain::{
-        BatchId, DirectoryKey, Seal, SealGeneration, TreeVersion, WalReplayPoint,
+        BatchId, DirectoryKey, OwnerToken, Seal, SealGeneration, TreeVersion, WalBody, WalObject,
+        WalReplayPoint,
     };
-    use strom_storage_protocol::{AuthoredClaim, CommandEnvelope, CreateStream, Forest};
+    use strom_storage_protocol::{
+        BootstrapEffect, BootstrapEvent, BootstrapMachine, BootstrapStep, CommandEnvelope,
+        CreateStream, SealPublication, WalEstablishment,
+    };
     use tokio::sync::oneshot;
 
     use super::*;
@@ -435,7 +442,7 @@ mod tests {
             assert_eq!(None, exit);
             let terminal = machine.handle(WriterEvent::WalEstablished {
                 batch,
-                result: Ok(strom_storage_protocol::WalEstablishment::Durable),
+                result: Ok(WalEstablishment::Durable),
             });
 
             let (view, published) = watch::channel(PublishedView::new(initial));
@@ -494,7 +501,7 @@ mod tests {
             let batch = wal_batch(step).ok_or("each create issues one WAL")?;
             let step = machine.handle(WriterEvent::WalEstablished {
                 batch,
-                result: Ok(strom_storage_protocol::WalEstablishment::Durable),
+                result: Ok(WalEstablishment::Durable),
             });
             if let Some(ticket) = preparation_key(step) {
                 return Ok(ticket);
@@ -513,22 +520,43 @@ mod tests {
 
     fn recovered_machine() -> Result<WriterMachine, Box<dyn std::error::Error>> {
         let partition = "00112233-4455-6677-8899-aabbccddeeff".parse()?;
-        let generation = SealGeneration::genesis().successor()?;
+        let generation = SealGeneration::genesis();
+        let claim_generation = generation.successor()?;
         let durable = BatchId::try_from(1)?;
-        Ok(WriterMachine::from_recovery(
-            AuthoredClaim::new(generation),
-            Seal::new(
+        let mut bootstrap = BootstrapMachine::new();
+        drop(bootstrap.handle(BootstrapEvent::Started {
+            genesis_partition: partition,
+        }));
+        drop(bootstrap.handle(BootstrapEvent::HeadObserved(Some(generation))));
+        let seal = Seal::new(
+            partition,
+            generation,
+            WalReplayPoint::Genesis,
+            TreeVersion::empty(),
+            TreeVersion::empty(),
+        )?;
+        drop(bootstrap.handle(BootstrapEvent::SealRead(Some(seal))));
+        let step = bootstrap.handle(BootstrapEvent::ClaimPublished(SealPublication::Authored));
+        assert!(matches!(
+            step,
+            BootstrapStep::Effect(BootstrapEffect::ObserveWalTail)
+        ));
+        drop(bootstrap.handle(BootstrapEvent::WalTailObserved(None)));
+        drop(bootstrap.handle(BootstrapEvent::FenceEstablished(WalEstablishment::Durable)));
+        drop(
+            bootstrap.handle(BootstrapEvent::WalRead(Some(WalObject::new(
                 partition,
-                generation,
-                WalReplayPoint::Genesis,
-                TreeVersion::empty(),
-                TreeVersion::empty(),
-            )?,
-            Forest::empty(),
-            Forest::empty(),
-            durable,
-            durable.successor()?,
-        ))
+                durable,
+                OwnerToken::from(claim_generation),
+                WalBody::Fence,
+            )))),
+        );
+        let BootstrapStep::Complete(recovery) =
+            bootstrap.handle(BootstrapEvent::HeadObserved(Some(claim_generation)))
+        else {
+            return Err("writer fixture reaches complete bootstrap".into());
+        };
+        Ok(WriterMachine::from_recovery(recovery))
     }
 
     fn writer_with_machine(machine: WriterMachine) -> Writer {

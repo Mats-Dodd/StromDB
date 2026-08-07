@@ -1,5 +1,5 @@
-//! The `StromDB` storage engine: writer, bootstrap, forest, and
-//! typed stores. The `strom-db` crate is the public embeddable interface.
+//! The `StromDB` storage engine: effect interpreters and typed stores. The
+//! `strom-db` crate is the public embeddable interface.
 
 mod bootstrap;
 mod checkpoint;

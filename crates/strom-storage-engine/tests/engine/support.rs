@@ -10,7 +10,7 @@ use strom_object_store::ObjectKey;
 use strom_object_store::test_support::FaultStore;
 use strom_storage_domain::{
     AttemptId, BatchId, FreshIdentity, SealGeneration, SealKey, SealNamespace, StoreKind, TableKey,
-    TableObjectId, WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WalKey, WalNamespace,
+    TableObjectId, WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WalKey,
 };
 use strom_storage_engine::{CloseOutcome, Engine, StreamError};
 
@@ -163,13 +163,6 @@ pub(crate) fn seal_namespace() -> ObjectKey {
         .to_string()
         .parse()
         .expect("Seal namespace spelling is a canonical object key")
-}
-
-pub(crate) fn wal_namespace() -> ObjectKey {
-    WalNamespace
-        .to_string()
-        .parse()
-        .expect("WAL namespace spelling is a canonical object key")
 }
 
 pub(crate) async fn assert_object_present(

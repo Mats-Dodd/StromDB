@@ -1,5 +1,13 @@
 //! Decided typed-store outcomes observed by the writer machine.
 
+/// Decided outcome of establishing the canonical genesis Seal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenesisEstablishment {
+    Established,
+    LostRace,
+    Unresolved,
+}
+
 /// Failures of typed store operations, shaped for protocol decisions.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TypedStoreError {

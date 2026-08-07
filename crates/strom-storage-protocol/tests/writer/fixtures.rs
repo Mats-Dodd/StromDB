@@ -1,13 +1,16 @@
+use std::num::NonZeroU64;
+
 use strom_domain::{CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle};
 use strom_storage_domain::{
-    BatchId, DirectoryKey, EncodedAuthoritySeal, OwnerToken, Seal, SealGeneration, TreeVersion,
-    WalReplayPoint,
+    AttemptId, BatchId, DecodedTable, DirectoryKey, EncodedAuthoritySeal, FreshIdentity,
+    OwnerToken, Seal, SealGeneration, SortedRun, StoreKind, TableObjectId, TableRef, TreeVersion,
+    WalBody, WalObject, WalReplayPoint,
 };
 use strom_storage_protocol::{
-    AdmissionRefusal, AuthoredClaim, CheckpointInput, CheckpointTicket, CommandEnvelope,
-    Completion, CreateStream, Forest, PreparationOutcome, PreparedCheckpoint, SealPublication,
-    WalEstablishment, WriterAction, WriterEffect, WriterEvent, WriterMachine, WriterOutput,
-    WriterStep,
+    AdmissionRefusal, BootstrapEffect, BootstrapEvent, BootstrapMachine, BootstrapStep,
+    CheckpointInput, CheckpointTicket, CommandEnvelope, Completion, CreateStream, Forest,
+    PreparationOutcome, PreparedCheckpoint, SealPublication, WalEstablishment, WriterAction,
+    WriterEffect, WriterEvent, WriterMachine, WriterOutput, WriterStep,
 };
 use tokio::sync::oneshot;
 
@@ -56,31 +59,142 @@ pub(super) fn machine_with_preparation_at(
 }
 
 pub(super) fn recovered_machine_at(durable: u64) -> TestResult<WriterMachine> {
-    recovered_machine_at_with_forest(durable, Forest::empty())
+    recovered_machine_at_with_forest(durable, &Forest::empty())
 }
 
 pub(super) fn recovered_machine_at_with_forest(
     durable: u64,
-    forest: Forest,
+    forest: &Forest,
 ) -> TestResult<WriterMachine> {
     let partition = "00112233-4455-6677-8899-aabbccddeeff".parse()?;
-    let generation = SealGeneration::genesis().successor()?;
+    let generation = SealGeneration::try_from(durable)?;
+    let claim_generation = generation.successor()?;
     let durable_batch = BatchId::try_from(durable)?;
-    let next_batch = durable_batch.successor()?;
-    Ok(WriterMachine::from_recovery(
-        AuthoredClaim::new(generation),
-        Seal::new(
+    let cells = forest.checkpoint_cells();
+    let directory = recovery_tree(
+        generation,
+        StoreKind::Directory,
+        0,
+        !cells.directory.is_empty(),
+    )?;
+    let ledger = recovery_tree(generation, StoreKind::Ledger, 1, !cells.ledger.is_empty())?;
+    let seal = Seal::new(
+        partition,
+        generation,
+        WalReplayPoint::Genesis,
+        directory,
+        ledger,
+    )?;
+
+    let mut machine = BootstrapMachine::new();
+    drop(machine.handle(BootstrapEvent::Started {
+        genesis_partition: partition,
+    }));
+    drop(machine.handle(BootstrapEvent::HeadObserved(Some(generation))));
+    drop(machine.handle(BootstrapEvent::SealRead(Some(seal))));
+    let mut step = machine.handle(BootstrapEvent::ClaimPublished(SealPublication::Authored));
+    loop {
+        step = match step {
+            BootstrapStep::Effect(BootstrapEffect::ReadTable { table, .. }) => {
+                let decoded = match table.object().store() {
+                    StoreKind::Directory => DecodedTable::Directory(cells.directory.clone()),
+                    StoreKind::Ledger => DecodedTable::Ledger(cells.ledger.clone()),
+                    StoreKind::Tally | StoreKind::Annals => {
+                        return Err("recovery fixture selected a nonresident table".into());
+                    }
+                };
+                machine.handle(BootstrapEvent::TableRead { table, decoded })
+            }
+            BootstrapStep::Effect(BootstrapEffect::ObserveWalTail) => break,
+            other @ (BootstrapStep::Effect(_)
+            | BootstrapStep::Complete(_)
+            | BootstrapStep::Exit(_)) => {
+                return Err(
+                    format!("expected a base read or WAL observation, got {other:?}").into(),
+                );
+            }
+        };
+    }
+    let listed_tail = durable
+        .checked_sub(1)
+        .filter(|tail| *tail > 0)
+        .map(BatchId::try_from)
+        .transpose()?;
+    let mut step = machine.handle(BootstrapEvent::WalTailObserved(listed_tail));
+    if let Some(tail) = listed_tail {
+        assert!(
+            matches!(
+                step,
+                BootstrapStep::Effect(BootstrapEffect::ReadWal { batch, .. }) if batch == tail
+            ),
+            "the listed tail is read before FENCE placement"
+        );
+        step = machine.handle(BootstrapEvent::WalRead(Some(WalObject::new(
             partition,
-            generation,
-            WalReplayPoint::Genesis,
-            TreeVersion::empty(),
-            TreeVersion::empty(),
-        )?,
-        Forest::empty(),
-        forest,
-        durable_batch,
-        next_batch,
-    ))
+            tail,
+            OwnerToken::from(SealGeneration::try_from(tail.get())?),
+            WalBody::Fence,
+        ))));
+    }
+    assert!(
+        matches!(
+            step,
+            BootstrapStep::Effect(BootstrapEffect::EstablishFence(_))
+        ),
+        "the bounded first hole requests the takeover FENCE"
+    );
+    let mut step = machine.handle(BootstrapEvent::FenceEstablished(WalEstablishment::Durable));
+    assert!(
+        matches!(
+            step,
+            BootstrapStep::Effect(BootstrapEffect::ReadWal { batch, .. }) if batch == BatchId::try_from(1)?
+        ),
+        "replay begins at batch one for a Genesis cut"
+    );
+    for raw_batch in 1..=durable {
+        let batch = BatchId::try_from(raw_batch)?;
+        let owner = if batch == durable_batch {
+            OwnerToken::from(claim_generation)
+        } else {
+            OwnerToken::from(SealGeneration::try_from(raw_batch)?)
+        };
+        step = machine.handle(BootstrapEvent::WalRead(Some(WalObject::new(
+            partition,
+            batch,
+            owner,
+            WalBody::Fence,
+        ))));
+    }
+    assert!(
+        matches!(step, BootstrapStep::Effect(BootstrapEffect::ObserveHead)),
+        "replay through the takeover FENCE requests the final head refresh"
+    );
+    let BootstrapStep::Complete(recovery) =
+        machine.handle(BootstrapEvent::HeadObserved(Some(claim_generation)))
+    else {
+        return Err("recovery fixture reaches a complete bootstrap".into());
+    };
+    Ok(WriterMachine::from_recovery(recovery))
+}
+
+fn recovery_tree(
+    generation: SealGeneration,
+    store: StoreKind,
+    ordinal: u32,
+    populated: bool,
+) -> TestResult<TreeVersion> {
+    if !populated {
+        return Ok(TreeVersion::empty());
+    }
+    let fresh = FreshIdentity::new(
+        generation,
+        AttemptId::new(SealGeneration::genesis(), 1),
+        ordinal,
+    )?;
+    let table = TableRef::new(TableObjectId::new(fresh, store), NonZeroU64::MIN)?;
+    Ok(TreeVersion::try_from(vec![SortedRun::try_from(vec![
+        table,
+    ])?])?)
 }
 
 pub(super) fn complete_success(effect: WriterEffect) -> TestResult<WriterEvent> {

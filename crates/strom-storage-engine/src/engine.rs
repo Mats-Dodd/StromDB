@@ -12,11 +12,13 @@ use strom_object_store::ObjectStoreAdapter;
 use strom_storage_domain::{
     DirectoryEntry, DirectoryKey, PartitionId, SealGeneration, WRITER_INGRESS_COMMANDS_MAX,
 };
-use strom_storage_protocol::{AdmissionRefusal, CommandEnvelope, CreateStream, Forest, WriterExit};
+use strom_storage_protocol::{
+    AdmissionRefusal, BootstrapExit, CommandEnvelope, CreateStream, Forest, WriterExit,
+};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::bootstrap::{BootstrapExit, bootstrap};
+use crate::bootstrap::bootstrap;
 use crate::writer::spawn_writer;
 
 #[derive(Debug, Clone)]
@@ -65,14 +67,14 @@ impl Engine {
     /// consistent, directly claimed, fenced, replayed, and current.
     pub async fn open(store: Arc<dyn ObjectStore>, entropy: Entropy) -> Result<Self, OpenError> {
         let adapter = ObjectStoreAdapter::new(store);
-        let ready = bootstrap(adapter.clone(), entropy)
+        let recovery = bootstrap(adapter.clone(), entropy)
             .await
             .map_err(open_error)?;
-        let partition = ready.partition();
-        let initial = PublishedView::new(ready.forest().clone());
+        let partition = recovery.partition();
+        let initial = PublishedView::new(recovery.durable_forest().clone());
         let (view_sender, view) = watch::channel(initial);
         let (commands, ingress) = mpsc::channel(WRITER_INGRESS_COMMANDS_MAX);
-        let writer = spawn_writer(adapter, ready, ingress, view_sender);
+        let writer = spawn_writer(adapter, recovery, ingress, view_sender);
         Ok(Self {
             partition,
             commands,
