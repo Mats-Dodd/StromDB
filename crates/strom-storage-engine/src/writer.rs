@@ -11,7 +11,7 @@ use crate::bootstrap::Ready;
 use crate::checkpoint::{CheckpointOutcome, PublicationGate, execute_checkpoint};
 use crate::collection::collect_advance;
 use crate::engine::PublishedView;
-use crate::store::{EncodedWal, WalStore, WalStoreError};
+use crate::store::{EncodedWal, TypedStoreError, WalStore};
 
 use state::{AdmissionDecision, CheckpointPlan, CheckpointTicket, Completion, FlightDecision};
 pub(crate) use state::{AdmissionRefusal, CommandEnvelope, CreateStream, WriterState};
@@ -40,7 +40,7 @@ struct Writer {
 
 struct Flight {
     encoded: EncodedWal,
-    task: JoinHandle<Result<CreateEvidence, WalStoreError>>,
+    task: JoinHandle<Result<CreateEvidence, TypedStoreError>>,
 }
 
 struct CheckpointFlight {
@@ -50,7 +50,7 @@ struct CheckpointFlight {
 }
 
 enum WriterEvent {
-    Flight(Result<Result<CreateEvidence, WalStoreError>, tokio::task::JoinError>),
+    Flight(Result<Result<CreateEvidence, TypedStoreError>, tokio::task::JoinError>),
     Checkpoint(Result<CheckpointOutcome, tokio::task::JoinError>),
     Command(Option<CommandEnvelope>),
 }
@@ -209,7 +209,7 @@ impl Writer {
 
     async fn complete_flight(
         &mut self,
-        evidence: Result<CreateEvidence, WalStoreError>,
+        evidence: Result<CreateEvidence, TypedStoreError>,
     ) -> Result<(), WriterExit> {
         let flight = self
             .flight
@@ -236,17 +236,18 @@ impl Writer {
                             .into(),
                     }),
                     Err(
-                        WalStoreError::Retryable { detail } | WalStoreError::Rejected { detail },
+                        TypedStoreError::Retryable { detail }
+                        | TypedStoreError::Rejected { detail },
                     ) => Err(WriterExit::Poisoned { batch, detail }),
-                    Err(WalStoreError::Contradiction { detail }) => {
+                    Err(TypedStoreError::Contradiction { detail }) => {
                         Err(WriterExit::Contradiction { batch, detail })
                     }
                 }
             }
-            Err(WalStoreError::Retryable { detail } | WalStoreError::Rejected { detail }) => {
+            Err(TypedStoreError::Retryable { detail } | TypedStoreError::Rejected { detail }) => {
                 Err(WriterExit::Poisoned { batch, detail })
             }
-            Err(WalStoreError::Contradiction { detail }) => {
+            Err(TypedStoreError::Contradiction { detail }) => {
                 Err(WriterExit::Contradiction { batch, detail })
             }
         };
@@ -336,15 +337,12 @@ impl Writer {
                     batch: ticket.cut,
                     detail: "advancing Seal create is unresolved".into(),
                 }),
-                Err(crate::store::SealStoreError::Contradiction { detail }) => {
-                    Err(WriterExit::Contradiction {
-                        batch: ticket.cut,
-                        detail,
-                    })
-                }
+                Err(TypedStoreError::Contradiction { detail }) => Err(WriterExit::Contradiction {
+                    batch: ticket.cut,
+                    detail,
+                }),
                 Err(
-                    crate::store::SealStoreError::Retryable { detail }
-                    | crate::store::SealStoreError::Rejected { detail },
+                    TypedStoreError::Retryable { detail } | TypedStoreError::Rejected { detail },
                 ) => Err(WriterExit::Poisoned {
                     batch: ticket.cut,
                     detail,

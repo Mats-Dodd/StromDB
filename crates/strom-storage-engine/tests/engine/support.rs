@@ -1,17 +1,29 @@
 use std::sync::Arc;
+use std::time::Duration;
 
+use futures::TryStreamExt as _;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt as _};
 use strom_common::{Entropy, Seed};
 use strom_domain::{CreateOutcome, ExpiryPolicy, StreamContentType, StreamId, StreamLifecycle};
 use strom_object_store::ObjectKey;
+use strom_object_store::test_support::FaultStore;
 use strom_storage_domain::{
-    AttemptId, BatchId, FreshIdentity, SealGeneration, SealKey, SealNamespace, TableKey,
-    TableObjectId, WalKey, WalNamespace,
+    AttemptId, BatchId, FreshIdentity, SealGeneration, SealKey, SealNamespace, StoreKind, TableKey,
+    TableObjectId, WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WalKey, WalNamespace,
 };
-use strom_storage_engine::{Engine, StreamError};
+use strom_storage_engine::{CloseOutcome, Engine, StreamError};
 
 pub(crate) type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+const CHECKPOINT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone)]
+pub(crate) struct CheckpointKeys {
+    pub(crate) seal: ObjectKey,
+    pub(crate) directory: ObjectKey,
+    pub(crate) ledger: ObjectKey,
+}
 
 pub(crate) async fn create(engine: &Engine, id: &StreamId) -> Result<CreateOutcome, StreamError> {
     engine
@@ -43,6 +55,88 @@ pub(crate) fn seal_key(generation: u64) -> ObjectKey {
         .to_string()
         .parse()
         .expect("Seal key spelling is a canonical object key")
+}
+
+/// Drive one fresh engine through the first checkpoint and return the observed keys.
+///
+/// The Seal generation is derived from the durable Directory/Ledger children, not
+/// from a hardcoded coordinate.
+pub(crate) async fn observe_checkpoint_keys() -> Result<CheckpointKeys, Box<dyn std::error::Error>>
+{
+    let store = FaultStore::new();
+    let backend = store.backend();
+    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    drive_checkpoint_span(&engine).await?;
+
+    let (directory, ledger) = tokio::time::timeout(CHECKPOINT_OBSERVATION_TIMEOUT, async {
+        loop {
+            let mut directory = None;
+            let mut ledger = None;
+            let mut listing = backend.list(None);
+            while let Some(metadata) = listing.try_next().await? {
+                let Ok(key) = metadata.location.as_ref().parse::<ObjectKey>() else {
+                    continue;
+                };
+                let Ok(table) = key.as_str().parse::<TableKey>() else {
+                    continue;
+                };
+                match table.object().store() {
+                    StoreKind::Directory => directory = Some(key),
+                    StoreKind::Ledger => ledger = Some(key),
+                    StoreKind::Tally | StoreKind::Annals => {}
+                }
+            }
+            if let (Some(directory), Some(ledger)) = (directory, ledger) {
+                return Ok::<_, object_store::Error>((directory, ledger));
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+
+    assert_eq!(
+        CloseOutcome::Shutdown,
+        engine.shutdown().await,
+        "the observation run remains healthy after producing checkpoint children"
+    );
+    let directory_table: TableKey = directory.as_str().parse()?;
+    let ledger_table: TableKey = ledger.as_str().parse()?;
+    let directory_fresh = directory_table.object().fresh();
+    let ledger_fresh = ledger_table.object().fresh();
+    assert_eq!(
+        directory_fresh.birth_generation(),
+        ledger_fresh.birth_generation(),
+        "one checkpoint gives every child the same birth generation"
+    );
+    assert_eq!(
+        directory_fresh.attempt(),
+        ledger_fresh.attempt(),
+        "one checkpoint gives every child the same attempt identity"
+    );
+    let seal = SealKey::from(directory_fresh.birth_generation())
+        .to_string()
+        .parse()?;
+    Ok(CheckpointKeys {
+        seal,
+        directory,
+        ledger,
+    })
+}
+
+pub(crate) async fn drive_checkpoint_span(
+    engine: &Engine,
+) -> Result<Vec<StreamId>, Box<dyn std::error::Error>> {
+    let mut streams = Vec::new();
+    for ordinal in 0..WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER {
+        let id: StreamId = format!("checkpoint/{ordinal}").parse()?;
+        assert_eq!(
+            CreateOutcome::Created,
+            create(engine, &id).await?,
+            "checkpoint setup command {ordinal} becomes durable"
+        );
+        streams.push(id);
+    }
+    Ok(streams)
 }
 
 pub(crate) fn checkpoint_table_key_at_attempt(observed: &ObjectKey, attempt: u64) -> ObjectKey {

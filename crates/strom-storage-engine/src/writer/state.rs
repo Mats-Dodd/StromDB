@@ -146,7 +146,7 @@ impl WriterState {
             "next_batch is the exact successor of the durable WAL head"
         );
         assert!(
-            replay_batch(seal.replay()).is_none_or(|cut| durable_batch >= cut),
+            seal.replay().batch().is_none_or(|cut| durable_batch >= cut),
             "the durable WAL head never precedes the replay cut"
         );
         Self {
@@ -378,7 +378,10 @@ impl WriterState {
             return None;
         }
         assert!(
-            replay_batch(self.seal.replay()).is_none_or(|cut| self.durable_batch > cut),
+            self.seal
+                .replay()
+                .batch()
+                .is_none_or(|cut| self.durable_batch > cut),
             "a checkpoint plan names an advancing durable cut"
         );
 
@@ -462,7 +465,7 @@ impl WriterState {
         admitted: AdmittedCommand,
         completion: Completion,
     ) -> AdmissionDecision {
-        if !decide_suffix_room(replay_batch(self.seal.replay()), self.next_batch) {
+        if !decide_suffix_room(self.seal.replay().batch(), self.next_batch) {
             self.retry_checkpoint_at = Some(self.durable_batch);
             return AdmissionDecision::Settled(completion.refusal(AdmissionRefusal::Overloaded));
         }
@@ -704,17 +707,10 @@ fn decide_suffix_room(cut: Option<BatchId>, proposed: BatchId) -> bool {
         .is_some_and(|span| span > 1 && span <= WAL_SUFFIX_COORDINATES_MAX_V2)
 }
 
-const fn replay_batch(replay: WalReplayPoint) -> Option<BatchId> {
-    match replay {
-        WalReplayPoint::Genesis => None,
-        WalReplayPoint::Through { batch, owner: _ } => Some(batch),
-    }
-}
-
 const fn suffix_span(replay: WalReplayPoint, durable_batch: BatchId) -> u64 {
-    let cut = match replay {
-        WalReplayPoint::Genesis => 0,
-        WalReplayPoint::Through { batch, owner: _ } => batch.get(),
+    let cut = match replay.batch() {
+        None => 0,
+        Some(batch) => batch.get(),
     };
     durable_batch
         .get()

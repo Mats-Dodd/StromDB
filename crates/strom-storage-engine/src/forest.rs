@@ -1,24 +1,27 @@
 //! Pure two-map forest: Directory and Ledger under strict fold.
 
-mod directory;
-mod ledger;
-
 use std::num::NonZeroU64;
 
-use directory::ResidentDirectory;
 use imbl::OrdMap;
-use ledger::ResidentLedger;
+use imbl::ordmap::DiffItem;
 use strom_domain::StreamLifecycle;
 use strom_storage_domain::{
-    BatchId, DirectoryEntry, DirectoryKey, OperationFact, PARTITION_PATH_OCCUPANCIES_MAX_V2,
-    StreamRecord, StreamUid,
+    BatchId, DirectoryEntry, DirectoryKey, LedgerCell, OperationFact,
+    PARTITION_PATH_OCCUPANCIES_MAX_V2, StreamRecord, StreamUid,
 };
 
 /// Resident Directory and Ledger under the no-forks cross-store invariants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Forest {
-    directory: ResidentDirectory,
-    ledger: ResidentLedger,
+    directory: OrdMap<DirectoryKey, DirectoryEntry>,
+    ledger: OrdMap<StreamUid, StreamRecord>,
+}
+
+/// Directory and Ledger rows that transform `base` into `self`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForestDelta {
+    pub(crate) directory: Vec<(DirectoryKey, DirectoryEntry)>,
+    pub(crate) ledger: Vec<(StreamUid, LedgerCell)>,
 }
 
 /// Zero-sized witness that one fact applied exactly once.
@@ -75,8 +78,8 @@ impl Forest {
     #[must_use]
     pub(crate) fn empty() -> Self {
         Self {
-            directory: ResidentDirectory::empty(),
-            ledger: ResidentLedger::empty(),
+            directory: OrdMap::new(),
+            ledger: OrdMap::new(),
         }
     }
 
@@ -139,10 +142,7 @@ impl Forest {
             return Err(ForestContradiction::LiveWithoutRecord);
         }
 
-        Ok(Self {
-            directory: ResidentDirectory::from_rows(directory),
-            ledger: ResidentLedger::from_records(ledger),
-        })
+        Ok(Self { directory, ledger })
     }
 
     /// Apply one fact at `batch` under the strict fold rules.
@@ -177,18 +177,25 @@ impl Forest {
                     return Err(FoldContradiction::UidNotDenseSuccessor);
                 }
 
-                self.directory.insert_live(path.clone(), *uid);
-                self.ledger.insert(
+                let previous = self
+                    .directory
+                    .insert(path.clone(), DirectoryEntry::Live(*uid));
+                assert!(
+                    previous.is_none(),
+                    "create folds only into an absent directory path"
+                );
+                let previous = self.ledger.insert(
                     *uid,
                     StreamRecord::new(content_type.clone(), *expiry, *lifecycle, batch),
                 );
+                assert!(previous.is_none(), "create folds a fresh ledger uid");
                 Ok(Applied)
             }
             OperationFact::StreamClosed { path, uid } => {
                 let live_uid = require_live_uid(self.directory.get(path), *uid)?;
                 let record = self
                     .ledger
-                    .get(live_uid)
+                    .get(&live_uid)
                     .expect("a Live directory row has exactly one Ledger record");
                 if record.lifecycle().is_closed() {
                     return Err(FoldContradiction::StreamAlreadyClosed);
@@ -199,20 +206,72 @@ impl Forest {
                     StreamLifecycle::Closed,
                     record.created_at(),
                 );
-                self.ledger.replace(live_uid, closed);
+                let previous = self.ledger.insert(live_uid, closed);
+                assert!(previous.is_some(), "close folds an existing ledger record");
                 Ok(Applied)
             }
             OperationFact::StreamDeleted { path, uid } => {
                 let live_uid = require_live_uid(self.directory.get(path), *uid)?;
                 assert!(
-                    self.ledger.get(live_uid).is_some(),
+                    self.ledger.get(&live_uid).is_some(),
                     "a Live directory row has exactly one Ledger record"
                 );
-                self.directory.tombstone_live(path, live_uid);
-                self.ledger.remove(live_uid);
+                let entry = self
+                    .directory
+                    .get_mut(path)
+                    .expect("delete folds a Live directory row");
+                assert!(
+                    matches!(entry, DirectoryEntry::Live(present) if *present == live_uid),
+                    "delete folds the Live uid named by the fact"
+                );
+                *entry = DirectoryEntry::Tombstone(live_uid);
+                let previous = self.ledger.remove(&live_uid);
+                assert!(
+                    previous.is_some(),
+                    "delete removes an existing ledger record"
+                );
                 Ok(Applied)
             }
         }
+    }
+
+    /// Rows that transform `base` into this forest.
+    ///
+    /// Directory path occupancy is permanent: a remove in the `imbl` diff is an
+    /// invariant failure, not a delete cell.
+    #[must_use]
+    pub(crate) fn delta_since(&self, base: &Self) -> ForestDelta {
+        let directory = base
+            .directory
+            .diff(&self.directory)
+            .filter_map(|difference| match difference {
+                DiffItem::Add(key, entry)
+                | DiffItem::Update {
+                    old: _,
+                    new: (key, entry),
+                } => Some((key.clone(), *entry)),
+                DiffItem::Remove(key, _entry) => {
+                    assert!(
+                        self.directory.contains_key(key),
+                        "Directory path occupancy is permanent"
+                    );
+                    None
+                }
+            })
+            .collect();
+        let ledger = base
+            .ledger
+            .diff(&self.ledger)
+            .map(|difference| match difference {
+                DiffItem::Add(uid, record)
+                | DiffItem::Update {
+                    old: _,
+                    new: (uid, record),
+                } => (*uid, LedgerCell::Value(record.clone())),
+                DiffItem::Remove(uid, _record) => (*uid, LedgerCell::Delete),
+            })
+            .collect();
+        ForestDelta { directory, ledger }
     }
 
     #[must_use]
@@ -222,7 +281,7 @@ impl Forest {
 
     #[must_use]
     pub(crate) fn record(&self, uid: StreamUid) -> Option<&StreamRecord> {
-        self.ledger.get(uid)
+        self.ledger.get(&uid)
     }
 
     /// # Panics
@@ -250,17 +309,16 @@ impl Forest {
     }
 
     pub(crate) const fn directory_rows(&self) -> &OrdMap<DirectoryKey, DirectoryEntry> {
-        self.directory.rows()
+        &self.directory
     }
 
     pub(crate) const fn ledger_rows(&self) -> &OrdMap<StreamUid, StreamRecord> {
-        self.ledger.rows()
+        &self.ledger
     }
 
     #[must_use]
     pub(crate) fn shares_roots_with(&self, other: &Self) -> bool {
-        self.directory.rows().ptr_eq(other.directory.rows())
-            && self.ledger.rows().ptr_eq(other.ledger.rows())
+        self.directory.ptr_eq(&other.directory) && self.ledger.ptr_eq(&other.ledger)
     }
 }
 

@@ -1,6 +1,5 @@
 //! Pure advancing-checkpoint preparation.
 
-use imbl::ordmap::DiffItem;
 use strom_storage_domain::{
     AttemptId, BatchId, DIRECTORY_ROW_ENCODED_BYTES_MAX, DirectoryEntry, DirectoryKey,
     FreshIdentity, LEDGER_DELETE_ROW_ENCODED_BYTES_MAX, LEDGER_VALUE_ROW_ENCODED_BYTES_MAX,
@@ -10,7 +9,7 @@ use strom_storage_domain::{
     WalReplayPoint, encode_directory_sst, encode_ledger_sst,
 };
 
-use crate::forest::Forest;
+use crate::forest::{Forest, ForestDelta};
 use crate::store::{EncodedSeal, EncodedTable};
 
 use super::{CheckpointInput, PreparedCheckpoint};
@@ -52,7 +51,7 @@ pub(super) fn prepare_checkpoint(
     } = input;
     let partition = source.partition();
     let owner_claim = attempt.owner_claim();
-    let previous_cut = replay_batch(source.replay());
+    let previous_cut = source.replay().batch();
     if previous_cut.is_some_and(|previous| cut <= previous) {
         return Err("checkpoint cut does not advance its source Seal"
             .to_owned()
@@ -63,16 +62,21 @@ pub(super) fn prepare_checkpoint(
         .successor()
         .map_err(|error| error.to_string())?;
 
-    let plan = plan_checkpoint(&source, &base, &snapshot);
+    let delta = snapshot.delta_since(&base);
+    let plan = plan_checkpoint(&source, &snapshot, &delta);
     let mut ordinal = 0u32;
     let (directory, ledger) = match plan {
         CheckpointPlan::Delta => {
+            let ForestDelta {
+                directory: directory_rows,
+                ledger: ledger_rows,
+            } = delta;
             let Some(directory) = build_directory_tree(
                 partition,
                 generation,
                 attempt,
                 &mut ordinal,
-                delta_directory_rows(&base, &snapshot),
+                directory_rows,
                 Some(source.directory()),
                 emit,
             ) else {
@@ -83,7 +87,7 @@ pub(super) fn prepare_checkpoint(
                 generation,
                 attempt,
                 &mut ordinal,
-                delta_ledger_rows(&base, &snapshot),
+                ledger_rows,
                 Some(source.ledger()),
                 emit,
             ) else {
@@ -141,16 +145,9 @@ pub(super) fn prepare_checkpoint(
     })))
 }
 
-const fn replay_batch(replay: WalReplayPoint) -> Option<BatchId> {
-    match replay {
-        WalReplayPoint::Genesis => None,
-        WalReplayPoint::Through { batch, owner: _ } => Some(batch),
-    }
-}
-
-fn plan_checkpoint(source: &Seal, base: &Forest, snapshot: &Forest) -> CheckpointPlan {
-    if let Some(delta) = plan_delta(source, base, snapshot) {
-        return delta;
+fn plan_checkpoint(source: &Seal, snapshot: &Forest, delta: &ForestDelta) -> CheckpointPlan {
+    if let Some(plan) = plan_delta(source, delta) {
+        return plan;
     }
     let directory = account_rows(
         snapshot
@@ -168,43 +165,28 @@ fn plan_checkpoint(source: &Seal, base: &Forest, snapshot: &Forest) -> Checkpoin
     CheckpointPlan::Full
 }
 
-fn plan_delta(source: &Seal, base: &Forest, snapshot: &Forest) -> Option<CheckpointPlan> {
+fn plan_delta(source: &Seal, delta: &ForestDelta) -> Option<CheckpointPlan> {
     let directory = account_rows(
-        base.directory_rows()
-            .diff(snapshot.directory_rows())
-            .filter_map(|difference| match difference {
-                DiffItem::Add(_, _) | DiffItem::Update { .. } => {
-                    Some(DIRECTORY_ROW_ENCODED_BYTES_MAX)
-                }
-                DiffItem::Remove(key, _entry) => {
-                    assert!(
-                        snapshot.directory_rows().contains_key(key),
-                        "Directory path occupancy is permanent"
-                    );
-                    None
-                }
-            }),
+        delta
+            .directory
+            .iter()
+            .map(|_row| DIRECTORY_ROW_ENCODED_BYTES_MAX),
     );
     let ledger = account_rows(
-        base.ledger_rows()
-            .diff(snapshot.ledger_rows())
-            .map(|difference| match difference {
-                DiffItem::Add(_, _) | DiffItem::Update { .. } => LEDGER_VALUE_ROW_ENCODED_BYTES_MAX,
-                DiffItem::Remove(_, _) => LEDGER_DELETE_ROW_ENCODED_BYTES_MAX,
-            }),
+        delta
+            .ledger
+            .iter()
+            .map(|(_uid, cell)| ledger_row_bytes(cell)),
     );
     select_delta(source, directory, ledger)
 }
 
 #[cfg(test)]
 fn plan_delta_rows(base: &Forest, snapshot: &Forest) -> PlannedRows {
+    let delta = snapshot.delta_since(base);
     PlannedRows {
-        directory: chunk_rows(delta_directory_rows(base, snapshot), |_row| {
-            DIRECTORY_ROW_ENCODED_BYTES_MAX
-        }),
-        ledger: chunk_rows(delta_ledger_rows(base, snapshot), |(_uid, cell)| {
-            ledger_row_bytes(cell)
-        }),
+        directory: chunk_rows(delta.directory, |_row| DIRECTORY_ROW_ENCODED_BYTES_MAX),
+        ledger: chunk_rows(delta.ledger, |(_uid, cell)| ledger_row_bytes(cell)),
     }
 }
 
@@ -337,28 +319,6 @@ fn build_directory_tree(
     .then(|| build_manifest(carried, references))
 }
 
-fn delta_directory_rows<'forest>(
-    base: &'forest Forest,
-    snapshot: &'forest Forest,
-) -> impl Iterator<Item = (DirectoryKey, DirectoryEntry)> + 'forest {
-    base.directory_rows()
-        .diff(snapshot.directory_rows())
-        .filter_map(move |difference| match difference {
-            DiffItem::Add(key, entry) => Some((key.clone(), *entry)),
-            DiffItem::Update {
-                old: (_old_key, _old_entry),
-                new: (key, entry),
-            } => Some((key.clone(), *entry)),
-            DiffItem::Remove(key, _entry) => {
-                assert!(
-                    snapshot.directory_rows().contains_key(key),
-                    "Directory path occupancy is permanent"
-                );
-                None
-            }
-        })
-}
-
 fn build_ledger_tree(
     partition: PartitionId,
     generation: SealGeneration,
@@ -388,22 +348,6 @@ fn build_ledger_tree(
         },
     )
     .then(|| build_manifest(carried, references))
-}
-
-fn delta_ledger_rows<'forest>(
-    base: &'forest Forest,
-    snapshot: &'forest Forest,
-) -> impl Iterator<Item = (StreamUid, LedgerCell)> + 'forest {
-    base.ledger_rows()
-        .diff(snapshot.ledger_rows())
-        .map(|difference| match difference {
-            DiffItem::Add(uid, record) => (*uid, LedgerCell::Value(record.clone())),
-            DiffItem::Update {
-                old: (_old_uid, _old_record),
-                new: (uid, record),
-            } => (*uid, LedgerCell::Value(record.clone())),
-            DiffItem::Remove(uid, _record) => (*uid, LedgerCell::Delete),
-        })
 }
 
 const fn ledger_row_bytes(cell: &LedgerCell) -> u64 {

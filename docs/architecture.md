@@ -528,7 +528,8 @@ and offline verification:
 
 ```rust
 fn strict_fold(
-    state: &mut DurableState,
+    forest: &mut Forest,
+    batch: BatchId,
     fact: &OperationFact,
 ) -> Result<Applied, FoldContradiction>;
 ```
@@ -567,34 +568,29 @@ not cancel a fact that may become durable.
 
 ### pure admission
 
-The writer is the sole mutable owner of `AdmittedState`. It decides requests
-in queue order through a pure function:
+The writer shell owns I/O. Pure protocol state lives in `WriterState`. The
+shell decides requests in queue order through that state:
 
 ```rust
-fn admit(state: &AdmittedState, command: ProtocolCommand) -> Admission;
+fn admit(&mut self, command: CommandEnvelope) -> AdmissionDecision;
 
-enum Admission {
-    Immediate(ProtocolReply),
-    Deferred {
-        fact: Option<OperationFact>,
-        reply: DeferredReply,
-        dependency: DurabilityBarrier,
-    },
-    Shed(CapacityKind),
+enum AdmissionDecision {
+    Settled(Completion),
+    Queued,
 }
 ```
 
-Accepted effects enter `AdmittedState` immediately, allowing a later request
-to observe earlier accepted pending work. They remain unreadable and
+Accepted effects enter the admitted forest immediately, allowing a later
+request to observe earlier accepted pending work. They remain unreadable and
 unacknowledged until durable.
 
-`None` represents an idempotent result whose truth depends on an earlier
-uncommitted fact. A new accepted mutation contributes exactly one bounded
-`OperationFact`; the WAL RUN supplies group commit across many such facts.
+An idempotent result whose truth depends on an earlier uncommitted fact
+queues with no WAL fact and inherits that run's barrier. A new accepted
+mutation contributes exactly one bounded `OperationFact`; the WAL RUN
+supplies group commit across many such facts.
 
-An idempotent response depending on an uncommitted fact inherits that fact's
-barrier. For example, a duplicate create cannot return success while the
-original create remains only in `PendingRun`.
+For example, a duplicate create cannot return success while the original
+create remains only in flight.
 
 
 ### group commit
@@ -716,53 +712,38 @@ every successfully read coordinate.
 
 ## published and resident state
 
-The writer maintains three different logical moments because combining them
-would either expose pending work or make dependent admission incorrect:
+One `WriterState` owns the three logical moments of writer progress. Combining
+them in the published contract would either expose pending work or make
+dependent admission incorrect:
 
 ```text
-AdmittedState   durable + in-flight + pending effects; writer decisions only
-DurableState    newest Seal + proven WAL effects; writer-owned
-PublishedView   immutable reader contract; durable effects only
+WriterState
+  admitted   durable + in-flight + pending effects; admission decisions only
+  durable    newest Seal + proven WAL effects
+  base       Seal forest at the last installed checkpoint
+
+PublishedView   immutable reader contract; durable forest only
 ```
+
+The shell publishes a `PublishedView` after it records WAL durability or
+installs a checkpoint. Readers never see admitted-only work.
 
 The current published view is:
 
 ```rust
 struct PublishedView {
-    identity: ViewIdentity,
-    seal: LoadedSeal,
-    directory: ResidentDirectory,
-    ledger: ResidentLedger,
-    tally: ResidentTally,
-    annals: AnnalsReadDirectory,
-    overlay: DurableWalOverlay,
+    forest: Forest,
 }
 ```
 
-`ViewIdentity` includes the route assignment, monotonically increasing local
-view version, and exact Seal identity. Because Seal coordinates are permanent
-and immutable, generation identifies the durable physical version. A same-cut
-maintenance publication changes physical view identity even though its logical
-cut does not change.
-
+Later slices may grow view identity, Tally, Annals, and a post-W overlay.
 Directory and Ledger state must be locally queryable before Ready. Their
 representation may use RAM, packed local files, persistent maps, or local NVMe
-after measurement. It is always reconstructed from S3 and never becomes
-authority. The exact Tally and Annals resident/read planning shapes remain
-deferred to their RFCs.
+after measurement. It is always reconstructed from object storage and never
+becomes authority.
 
-The global post-W overlay is keyed by complete logical keys. It carries no
-physical range identity:
-
-```text
-PublishedView = Seal trees + global WAL overlay after Seal.replay
-```
-
-That one choice lets same-cut compaction and range changes install without
-repartitioning a large local suffix.
-
-Published views are immutable. Read tasks borrow a large view synchronously,
-copy one bounded seed, and release it before any await. Long-poll and SSE tasks
+Published views are immutable. Read tasks borrow a view synchronously, copy
+one bounded seed, and release it before any await. Long-poll and SSE tasks
 retain only a small watch/version token while sleeping.
 
 
@@ -980,78 +961,50 @@ as an empty tree or silently scans backward to an older convenient Seal.
 ## storage adapter APIs
 
 
-The engine depends on narrow private contracts rather than a general-purpose
-object-store handle:
+The engine wraps the raw object-store adapter in three concrete typed stores.
+Each store owns one namespace. There is one adapter instance behind them; a
+trait seam between the engine and these stores is not part of the design.
 
 ```rust
-trait SealStore {
-    async fn create_seal(
-        &self,
-        candidate: EncodedSeal,
-    ) -> Result<CreateEvidence, SealStoreError>;
+struct SealStore { adapter: ObjectStoreAdapter }
+struct WalStore { adapter: ObjectStoreAdapter }
+struct TableStore { adapter: ObjectStoreAdapter }
 
+impl SealStore {
+    async fn create_seal(&self, candidate: &EncodedSeal)
+        -> Result<CreateEvidence, TypedStoreError>;
     async fn newest_generation(&self)
-        -> Result<Option<SealGeneration>, SealStoreError>;
-
-    async fn read_seal(
-        &self,
-        generation: SealGeneration,
-    ) -> Result<Option<DecodedSeal>, SealStoreError>;
+        -> Result<Option<SealGeneration>, TypedStoreError>;
+    async fn read_seal(&self, generation: SealGeneration)
+        -> Result<Option<Seal>, TypedStoreError>;
 }
 
-trait WalStore {
-    async fn create_wal(
-        &self,
-        candidate: EncodedWal,
-    ) -> Result<CreateEvidence, WalStoreError>;
-
-    async fn read_wal(
-        &self,
-        partition: PartitionId,
-        batch: BatchId,
-    ) -> Result<Option<ObservedWal>, WalStoreError>;
-
+impl WalStore {
+    async fn create_wal(&self, candidate: &EncodedWal)
+        -> Result<CreateEvidence, TypedStoreError>;
+    async fn read_wal(&self, batch: BatchId)
+        -> Result<Option<ObservedWal>, TypedStoreError>;
     async fn newest_surviving_batch(&self)
-        -> Result<Option<BatchId>, WalStoreError>;
-
-    async fn delete_run(
-        &self,
-        proof: AuthorizedWalRunDelete,
-    ) -> Result<ConditionalDeleteObservation, WalStoreError>;
+        -> Result<Option<BatchId>, TypedStoreError>;
+    async fn delete_run(&self, proof: AuthorizedWalRunDelete)
+        -> Result<(), TypedStoreError>;
 }
 
-trait ContentStore {
-    async fn create_or_verify(
-        &self,
-        object: EncodedContentObject,
-    ) -> Result<DurableContentObject, ContentStoreError>;
-
-    async fn read_object(
-        &self,
-        identity: ContentObjectId,
-    ) -> Result<Option<DecodedContentObject>, ContentStoreError>;
-
-    async fn read_range(
-        &self,
-        range: AuthenticatedObjectRange,
-    ) -> Result<Option<VerifiedRangeBytes>, ContentStoreError>;
-
-    async fn list_page(
-        &self,
-        request: BoundedContentPageRequest,
-    ) -> Result<ContentPage, ContentStoreError>;
-
-    async fn delete(
-        &self,
-        proof: AuthorizedContentDelete,
-    ) -> Result<DeleteObservation, ContentStoreError>;
+impl TableStore {
+    async fn create_table(&self, candidate: &EncodedTable)
+        -> Result<CreateEvidence, TypedStoreError>;
+    async fn reconcile_table(&self, candidate: &EncodedTable)
+        -> Result<CandidateTableEvidence, TypedStoreError>;
+    async fn read_table(&self, key: TableKey)
+        -> Result<Option<TableRows>, TypedStoreError>;
+    async fn delete_tables(&self, keys: &[TableKey])
+        -> Result<(), TypedStoreError>;
 }
 ```
 
-These signatures are responsibility sketches. Concrete private traits may be
-combined when that removes ceremony, but the special rules for newest-head
-listing, exact WAL deletion, authenticated range construction, and typed
-content deletion must remain impossible to bypass.
+All three stores share one `TypedStoreError` shape: retryable, rejected, or
+contradiction. Newest-head listing, exact WAL deletion, and typed table
+decode rules stay inside these concrete types so callers cannot bypass them.
 
 
 ## failure, fencing, routing, and shutdown

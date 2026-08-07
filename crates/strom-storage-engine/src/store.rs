@@ -9,12 +9,43 @@ use std::fmt;
 use strom_object_store::{KeysBound, ObjectKey, PUT_BYTES_MAX, StoreError};
 use strom_storage_domain::{SEAL_ENCODED_BYTES_MAX, WAL_ENCODED_BYTES_MAX};
 
-pub(crate) use seal::{EncodedSeal, SealStore, SealStoreError};
+pub(crate) use seal::{EncodedSeal, SealStore};
 pub(crate) use table::{
-    CandidateTableEvidence, EncodedTable, TableRows, TableStore, TableStoreError,
-    targeted_table_deletes,
+    CandidateTableEvidence, EncodedTable, TableRows, TableStore, targeted_table_deletes,
 };
-pub(crate) use wal::{EncodedWal, WalStore, WalStoreError};
+pub(crate) use wal::{EncodedWal, WalStore};
+
+/// Failures of typed store operations, shaped for writer and bootstrap exits.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum TypedStoreError {
+    /// Transport trouble; a bounded retry of the same idempotent request is legal.
+    #[error("retryable store failure: {detail}")]
+    Retryable { detail: String },
+    /// The backend refused the request definitively; retrying cannot help.
+    #[error("store rejected the request: {detail}")]
+    Rejected { detail: String },
+    /// Durable bytes violate the storage model. The caller fails closed.
+    #[error("store durable contradiction: {detail}")]
+    Contradiction { detail: String },
+}
+
+impl TypedStoreError {
+    fn from_store(error: StoreError) -> Self {
+        match error {
+            StoreError::Retryable { detail } => Self::Retryable { detail },
+            StoreError::Rejected { detail } => Self::Rejected { detail },
+            StoreError::Contradiction(contradiction) => Self::Contradiction {
+                detail: contradiction.to_string(),
+            },
+        }
+    }
+
+    fn contradiction(detail: impl Into<String>) -> Self {
+        Self::Contradiction {
+            detail: detail.into(),
+        }
+    }
+}
 
 // The engine joins the two crates; neither can see the other's bound constant
 // (RFC 0002). These asserts keep the typed complete-object bounds inside the
@@ -47,20 +78,4 @@ fn object_key(spelling: impl fmt::Display) -> ObjectKey {
 
 fn newest_keys_bound() -> KeysBound {
     KeysBound::try_from(1).expect("one is a legal keys bound")
-}
-
-fn map_store_error(error: StoreError) -> (StoreErrorClass, String) {
-    match error {
-        StoreError::Retryable { detail } => (StoreErrorClass::Retryable, detail),
-        StoreError::Rejected { detail } => (StoreErrorClass::Rejected, detail),
-        StoreError::Contradiction(contradiction) => {
-            (StoreErrorClass::Contradiction, contradiction.to_string())
-        }
-    }
-}
-
-enum StoreErrorClass {
-    Retryable,
-    Rejected,
-    Contradiction,
 }

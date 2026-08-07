@@ -10,7 +10,7 @@ use strom_storage_domain::{
     encode_seal,
 };
 
-use super::{StoreErrorClass, map_store_error, newest_keys_bound, object_key};
+use super::{TypedStoreError, newest_keys_bound, object_key};
 
 /// One Seal candidate, encoded exactly once. Key and body agree by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,37 +55,6 @@ impl EncodedSeal {
     }
 }
 
-/// Failures of Seal store operations, shaped for the writer state machine.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum SealStoreError {
-    /// Transport trouble; a bounded retry of the same idempotent request is legal.
-    #[error("retryable Seal store failure: {detail}")]
-    Retryable { detail: String },
-    /// The backend refused the request definitively; retrying cannot help.
-    #[error("Seal store rejected the request: {detail}")]
-    Rejected { detail: String },
-    /// Durable bytes violate the storage model. The caller fails closed.
-    #[error("Seal store durable contradiction: {detail}")]
-    Contradiction { detail: String },
-}
-
-impl SealStoreError {
-    fn from_store(error: strom_object_store::StoreError) -> Self {
-        let (class, detail) = map_store_error(error);
-        match class {
-            StoreErrorClass::Retryable => Self::Retryable { detail },
-            StoreErrorClass::Rejected => Self::Rejected { detail },
-            StoreErrorClass::Contradiction => Self::Contradiction { detail },
-        }
-    }
-
-    fn contradiction(detail: impl Into<String>) -> Self {
-        Self::Contradiction {
-            detail: detail.into(),
-        }
-    }
-}
-
 /// Typed Seal namespace over the raw object-store adapter.
 #[derive(Debug, Clone)]
 pub(crate) struct SealStore {
@@ -107,26 +76,28 @@ impl SealStore {
     ///
     /// # Errors
     ///
-    /// Returns [`SealStoreError`] when the adapter reports a retryable,
+    /// Returns [`TypedStoreError`] when the adapter reports a retryable,
     /// rejected, or contradictory outcome.
     pub(crate) async fn create_seal(
         &self,
         candidate: &EncodedSeal,
-    ) -> Result<CreateEvidence, SealStoreError> {
+    ) -> Result<CreateEvidence, TypedStoreError> {
         let key = object_key(SealKey::from(candidate.generation));
         self.adapter
             .create_if_absent(&key, candidate.bytes.clone())
             .await
-            .map_err(SealStoreError::from_store)
+            .map_err(TypedStoreError::from_store)
     }
 
     /// Newest generation via one ascending list page with `keys_max = 1`.
     ///
     /// # Errors
     ///
-    /// Returns [`SealStoreError`] on adapter failure. A listed key that does
+    /// Returns [`TypedStoreError`] on adapter failure. A listed key that does
     /// not parse as this partition's Seal key is a contradiction.
-    pub(crate) async fn newest_generation(&self) -> Result<Option<SealGeneration>, SealStoreError> {
+    pub(crate) async fn newest_generation(
+        &self,
+    ) -> Result<Option<SealGeneration>, TypedStoreError> {
         let page = self
             .adapter
             .list_page(ListPageRequest {
@@ -135,12 +106,12 @@ impl SealStore {
                 keys_max: newest_keys_bound(),
             })
             .await
-            .map_err(SealStoreError::from_store)?;
+            .map_err(TypedStoreError::from_store)?;
         let Some(listed) = page.keys().first() else {
             return Ok(None);
         };
         let key = SealKey::from_str(listed.as_str()).map_err(|source| {
-            SealStoreError::contradiction(format!(
+            TypedStoreError::contradiction(format!(
                 "listed key {listed} under the Seal namespace is not a Seal key: {source}"
             ))
         })?;
@@ -151,26 +122,26 @@ impl SealStore {
     ///
     /// # Errors
     ///
-    /// Returns [`SealStoreError`] on adapter failure. A present body that fails
+    /// Returns [`TypedStoreError`] on adapter failure. A present body that fails
     /// decode is a contradiction, never absence.
     pub(crate) async fn read_seal(
         &self,
         generation: SealGeneration,
-    ) -> Result<Option<Seal>, SealStoreError> {
+    ) -> Result<Option<Seal>, TypedStoreError> {
         let key = object_key(SealKey::from(generation));
         let bound = seal_read_bound();
         let Some(observed) = self
             .adapter
             .read(&key, bound)
             .await
-            .map_err(SealStoreError::from_store)?
+            .map_err(TypedStoreError::from_store)?
         else {
             return Ok(None);
         };
         decode_seal(generation, observed.body())
             .map(Some)
             .map_err(|source| {
-                SealStoreError::contradiction(format!(
+                TypedStoreError::contradiction(format!(
                     "Seal body at {key} failed checked decode for {generation:?}: {source}"
                 ))
             })
@@ -251,7 +222,7 @@ mod tests {
 
         let outcome = store.read_seal(identity).await;
         assert!(
-            matches!(outcome, Err(SealStoreError::Contradiction { .. })),
+            matches!(outcome, Err(TypedStoreError::Contradiction { .. })),
             "decode failure at an owned Seal key is Contradiction, got {outcome:?}"
         );
     }
@@ -272,7 +243,7 @@ mod tests {
 
         let outcome = store.newest_generation().await;
         assert!(
-            matches!(outcome, Err(SealStoreError::Contradiction { .. })),
+            matches!(outcome, Err(TypedStoreError::Contradiction { .. })),
             "a foreign key under the Seal namespace is Contradiction, got {outcome:?}"
         );
     }
@@ -295,7 +266,7 @@ mod tests {
 
         let outcome = store.read_seal(identity_b).await;
         assert!(
-            matches!(outcome, Err(SealStoreError::Contradiction { .. })),
+            matches!(outcome, Err(TypedStoreError::Contradiction { .. })),
             "IdentityMismatch at the read identity is Contradiction, got {outcome:?}"
         );
     }

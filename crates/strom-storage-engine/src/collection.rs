@@ -1,7 +1,7 @@
 //! Best-effort collection after an advancing Seal publication.
 
 use strom_object_store::ObjectStoreAdapter;
-use strom_storage_domain::{BatchId, PartitionId, Seal, WalReplayPoint};
+use strom_storage_domain::{BatchId, PartitionId, Seal};
 
 use crate::store::{TableStore, WalStore, targeted_table_deletes};
 
@@ -53,15 +53,13 @@ fn plan_wal_collection(source: &Seal, successor: &Seal) -> (PartitionId, BatchId
         successor.generation(),
         "collection requires an exact Seal successor pair"
     );
-    let cut = replay_batch(successor.replay()).expect("an advancing successor Seal has a WAL cut");
-    let first = match source.replay() {
-        WalReplayPoint::Genesis => {
-            BatchId::try_from(1).expect("batch one is a legal WAL coordinate")
-        }
-        WalReplayPoint::Through {
-            batch: previous,
-            owner: _,
-        } => {
+    let cut = successor
+        .replay()
+        .batch()
+        .expect("an advancing successor Seal has a WAL cut");
+    let first = match source.replay().batch() {
+        None => BatchId::try_from(1).expect("batch one is a legal WAL coordinate"),
+        Some(previous) => {
             assert!(
                 previous < cut,
                 "an advancing successor Seal has a strictly greater WAL cut"
@@ -72,13 +70,6 @@ fn plan_wal_collection(source: &Seal, successor: &Seal) -> (PartitionId, BatchId
         }
     };
     (source.partition(), first, cut)
-}
-
-const fn replay_batch(replay: WalReplayPoint) -> Option<BatchId> {
-    match replay {
-        WalReplayPoint::Genesis => None,
-        WalReplayPoint::Through { batch, owner: _ } => Some(batch),
-    }
 }
 
 #[cfg(test)]
@@ -96,7 +87,7 @@ mod tests {
     use strom_storage_domain::{
         AttemptId, DirectoryKey, FreshIdentity, OperationFact, OwnerToken, SealGeneration, SealKey,
         SortedRun, StoreKind, StreamUid, TableKey, TableObjectId, TableRef, TreeVersion, WalBody,
-        WalFacts, WalKey, WalObject,
+        WalFacts, WalKey, WalObject, WalReplayPoint,
     };
 
     use super::*;

@@ -17,8 +17,7 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use crate::forest::Forest;
 use crate::store::{
-    CandidateTableEvidence, EncodedSeal, EncodedTable, SealStore, SealStoreError, TableStore,
-    TableStoreError,
+    CandidateTableEvidence, EncodedSeal, EncodedTable, SealStore, TableStore, TypedStoreError,
 };
 
 use self::prepare::prepare_checkpoint;
@@ -72,7 +71,7 @@ pub(crate) enum CheckpointOutcome {
     },
     Seal {
         prepared: Box<PreparedCheckpoint>,
-        evidence: Result<CreateEvidence, SealStoreError>,
+        evidence: Result<CreateEvidence, TypedStoreError>,
     },
 }
 
@@ -244,17 +243,17 @@ async fn establish_table(
                 detail: "an unresolved fresh checkpoint table contains foreign bytes".into(),
             }),
             Ok(CandidateTableEvidence::Absent)
-            | Err(TableStoreError::Retryable { .. } | TableStoreError::Rejected { .. }) => {
+            | Err(TypedStoreError::Retryable { .. } | TypedStoreError::Rejected { .. }) => {
                 Err(EstablishTableError::Abandon)
             }
-            Err(TableStoreError::Contradiction { detail }) => {
+            Err(TypedStoreError::Contradiction { detail }) => {
                 Err(EstablishTableError::Contradiction { detail })
             }
         },
-        Err(TableStoreError::Retryable { .. } | TableStoreError::Rejected { .. }) => {
+        Err(TypedStoreError::Retryable { .. } | TypedStoreError::Rejected { .. }) => {
             Err(EstablishTableError::Abandon)
         }
-        Err(TableStoreError::Contradiction { detail }) => {
+        Err(TypedStoreError::Contradiction { detail }) => {
             Err(EstablishTableError::Contradiction { detail })
         }
     }

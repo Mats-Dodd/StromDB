@@ -12,7 +12,7 @@ use strom_storage_domain::{
 };
 use strom_storage_engine::{CloseOutcome, Engine, OpenError, StreamError};
 
-use super::support::{TestResult, create, entropy, seal_key, wal_key};
+use super::support::{TestResult, create, entropy, observe_checkpoint_keys, wal_key};
 
 #[tokio::test]
 async fn direct_wal_create_commits_once_and_survives_reopen() -> TestResult {
@@ -258,8 +258,8 @@ async fn wal_run_retains_matching_state_and_shell_flights_until_completion() -> 
 
 #[tokio::test]
 async fn held_checkpoint_cannot_extend_the_bounded_wal_suffix() -> TestResult {
+    let seal_key = observe_checkpoint_keys().await?.seal;
     let seal_gate = Gate::new();
-    let seal_key = seal_key(3);
     let store = FaultStore::new().gate(
         Selection::create(Target::Key(seal_key.clone())),
         seal_gate.clone(),

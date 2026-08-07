@@ -9,7 +9,7 @@ use strom_storage_domain::{
     TableObjectId, TableRef, decode_directory_sst, decode_ledger_sst,
 };
 
-use super::{StoreErrorClass, map_store_error, object_key};
+use super::{TypedStoreError, object_key};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TableRows {
@@ -60,33 +60,6 @@ pub(crate) struct AuthorizedTableDelete {
     object: TableObjectId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum TableStoreError {
-    #[error("retryable table store failure: {detail}")]
-    Retryable { detail: String },
-    #[error("table store rejected the request: {detail}")]
-    Rejected { detail: String },
-    #[error("table store durable contradiction: {detail}")]
-    Contradiction { detail: String },
-}
-
-impl TableStoreError {
-    fn from_store(error: strom_object_store::StoreError) -> Self {
-        let (class, detail) = map_store_error(error);
-        match class {
-            StoreErrorClass::Retryable => Self::Retryable { detail },
-            StoreErrorClass::Rejected => Self::Rejected { detail },
-            StoreErrorClass::Contradiction => Self::Contradiction { detail },
-        }
-    }
-
-    fn contradiction(detail: impl Into<String>) -> Self {
-        Self::Contradiction {
-            detail: detail.into(),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct TableStore {
     adapter: ObjectStoreAdapter,
@@ -101,18 +74,18 @@ impl TableStore {
     pub(crate) async fn create_table(
         &self,
         candidate: &EncodedTable,
-    ) -> Result<CreateEvidence, TableStoreError> {
+    ) -> Result<CreateEvidence, TypedStoreError> {
         let key = object_key(candidate.key);
         self.adapter
             .create_if_absent(&key, candidate.bytes.clone())
             .await
-            .map_err(TableStoreError::from_store)
+            .map_err(TypedStoreError::from_store)
     }
 
     pub(crate) async fn reconcile_table(
         &self,
         candidate: &EncodedTable,
-    ) -> Result<CandidateTableEvidence, TableStoreError> {
+    ) -> Result<CandidateTableEvidence, TypedStoreError> {
         let key = object_key(candidate.key);
         let bound = ByteBound::try_from(candidate.table.object_bytes().get())
             .expect("a TableRef carries a nonzero in-bound object length");
@@ -120,7 +93,7 @@ impl TableStore {
             .adapter
             .read(&key, bound)
             .await
-            .map_err(TableStoreError::from_store)?;
+            .map_err(TypedStoreError::from_store)?;
         Ok(match observed {
             Some(observed) if observed.body() == candidate.as_slice() => {
                 CandidateTableEvidence::Match
@@ -133,19 +106,19 @@ impl TableStore {
     pub(crate) async fn delete_table(
         &self,
         proof: AuthorizedTableDelete,
-    ) -> Result<(), TableStoreError> {
+    ) -> Result<(), TypedStoreError> {
         let key = object_key(TableKey::new(proof.object));
         self.adapter
             .delete_idempotent(&key)
             .await
-            .map_err(TableStoreError::from_store)
+            .map_err(TypedStoreError::from_store)
     }
 
     pub(crate) async fn read_table(
         &self,
         partition: PartitionId,
         table: &TableRef,
-    ) -> Result<TableRows, TableStoreError> {
+    ) -> Result<TableRows, TypedStoreError> {
         let key = TableKey::new(table.object());
         let object_key = object_key(key);
         let bound = ByteBound::try_from(table.object_bytes().get())
@@ -154,15 +127,15 @@ impl TableStore {
             .adapter
             .read(&object_key, bound)
             .await
-            .map_err(TableStoreError::from_store)?
+            .map_err(TypedStoreError::from_store)?
         else {
-            return Err(TableStoreError::contradiction(format!(
+            return Err(TypedStoreError::contradiction(format!(
                 "Seal-selected table {key} is absent"
             )));
         };
         let bytes_actual = u64::try_from(observed.body().len()).unwrap_or(u64::MAX);
         if bytes_actual != table.object_bytes().get() {
-            return Err(TableStoreError::contradiction(format!(
+            return Err(TypedStoreError::contradiction(format!(
                 "table {key} has {bytes_actual} bytes; its Seal records {}",
                 table.object_bytes()
             )));
@@ -172,18 +145,18 @@ impl TableStore {
             StoreKind::Directory => decode_directory_sst(partition, &key, observed.body())
                 .map(TableRows::Directory)
                 .map_err(|source| {
-                    TableStoreError::contradiction(format!(
+                    TypedStoreError::contradiction(format!(
                         "Directory table {key} failed checked decode: {source}"
                     ))
                 }),
             StoreKind::Ledger => decode_ledger_sst(partition, &key, observed.body())
                 .map(TableRows::Ledger)
                 .map_err(|source| {
-                    TableStoreError::contradiction(format!(
+                    TypedStoreError::contradiction(format!(
                         "Ledger table {key} failed checked decode: {source}"
                     ))
                 }),
-            StoreKind::Tally | StoreKind::Annals => Err(TableStoreError::contradiction(format!(
+            StoreKind::Tally | StoreKind::Annals => Err(TypedStoreError::contradiction(format!(
                 "table {key} names a store with no resident decoder"
             ))),
         }
@@ -301,7 +274,7 @@ mod tests {
                     &table_ref(directory_table_key, ledger_bytes.len())?
                 )
                 .await,
-            Err(TableStoreError::Contradiction { .. })
+            Err(TypedStoreError::Contradiction { .. })
         ));
 
         let encoded_key = table_key_at(StoreKind::Directory, 2)?;
@@ -320,7 +293,7 @@ mod tests {
                     &table_ref(planted_key, wrong_identity_bytes.len())?
                 )
                 .await,
-            Err(TableStoreError::Contradiction { .. })
+            Err(TypedStoreError::Contradiction { .. })
         ));
 
         let garbage_key = table_key_at(StoreKind::Directory, 4)?;
@@ -331,7 +304,7 @@ mod tests {
             TableStore::new(garbage_adapter)
                 .read_table(partition(), &table_ref(garbage_key, garbage.len())?)
                 .await,
-            Err(TableStoreError::Contradiction { .. })
+            Err(TypedStoreError::Contradiction { .. })
         ));
         Ok(())
     }
@@ -350,7 +323,7 @@ mod tests {
         let exact = table_ref(key, bytes.len())?;
         assert!(matches!(
             absent_store.read_table(partition(), &exact).await,
-            Err(TableStoreError::Contradiction { .. })
+            Err(TypedStoreError::Contradiction { .. })
         ));
 
         let short_adapter = ObjectStoreAdapter::in_memory();
@@ -363,7 +336,7 @@ mod tests {
             TableStore::new(short_adapter)
                 .read_table(partition(), &recorded_longer)
                 .await,
-            Err(TableStoreError::Contradiction { .. })
+            Err(TypedStoreError::Contradiction { .. })
         ));
 
         let long_adapter = ObjectStoreAdapter::in_memory();
@@ -381,7 +354,7 @@ mod tests {
             TableStore::new(long_adapter)
                 .read_table(partition(), &recorded_shorter)
                 .await,
-            Err(TableStoreError::Contradiction { .. })
+            Err(TypedStoreError::Contradiction { .. })
         ));
         Ok(())
     }

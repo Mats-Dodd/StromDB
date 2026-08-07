@@ -126,6 +126,17 @@ pub enum WalReplayPoint {
     Through { batch: BatchId, owner: OwnerToken },
 }
 
+impl WalReplayPoint {
+    /// The inclusive WAL cut named by this replay point, if any.
+    #[must_use]
+    pub const fn batch(self) -> Option<BatchId> {
+        match self {
+            Self::Genesis => None,
+            Self::Through { batch, owner: _ } => Some(batch),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
 pub struct TreeVersion {
     runs: Vec<SortedRun>,

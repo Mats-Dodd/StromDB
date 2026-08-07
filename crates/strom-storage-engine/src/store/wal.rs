@@ -11,7 +11,7 @@ use strom_storage_domain::{
     WalObject, decode_wal, encode_wal,
 };
 
-use super::{StoreErrorClass, map_store_error, newest_keys_bound, object_key};
+use super::{TypedStoreError, newest_keys_bound, object_key};
 
 /// One WAL candidate, encoded exactly once. Key and body agree by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,37 +130,6 @@ pub(crate) struct AuthorizedWalRunDelete {
     validator: Etag,
 }
 
-/// Failures of WAL store operations, shaped for the writer state machine.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum WalStoreError {
-    /// Transport trouble; a bounded retry of the same idempotent request is legal.
-    #[error("retryable WAL store failure: {detail}")]
-    Retryable { detail: String },
-    /// The backend refused the request definitively; retrying cannot help.
-    #[error("WAL store rejected the request: {detail}")]
-    Rejected { detail: String },
-    /// Durable bytes violate the storage model. The caller fails closed.
-    #[error("WAL store durable contradiction: {detail}")]
-    Contradiction { detail: String },
-}
-
-impl WalStoreError {
-    fn from_store(error: strom_object_store::StoreError) -> Self {
-        let (class, detail) = map_store_error(error);
-        match class {
-            StoreErrorClass::Retryable => Self::Retryable { detail },
-            StoreErrorClass::Rejected => Self::Rejected { detail },
-            StoreErrorClass::Contradiction => Self::Contradiction { detail },
-        }
-    }
-
-    fn contradiction(detail: impl Into<String>) -> Self {
-        Self::Contradiction {
-            detail: detail.into(),
-        }
-    }
-}
-
 /// Typed WAL namespace over the raw object-store adapter.
 #[derive(Debug, Clone)]
 pub(crate) struct WalStore {
@@ -182,26 +151,26 @@ impl WalStore {
     ///
     /// # Errors
     ///
-    /// Returns [`WalStoreError`] when the adapter reports a retryable,
+    /// Returns [`TypedStoreError`] when the adapter reports a retryable,
     /// rejected, or contradictory outcome.
     pub(crate) async fn create_wal(
         &self,
         candidate: &EncodedWal,
-    ) -> Result<CreateEvidence, WalStoreError> {
+    ) -> Result<CreateEvidence, TypedStoreError> {
         let key = object_key(WalKey::from(candidate.batch));
         self.adapter
             .create_if_absent(&key, candidate.bytes.clone())
             .await
-            .map_err(WalStoreError::from_store)
+            .map_err(TypedStoreError::from_store)
     }
 
     /// Newest surviving batch via one ascending list page with `keys_max = 1`.
     ///
     /// # Errors
     ///
-    /// Returns [`WalStoreError`] on adapter failure. A listed key that does
+    /// Returns [`TypedStoreError`] on adapter failure. A listed key that does
     /// not parse as this partition's WAL key is a contradiction.
-    pub(crate) async fn newest_surviving_batch(&self) -> Result<Option<BatchId>, WalStoreError> {
+    pub(crate) async fn newest_surviving_batch(&self) -> Result<Option<BatchId>, TypedStoreError> {
         let page = self
             .adapter
             .list_page(ListPageRequest {
@@ -210,12 +179,12 @@ impl WalStore {
                 keys_max: newest_keys_bound(),
             })
             .await
-            .map_err(WalStoreError::from_store)?;
+            .map_err(TypedStoreError::from_store)?;
         let Some(listed) = page.keys().first() else {
             return Ok(None);
         };
         let key = WalKey::from_str(listed.as_str()).map_err(|source| {
-            WalStoreError::contradiction(format!(
+            TypedStoreError::contradiction(format!(
                 "listed key {listed} under the WAL namespace is not a WAL key: {source}"
             ))
         })?;
@@ -226,30 +195,30 @@ impl WalStore {
     ///
     /// # Errors
     ///
-    /// Returns [`WalStoreError`] on adapter failure. A present body that fails
+    /// Returns [`TypedStoreError`] on adapter failure. A present body that fails
     /// decode is a contradiction, never absence.
     pub(crate) async fn read_wal(
         &self,
         partition: PartitionId,
         batch: BatchId,
-    ) -> Result<Option<ObservedWal>, WalStoreError> {
+    ) -> Result<Option<ObservedWal>, TypedStoreError> {
         let key = object_key(WalKey::from(batch));
         let bound = wal_read_bound();
         let Some(observed) = self
             .adapter
             .read(&key, bound)
             .await
-            .map_err(WalStoreError::from_store)?
+            .map_err(TypedStoreError::from_store)?
         else {
             return Ok(None);
         };
         let object = decode_wal(partition, batch, observed.body()).map_err(|source| {
-            WalStoreError::contradiction(format!(
+            TypedStoreError::contradiction(format!(
                 "WAL body at {key} failed checked decode for {partition}/{batch:?}: {source}"
             ))
         })?;
         let bytes = FrozenBytes::try_from(observed.body().to_vec()).map_err(|source| {
-            WalStoreError::contradiction(format!(
+            TypedStoreError::contradiction(format!(
                 "decoded WAL body at {key} cannot be retained for exact reconciliation: {source}"
             ))
         })?;
@@ -274,12 +243,12 @@ impl WalStore {
     ///
     /// # Errors
     ///
-    /// Returns [`WalStoreError`] when the adapter reports a retryable,
+    /// Returns [`TypedStoreError`] when the adapter reports a retryable,
     /// rejected, or contradictory outcome.
     pub(crate) async fn delete_run(
         &self,
         proof: AuthorizedWalRunDelete,
-    ) -> Result<(), WalStoreError> {
+    ) -> Result<(), TypedStoreError> {
         let AuthorizedWalRunDelete { batch, validator } = proof;
         // Retained until If-Match delete is available; see AuthorizedWalRunDelete.
         drop(validator);
@@ -287,7 +256,7 @@ impl WalStore {
         self.adapter
             .delete_idempotent(&key)
             .await
-            .map_err(WalStoreError::from_store)
+            .map_err(TypedStoreError::from_store)
     }
 }
 
@@ -373,7 +342,7 @@ mod tests {
 
         let outcome = store.read_wal(partition(), batch).await;
         assert!(
-            matches!(outcome, Err(WalStoreError::Contradiction { .. })),
+            matches!(outcome, Err(TypedStoreError::Contradiction { .. })),
             "decode failure at an owned WAL key is Contradiction, got {outcome:?}"
         );
     }
@@ -419,7 +388,7 @@ mod tests {
 
         let outcome = store.newest_surviving_batch().await;
         assert!(
-            matches!(outcome, Err(WalStoreError::Contradiction { .. })),
+            matches!(outcome, Err(TypedStoreError::Contradiction { .. })),
             "a foreign key under the WAL namespace is Contradiction, got {outcome:?}"
         );
     }
@@ -441,7 +410,7 @@ mod tests {
 
         let outcome = store.read_wal(partition(), batch_b).await;
         assert!(
-            matches!(outcome, Err(WalStoreError::Contradiction { .. })),
+            matches!(outcome, Err(TypedStoreError::Contradiction { .. })),
             "IdentityMismatch at the read identity is Contradiction, got {outcome:?}"
         );
     }

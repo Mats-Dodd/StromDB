@@ -15,8 +15,7 @@ use strom_storage_domain::{
 use crate::forest::Forest;
 use crate::forest::ForestContradiction;
 use crate::store::{
-    EncodedSeal, EncodedWal, SealStore, SealStoreError, TableRows, TableStore, TableStoreError,
-    WalStore, WalStoreError,
+    EncodedSeal, EncodedWal, SealStore, TableRows, TableStore, TypedStoreError, WalStore,
 };
 use crate::writer::WriterState;
 
@@ -172,7 +171,7 @@ pub(crate) async fn bootstrap(
                 let observed = seal_store
                     .newest_generation()
                     .await
-                    .map_err(map_seal_error)?;
+                    .map_err(map_typed_store_error)?;
                 let generation = if let Some(generation) = observed {
                     generation
                 } else {
@@ -191,7 +190,7 @@ pub(crate) async fn bootstrap(
                 let head = seal_store
                     .read_seal(generation)
                     .await
-                    .map_err(map_seal_error)?
+                    .map_err(map_typed_store_error)?
                     .ok_or_else(|| BootstrapExit::Contradiction {
                         detail: format!("newest Seal {generation:?} is absent"),
                     })?;
@@ -222,7 +221,7 @@ pub(crate) async fn bootstrap(
             } => match seal_store
                 .create_seal(&encoded)
                 .await
-                .map_err(map_seal_error)?
+                .map_err(map_typed_store_error)?
             {
                 CreateEvidence::Direct => {
                     let generation = candidate.generation();
@@ -252,10 +251,10 @@ pub(crate) async fn bootstrap(
                 let listed_tail = wal_store
                     .newest_surviving_batch()
                     .await
-                    .map_err(map_wal_error)?;
+                    .map_err(map_typed_store_error)?;
                 let replay = seal.replay();
-                let candidate = plan_fence_candidate(replay_batch(replay), listed_tail)?;
-                let fence = bound_fence(replay_batch(replay), candidate)?;
+                let candidate = plan_fence_candidate(replay.batch(), listed_tail)?;
+                let fence = bound_fence(replay.batch(), candidate)?;
                 BootstrapPhase::PlaceFence {
                     claim,
                     seal,
@@ -278,7 +277,7 @@ pub(crate) async fn bootstrap(
                 if let FenceTailGate::RefreshAnomaly { detail } = guard_fence_tail(
                     &wal_store,
                     partition,
-                    replay_batch(replay),
+                    replay.batch(),
                     listed_tail,
                     claim.owner,
                 )
@@ -297,7 +296,7 @@ pub(crate) async fn bootstrap(
                 let evidence = wal_store
                     .create_wal(&encoded)
                     .await
-                    .map_err(map_wal_error)?;
+                    .map_err(map_typed_store_error)?;
                 let established = match evidence {
                     CreateEvidence::Direct | CreateEvidence::DurableMatch => true,
                     CreateEvidence::NotOurs => false,
@@ -311,7 +310,7 @@ pub(crate) async fn bootstrap(
                                     ),
                                 });
                             }
-                            Err(error) => return Err(map_wal_error(error)),
+                            Err(error) => return Err(map_typed_store_error(error)),
                         }
                     }
                 };
@@ -329,8 +328,8 @@ pub(crate) async fn bootstrap(
                     let listed_tail = wal_store
                         .newest_surviving_batch()
                         .await
-                        .map_err(map_wal_error)?;
-                    let next_candidate = plan_fence_candidate(replay_batch(replay), listed_tail)?;
+                        .map_err(map_typed_store_error)?;
+                    let next_candidate = plan_fence_candidate(replay.batch(), listed_tail)?;
                     if next_candidate <= candidate {
                         return Err(BootstrapExit::Contradiction {
                             detail: format!(
@@ -343,7 +342,7 @@ pub(crate) async fn bootstrap(
                         seal,
                         base,
                         forest,
-                        fence: bound_fence(replay_batch(replay), next_candidate)?,
+                        fence: bound_fence(replay.batch(), next_candidate)?,
                         listed_tail,
                     }
                 }
@@ -367,14 +366,15 @@ pub(crate) async fn bootstrap(
                         };
                         continue;
                     }
-                    Err(WalStoreError::Contradiction { detail }) => {
+                    Err(TypedStoreError::Contradiction { detail }) => {
                         phase = BootstrapPhase::RefreshAnomaly { claim, detail };
                         continue;
                     }
                     Err(
-                        error @ (WalStoreError::Retryable { .. } | WalStoreError::Rejected { .. }),
+                        error @ (TypedStoreError::Retryable { .. }
+                        | TypedStoreError::Rejected { .. }),
                     ) => {
-                        return Err(map_wal_error(error));
+                        return Err(map_typed_store_error(error));
                     }
                 };
                 let object = observed.object();
@@ -441,7 +441,7 @@ pub(crate) async fn bootstrap(
                 let newest = seal_store
                     .newest_generation()
                     .await
-                    .map_err(map_seal_error)?;
+                    .map_err(map_typed_store_error)?;
                 match newest {
                     Some(observed) if observed > claim.generation => {
                         return Err(BootstrapExit::Fenced { observed });
@@ -470,7 +470,7 @@ pub(crate) async fn bootstrap(
                 let newest = seal_store
                     .newest_generation()
                     .await
-                    .map_err(map_seal_error)?;
+                    .map_err(map_typed_store_error)?;
                 match newest {
                     Some(observed) if observed == replayed.claim.generation => {
                         let partition =
@@ -565,7 +565,7 @@ async fn load_admission_base(
             let rows = match store
                 .read_table(partition, &table)
                 .await
-                .map_err(map_table_error)?
+                .map_err(map_typed_store_error)?
             {
                 TableRows::Directory(rows) => rows,
                 TableRows::Ledger(_) => {
@@ -584,7 +584,7 @@ async fn load_admission_base(
             let rows = match store
                 .read_table(partition, &table)
                 .await
-                .map_err(map_table_error)?
+                .map_err(map_typed_store_error)?
             {
                 TableRows::Ledger(rows) => rows,
                 TableRows::Directory(_) => {
@@ -695,10 +695,10 @@ async fn guard_fence_tail(
                 detail: format!("listed WAL tail {tail:?} disappeared before FENCE placement"),
             });
         }
-        Err(WalStoreError::Contradiction { detail }) => {
+        Err(TypedStoreError::Contradiction { detail }) => {
             return Ok(FenceTailGate::RefreshAnomaly { detail });
         }
-        Err(error) => return Err(map_wal_error(error)),
+        Err(error) => return Err(map_typed_store_error(error)),
     };
     if observed.object().owner() >= claim_owner {
         return Ok(FenceTailGate::RefreshAnomaly {
@@ -760,7 +760,11 @@ async fn provision_genesis(
     let encoded = EncodedSeal::new(&genesis).map_err(|source| BootstrapExit::Contradiction {
         detail: format!("canonical genesis could not be encoded: {source}"),
     })?;
-    match store.create_seal(&encoded).await.map_err(map_seal_error)? {
+    match store
+        .create_seal(&encoded)
+        .await
+        .map_err(map_typed_store_error)?
+    {
         CreateEvidence::Direct | CreateEvidence::DurableMatch => Ok(GenesisProvision::Created),
         CreateEvidence::NotOurs => Ok(GenesisProvision::LostRace),
         CreateEvidence::Unresolved => Err(BootstrapExit::Retryable {
@@ -776,13 +780,6 @@ fn mint_partition_id(entropy: &mut Entropy) -> PartitionId {
         if let Ok(partition) = PartitionId::try_from(bytes) {
             return partition;
         }
-    }
-}
-
-const fn replay_batch(replay: WalReplayPoint) -> Option<BatchId> {
-    match replay {
-        WalReplayPoint::Genesis => None,
-        WalReplayPoint::Through { batch, owner: _ } => Some(batch),
     }
 }
 
@@ -845,28 +842,10 @@ fn map_forest_error(error: ForestContradiction) -> BootstrapExit {
     }
 }
 
-fn map_seal_error(error: SealStoreError) -> BootstrapExit {
+fn map_typed_store_error(error: TypedStoreError) -> BootstrapExit {
     match error {
-        SealStoreError::Retryable { detail } => BootstrapExit::Retryable { detail },
-        SealStoreError::Rejected { detail } | SealStoreError::Contradiction { detail } => {
-            BootstrapExit::Contradiction { detail }
-        }
-    }
-}
-
-fn map_wal_error(error: WalStoreError) -> BootstrapExit {
-    match error {
-        WalStoreError::Retryable { detail } => BootstrapExit::Retryable { detail },
-        WalStoreError::Rejected { detail } | WalStoreError::Contradiction { detail } => {
-            BootstrapExit::Contradiction { detail }
-        }
-    }
-}
-
-fn map_table_error(error: TableStoreError) -> BootstrapExit {
-    match error {
-        TableStoreError::Retryable { detail } => BootstrapExit::Retryable { detail },
-        TableStoreError::Rejected { detail } | TableStoreError::Contradiction { detail } => {
+        TypedStoreError::Retryable { detail } => BootstrapExit::Retryable { detail },
+        TypedStoreError::Rejected { detail } | TypedStoreError::Contradiction { detail } => {
             BootstrapExit::Contradiction { detail }
         }
     }
