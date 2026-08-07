@@ -140,6 +140,63 @@ Durable tests use the public engine boundary. They prove:
 
 Cross reopen whenever durable state can differ from memory state.
 
+## Engine test crate structure
+
+Durable engine tests live in one integration binary:
+
+```text
+crates/strom-storage-engine/tests/
+    engine/
+        main.rs
+        support.rs
+        writer.rs
+        bootstrap.rs
+        checkpoint.rs
+        collection.rs
+```
+
+One binary compiles the crate once, shares one support module, and still runs
+cases in parallel. Do not add one top-level test file per area; each top-level
+file is its own binary and cannot share helpers.
+
+The `support` module owns deterministic entropy, command shortcuts, key
+spelling helpers, a drive-N-commands helper, and durable object-presence
+assertions. It builds values and asserts outcomes. It must not hide operation
+order, fault placement, publication, authority, or reopen.
+
+## No exports for tests
+
+The engine crate exports nothing for its tests. Every capability a durable
+test needs is already public at a lower seam:
+
+- `FaultStore`, `Gate`, `Fault`, and `Selection` are public in
+  `strom-object-store` behind the `test-support` feature. The engine names
+  that feature only in `[dev-dependencies]`.
+- Key spelling (`SealKey`, `WalKey`, `TableKey`) and the durable codecs are
+  public in `strom-storage-domain`. They are versioned durable formats, so a
+  test may spell an exact fault target and plant a durable object.
+- Named bounds such as `WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER` and
+  `WAL_SUFFIX_COORDINATES_MAX_V2` are public in `strom-storage-domain`. A
+  test reaches a trigger by driving that many real commands.
+- The test owns the `Arc<dyn ObjectStore>` it passes to `Engine::open`.
+  Durable observations read and list through that handle.
+- Entropy is injected at `Engine::open`. Each test binary defines its own
+  deterministic entropy.
+
+If a durable test appears to need a new engine export, the engine interface is
+the wrong shape or the claim belongs at a lower layer. Do not add the export.
+
+Operational rules for durable tests:
+
+- Drive real operation counts. A checkpoint test issues
+  `WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER` sequential creates. A suffix-exhaustion
+  test approaches `WAL_SUFFIX_COORDINATES_MAX_V2` behind a gated Seal create.
+  Against `InMemory` this is cheap; do not add a test-only configuration knob.
+- Release every gate before `shutdown`. Shutdown awaits the active WAL flight
+  and resolves the checkpoint, so a held gate deadlocks the test.
+- Checkpoint preparation uses one process-global semaphore. Parallel
+  checkpoint tests serialize preparation; they do not fail.
+
 ## Minimal fault store
 
 Add one test-only object store in `strom-object-store`. It wraps
@@ -519,6 +576,41 @@ Cover:
 
 Do not keep a complex temporary expectation framework. Build the minimal shape
 directly.
+
+### Migration order
+
+Migration is additive first. Keep every existing inline test green while the
+durable tests land, one area at a time:
+
+1. writer: ambiguous WAL completion, reconciliation outcomes, no-resend,
+   visibility before reply through a gated WAL create, and fencing;
+2. bootstrap: genesis races, unresolved claims, read and list failures,
+   planted replay gaps, and reopen from every accepted durable prefix;
+3. checkpoint: child durability before Seal publication, Seal faults,
+   cancellation before publication, and reopen after each result;
+4. collection: partial deletes, leak-only progress, and successor-table
+   protection; and
+5. suffix exhaustion behind a gated Seal create.
+
+Audit and delete only after `just ci` is green with the new coverage.
+
+### Audit expectations
+
+Apply the review rules module by module. The expected end state:
+
+| Location | Expected verdict |
+| --- | --- |
+| `writer.rs` inline tests | Delete. They construct the private writer and inject fabricated evidence; durable tests supersede them. |
+| `bootstrap.rs` inline tests | Delete the full-bootstrap cases. Keep pure helper tests only where the arithmetic is subtle. |
+| `checkpoint.rs` inline tests | Keep pure planning and property tests. Delete direct `collect_advance` cases once collection tests exist. |
+| `admission.rs`, `forest.rs` inline tests | Keep. Pure fold and refusal semantics at a stable seam. |
+| `store/{wal,seal,table}.rs` inline tests | Keep spelling, checked decode, and reconciliation. Delete repeated raw adapter claims. |
+| `strom-db/tests/db.rs` | Keep as thin pass-through checks. |
+
+The end state is not zero inline tests. A deep module may keep private tests
+at its internal seams. The rule is: every durability, authority, and recovery
+claim is proven at the `Engine` interface across reopen, and no private test
+repeats that claim.
 
 ## Review rules
 
