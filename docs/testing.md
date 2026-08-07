@@ -34,6 +34,7 @@ Prefer the hardest stable semantic boundary that can prove the claim.
 - Test forest, admission, and planning as pure logic.
 - Test raw result translation through `ObjectStoreAdapter`.
 - Test key spelling and checked decode through typed stores.
+- Test one-operation storage effects through their concrete effect-module interface.
 - Test durability, authority, and recovery through `Engine`.
 
 Do not mock StromDB modules to reduce test extent. Replace only the external
@@ -125,6 +126,17 @@ Typed-store tests prove only behavior added by Seal, WAL, and table stores:
 
 Do not repeat raw adapter contracts in every typed store.
 
+### Effect-module tests
+
+Effect-module tests exercise one async operation over typed stores. Plant the
+durable inputs, call the concrete operation through `ObjectStoreAdapter`, and
+assert the durable state afterward. Use the fault store to enumerate failures
+without introducing another port or trait.
+
+Use effect-module tests for collection because its contract is exactly a
+function of a source Seal, its published successor, and planted objects. Assert
+the deleted and surviving object sets, not the internal delete order.
+
 ### Durable engine tests
 
 Durable tests use the public engine boundary. They prove:
@@ -152,7 +164,6 @@ crates/strom-storage-engine/tests/
         writer.rs
         bootstrap.rs
         checkpoint.rs
-        collection.rs
 ```
 
 One binary compiles the crate once, shares one support module, and still runs
@@ -323,7 +334,11 @@ gate.release();
 checkpoint.await??;
 ```
 
-The gate reports arrival before it waits. Release is idempotent.
+The gate reports arrival before it waits. Release is idempotent. When a later
+assertion depends on the selected call having reached a terminal storage
+outcome or been cancelled, await
+`gate.wait_until_finished()` after release instead of relying on scheduler
+order. This is test-store observation, not a production completion signal.
 
 Gates and faults are independent. A test can gate a normal operation or gate an
 operation that will receive a fault after release.
@@ -553,14 +568,18 @@ Cover:
 
 ### Collection
 
-Cover:
+At the collection interface, cover:
 
 - complete collection;
 - failure before and after each delete;
 - leak-only partial progress;
 - repeated collection;
-- protection of successor tables; and
-- reopen after every partial delete prefix.
+- protection of FENCEs, Seals, successor tables, and unrelated objects; and
+- restart over every partial delete prefix.
+
+At the engine interface, keep one test that gates a WAL delete to prove an
+advancing publication starts collection, injects one delete failure, proves the
+writer remains healthy, and reopens with the complete logical state.
 
 ## Implementation order
 
@@ -568,7 +587,8 @@ Cover:
    self-tests.
 2. Add adversarial adapter contract tests.
 3. Add narrow shared fixtures.
-4. Add durable bootstrap, writer, checkpoint, and collection tests.
+4. Add durable bootstrap, writer, and checkpoint tests plus collection
+   effect-module tests.
 5. Replace scheduler polling with gates.
 6. Remove duplicate adapter claims from typed-store tests.
 7. Remove copied fixtures and helpers.
@@ -588,8 +608,8 @@ durable tests land, one area at a time:
    planted replay gaps, and reopen from every accepted durable prefix;
 3. checkpoint: child durability before Seal publication, Seal faults,
    cancellation before publication, and reopen after each result;
-4. collection: partial deletes, leak-only progress, and successor-table
-   protection; and
+4. collection effect module: partial deletes, leak-only progress,
+   successor-table protection, and repeated collection; and
 5. suffix exhaustion behind a gated Seal create.
 
 Audit and delete only after `just ci` is green with the new coverage.
@@ -602,15 +622,17 @@ Apply the review rules module by module. The expected end state:
 | --- | --- |
 | `writer.rs` inline tests | Delete. They construct the private writer and inject fabricated evidence; durable tests supersede them. |
 | `bootstrap.rs` inline tests | Delete the full-bootstrap cases. Keep pure helper tests only where the arithmetic is subtle. |
-| `checkpoint.rs` inline tests | Keep pure planning and property tests. Delete direct `collect_advance` cases once collection tests exist. |
+| `checkpoint/prepare.rs` inline tests | Keep pure planning and property tests. |
+| `collection.rs` inline tests | Keep the exhaustive collection effect matrix beside `collect_advance`. |
+| engine `checkpoint.rs` | Keep one collection wiring-and-recovery test; do not repeat the per-delete matrix. |
 | `admission.rs`, `forest.rs` inline tests | Keep. Pure fold and refusal semantics at a stable seam. |
 | `store/{wal,seal,table}.rs` inline tests | Keep spelling, checked decode, and reconciliation. Delete repeated raw adapter claims. |
 | `strom-db/tests/db.rs` | Keep as thin pass-through checks. |
 
-The end state is not zero inline tests. A deep module may keep private tests
-at its internal seams. The rule is: every durability, authority, and recovery
-claim is proven at the `Engine` interface across reopen, and no private test
-repeats that claim.
+The end state is not zero inline tests. A deep module may keep private tests at
+its internal seams. The rule is: collection effects are proven at the concrete
+collection interface, authority and logical recovery are proven at the
+`Engine` interface across reopen, and no private test repeats those claims.
 
 ## Review rules
 

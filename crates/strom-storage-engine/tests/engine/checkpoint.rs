@@ -16,7 +16,7 @@ use strom_storage_engine::{CloseOutcome, Engine, OpenError};
 
 use super::support::{
     TestResult, assert_object_absent, assert_object_present, checkpoint_table_key,
-    checkpoint_table_key_at_attempt, create, entropy, seal_key,
+    checkpoint_table_key_at_attempt, create, entropy, seal_key, wal_key,
 };
 
 const CHECKPOINT_CUT: u64 = WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER;
@@ -308,6 +308,41 @@ async fn foreign_seal_occupant_fences_and_is_a_contradiction_on_reopen() -> Test
         Engine::open(backend, entropy()).await,
         Err(OpenError::Contradiction { .. })
     ));
+    store.verify()?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn advancing_publication_starts_leak_only_collection_without_poisoning_the_writer()
+-> TestResult {
+    let delete_gate = Gate::new();
+    let failed_run = wal_key(2);
+    let store = FaultStore::new()
+        .inject(Fault::FailBefore {
+            selection: Selection::delete(Target::Key(failed_run.clone())),
+            failure: BackendFailure::Transport,
+        })?
+        .gate(
+            Selection::delete(Target::Key(failed_run.clone())),
+            delete_gate.clone(),
+        )?;
+    let backend = store.backend();
+    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    let mut streams = drive_checkpoint(&engine).await?;
+
+    delete_gate.wait_until_blocked().await;
+    delete_gate.release();
+    delete_gate.wait_until_finished().await;
+    let after_collection: StreamId = "checkpoint/after-collection-fault".parse()?;
+    assert_eq!(
+        CreateOutcome::Created,
+        create(&engine, &after_collection).await?
+    );
+    streams.push(after_collection);
+
+    assert_eq!(CloseOutcome::Shutdown, engine.shutdown().await);
+    assert_object_present(&backend, &failed_run).await?;
+    assert_reopens_with_streams(backend, &streams).await?;
     store.verify()?;
     Ok(())
 }

@@ -794,7 +794,7 @@ impl Attempt {
             self.call_id, self.selection
         ));
         drop(state);
-        self.finished = true;
+        self.finish();
     }
 
     fn completed(&mut self, detail: impl Into<String>) {
@@ -803,7 +803,7 @@ impl Attempt {
             "call {} completed: {} ({detail})",
             self.call_id, self.selection
         ));
-        self.finished = true;
+        self.finish();
     }
 
     fn ineffective(&mut self, detail: impl Into<String>) -> object_store::Error {
@@ -829,6 +829,13 @@ impl Attempt {
             self.call_id, self.selection
         ));
         drop(state);
+        self.finish();
+    }
+
+    fn finish(&mut self) {
+        for gate in &self.gates {
+            gate.finish();
+        }
         self.finished = true;
     }
 
@@ -845,9 +852,7 @@ impl Drop for Attempt {
         if self.finished {
             return;
         }
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
+        let mut state = self.state();
         if let Some(index) = self.fault_index
             && let Some(configured) = state.faults.get_mut(index)
         {
@@ -859,6 +864,8 @@ impl Drop for Attempt {
             "call {} cancelled: {}",
             self.call_id, self.selection
         ));
+        drop(state);
+        self.finish();
     }
 }
 
@@ -1222,6 +1229,7 @@ mod tests {
             "the selected operation remains blocked"
         );
         gate.release();
+        gate.wait_until_finished().await;
         assert_eq!(
             CreateEvidence::Direct,
             operation
@@ -1288,17 +1296,18 @@ mod tests {
 
         gate.wait_until_blocked().await;
         operation.abort();
+        gate.wait_until_finished().await;
+        let diagnostic = store.verify().expect_err("reserved fault never ran");
+        assert!(
+            diagnostic.to_string().contains("cancelled"),
+            "verification names the cancellation: {diagnostic}"
+        );
         assert!(
             operation
                 .await
                 .expect_err("operation is cancelled")
                 .is_cancelled(),
             "the task stopped at the gate"
-        );
-        let diagnostic = store.verify().expect_err("reserved fault never ran");
-        assert!(
-            diagnostic.to_string().contains("cancelled"),
-            "verification names the cancellation: {diagnostic}"
         );
     }
 }

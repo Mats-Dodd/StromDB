@@ -14,9 +14,8 @@ use crate::admission::{
     admit_create, admit_delete, decide_suffix_room,
 };
 use crate::bootstrap::{AuthoredClaim, Ready, WriterSeed};
-use crate::checkpoint::{
-    CheckpointInput, CheckpointOutcome, PublicationGate, collect_advance, execute_checkpoint,
-};
+use crate::checkpoint::{CheckpointInput, CheckpointOutcome, PublicationGate, execute_checkpoint};
+use crate::collection::collect_advance;
 use crate::engine::PublishedView;
 use crate::store::{EncodedWal, WalStore, WalStoreError};
 use crate::{Applied, Forest};

@@ -18,12 +18,14 @@ struct GateInner {
     state: Mutex<GateState>,
     arrival: Notify,
     release: Notify,
+    finish: Notify,
 }
 
 #[derive(Debug, Default)]
 struct GateState {
     arrived: bool,
     released: bool,
+    finished: bool,
 }
 
 impl Gate {
@@ -51,6 +53,17 @@ impl Gate {
         self.inner.release.notify_waiters();
     }
 
+    /// Wait until the selected operation reaches a terminal storage outcome or is cancelled.
+    pub async fn wait_until_finished(&self) {
+        loop {
+            let finish = self.inner.finish.notified();
+            if self.state().finished {
+                return;
+            }
+            finish.await;
+        }
+    }
+
     pub(super) async fn block(&self) {
         {
             let mut state = self.state();
@@ -65,6 +78,13 @@ impl Gate {
             }
             release.await;
         }
+    }
+
+    pub(super) fn finish(&self) {
+        let mut state = self.state();
+        state.finished = true;
+        drop(state);
+        self.inner.finish.notify_waiters();
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, GateState> {
