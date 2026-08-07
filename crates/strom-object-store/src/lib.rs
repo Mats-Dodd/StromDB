@@ -12,6 +12,8 @@ mod bytes;
 mod error;
 mod evidence;
 mod key;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 pub use adapter::ObjectStoreAdapter;
 pub use bounds::{KEY_BYTES_MAX, LIST_KEYS_MAX, PUT_BYTES_MAX};

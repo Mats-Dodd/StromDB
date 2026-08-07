@@ -6,14 +6,19 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+test-support = ["dep:async-trait", "dep:tokio"]
+
 [dependencies]
+async-trait = { workspace = true, optional = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 object_store = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"], optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 
 [lints]
 workspace = true

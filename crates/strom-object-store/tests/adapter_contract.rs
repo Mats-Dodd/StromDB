@@ -2,6 +2,10 @@
 //! at an external boundary). Every claim here must also hold against a real
 //! S3 endpoint.
 
+#[cfg(feature = "test-support")]
+use strom_object_store::test_support::{
+    BackendFailure, Fault, FaultStore, Operation, Selection, Target,
+};
 use strom_object_store::{
     ByteBound, CreateEvidence, FrozenBytes, KeysBound, ListPageRequest, ObjectKey,
     ObjectStoreAdapter, StoreContradiction, StoreError,
@@ -236,4 +240,336 @@ async fn delete_is_idempotent_for_present_and_absent_objects() {
         .delete_idempotent(&coordinate)
         .await
         .expect("delete of an absent object also succeeds");
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn failure_before_create_is_ambiguous_without_making_bytes_durable() {
+    let coordinate = key("partition/p1/wal/v1/fail-before");
+    let store = FaultStore::new()
+        .inject(Fault::FailBefore {
+            selection: Selection::create(Target::Key(coordinate.clone())),
+            failure: BackendFailure::Transport,
+        })
+        .expect("fault selection is unique");
+    let adapter = ObjectStoreAdapter::new(store.backend());
+
+    assert_eq!(
+        CreateEvidence::Unresolved,
+        adapter
+            .create_if_absent(&coordinate, body(b"candidate"))
+            .await
+            .expect("transport loss is evidence, not a definitive error")
+    );
+    assert!(
+        adapter
+            .read(&coordinate, read_bound())
+            .await
+            .expect("the subsequent read passes through")
+            .is_none(),
+        "failure before storage leaves the coordinate absent"
+    );
+    store
+        .assert_called_once(Operation::Create, &coordinate)
+        .expect("the adapter sends one authority-bearing create");
+    store.verify().expect("the configured fault ran");
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn response_loss_after_create_is_ambiguous_with_exact_bytes_durable() {
+    let coordinate = key("partition/p1/wal/v1/lost-response");
+    let candidate = body(b"candidate");
+    let store = FaultStore::new()
+        .inject(Fault::CreateThenLoseResponse {
+            target: Target::Key(coordinate.clone()),
+        })
+        .expect("fault selection is unique");
+    let adapter = ObjectStoreAdapter::new(store.backend());
+
+    assert_eq!(
+        CreateEvidence::Unresolved,
+        adapter
+            .create_if_absent(&coordinate, candidate.clone())
+            .await
+            .expect("lost response is evidence")
+    );
+    assert_eq!(
+        candidate.as_slice(),
+        adapter
+            .read(&coordinate, read_bound())
+            .await
+            .expect("reconciliation read succeeds")
+            .expect("the create took effect")
+            .body(),
+        "the exact candidate became durable before response loss"
+    );
+    store
+        .assert_called_once(Operation::Create, &coordinate)
+        .expect("the adapter does not resend an ambiguous create");
+    store.verify().expect("the configured fault ran");
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn permission_and_authentication_refusals_are_definitive_create_errors() {
+    for (case, failure) in [
+        ("permission", BackendFailure::PermissionDenied),
+        ("authentication", BackendFailure::Unauthenticated),
+    ] {
+        let coordinate = key(&format!("partition/p1/wal/v1/{case}"));
+        let store = FaultStore::new()
+            .inject(Fault::FailBefore {
+                selection: Selection::create(Target::Key(coordinate.clone())),
+                failure,
+            })
+            .expect("fault selection is unique");
+        let adapter = ObjectStoreAdapter::new(store.backend());
+
+        let outcome = adapter
+            .create_if_absent(&coordinate, body(b"candidate"))
+            .await;
+        assert!(
+            matches!(outcome, Err(StoreError::Rejected { .. })),
+            "{case} refusal must be definitive, got {outcome:?}"
+        );
+        store.verify().expect("the configured refusal ran");
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn failed_occupant_metadata_and_body_reads_leave_create_unresolved() {
+    let metadata_coordinate = key("partition/p1/wal/v1/occupant-metadata");
+    let body_coordinate = key("partition/p1/wal/v1/occupant-body");
+    let cases = [
+        (
+            "metadata",
+            metadata_coordinate.clone(),
+            Fault::FailBefore {
+                selection: Selection::read(Target::Key(metadata_coordinate)),
+                failure: BackendFailure::Transport,
+            },
+        ),
+        (
+            "body",
+            body_coordinate.clone(),
+            Fault::FailBody {
+                target: Target::Key(body_coordinate),
+                failure: BackendFailure::Transport,
+            },
+        ),
+    ];
+
+    for (case, coordinate, fault) in cases {
+        let store = FaultStore::new()
+            .inject(fault)
+            .expect("fault selection is unique");
+        let adapter = ObjectStoreAdapter::new(store.backend());
+        assert_eq!(
+            CreateEvidence::Direct,
+            adapter
+                .create_if_absent(&coordinate, body(b"occupant"))
+                .await
+                .expect("test occupant stores")
+        );
+
+        assert_eq!(
+            CreateEvidence::Unresolved,
+            adapter
+                .create_if_absent(&coordinate, body(b"foreign!"))
+                .await
+                .expect("failed reconciliation remains evidence"),
+            "a failed occupant {case} read cannot prove ownership"
+        );
+        store.verify().expect("the reconciliation fault ran");
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn transport_failures_on_read_and_list_are_retryable() {
+    let coordinate = key("partition/p1/seal/v1/read-failure");
+    let read_store = FaultStore::new()
+        .inject(Fault::FailBefore {
+            selection: Selection::read(Target::Key(coordinate.clone())),
+            failure: BackendFailure::Transport,
+        })
+        .expect("fault selection is unique");
+    let read_adapter = ObjectStoreAdapter::new(read_store.backend());
+
+    let read_outcome = read_adapter.read(&coordinate, read_bound()).await;
+    assert!(
+        matches!(read_outcome, Err(StoreError::Retryable { .. })),
+        "transport read failure is retryable, got {read_outcome:?}"
+    );
+    read_store.verify().expect("the read fault ran");
+
+    let prefix = key("partition/p1/seal/v1");
+    let list_store = FaultStore::new()
+        .inject(Fault::FailBefore {
+            selection: Selection::list(prefix.clone()),
+            failure: BackendFailure::Transport,
+        })
+        .expect("fault selection is unique");
+    let list_adapter = ObjectStoreAdapter::new(list_store.backend());
+
+    let list_outcome = list_adapter
+        .list_page(page_request(prefix.as_str(), None, 1))
+        .await;
+    assert!(
+        matches!(list_outcome, Err(StoreError::Retryable { .. })),
+        "transport list failure is retryable, got {list_outcome:?}"
+    );
+    list_store.verify().expect("the list fault ran");
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn bounded_read_rejects_a_body_that_grows_past_underreported_metadata() {
+    let coordinate = key("partition/p1/pack/v1/growing-body");
+    let store = FaultStore::new()
+        .inject(Fault::UnderreportMetadata {
+            target: Target::Key(coordinate.clone()),
+        })
+        .expect("fault selection is unique");
+    let adapter = ObjectStoreAdapter::new(store.backend());
+    adapter
+        .create_if_absent(&coordinate, body(b"123456"))
+        .await
+        .expect("test body stores");
+
+    let outcome = adapter
+        .read(
+            &coordinate,
+            ByteBound::try_from(5).expect("test bound is nonzero"),
+        )
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(StoreError::Contradiction(
+                StoreContradiction::OversizedObject {
+                    bytes_max: 5,
+                    bytes_actual: 6,
+                    ..
+                }
+            ))
+        ),
+        "stream growth beyond metadata fails closed, got {outcome:?}"
+    );
+    store.verify().expect("the metadata fault ran");
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn unordered_backend_listing_is_a_contradiction() {
+    let prefix = key("partition/p1/wal/v1");
+    let store = FaultStore::new()
+        .inject(Fault::ReturnOutOfOrder {
+            prefix: prefix.clone(),
+        })
+        .expect("fault selection is unique");
+    let adapter = ObjectStoreAdapter::new(store.backend());
+    for suffix in ["001", "002"] {
+        adapter
+            .create_if_absent(&key(&format!("{prefix}/{suffix}")), body(b"wal"))
+            .await
+            .expect("test object stores");
+    }
+
+    let outcome = adapter
+        .list_page(page_request(prefix.as_str(), None, 10))
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(StoreError::Contradiction(
+                StoreContradiction::UnorderedList { .. }
+            ))
+        ),
+        "the adapter must not silently sort a malformed listing, got {outcome:?}"
+    );
+    store.verify().expect("the ordering fault ran");
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn foreign_backend_list_key_is_a_contradiction() {
+    let prefix = key("partition/p1/table/v1");
+    let store = FaultStore::new()
+        .inject(Fault::ReturnForeignKey {
+            prefix: prefix.clone(),
+        })
+        .expect("fault selection is unique");
+    let adapter = ObjectStoreAdapter::new(store.backend());
+    adapter
+        .create_if_absent(&key(&format!("{prefix}/001")), body(b"table"))
+        .await
+        .expect("test object stores");
+
+    let outcome = adapter
+        .list_page(page_request(prefix.as_str(), None, 10))
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(StoreError::Contradiction(
+                StoreContradiction::ForeignKey { .. }
+            ))
+        ),
+        "a key outside StromDB's canonical vocabulary fails closed, got {outcome:?}"
+    );
+    store.verify().expect("the foreign-key fault ran");
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn delete_failures_distinguish_before_effect_from_lost_response() {
+    let before_coordinate = key("partition/p1/pack/v1/delete-before");
+    let after_coordinate = key("partition/p1/pack/v1/delete-after");
+    for (case, coordinate, fault, remains) in [
+        (
+            "before-effect",
+            before_coordinate.clone(),
+            Fault::FailBefore {
+                selection: Selection::delete(Target::Key(before_coordinate)),
+                failure: BackendFailure::Transport,
+            },
+            true,
+        ),
+        (
+            "lost-response",
+            after_coordinate.clone(),
+            Fault::DeleteThenLoseResponse {
+                target: Target::Key(after_coordinate),
+            },
+            false,
+        ),
+    ] {
+        let store = FaultStore::new()
+            .inject(fault)
+            .expect("fault selection is unique");
+        let adapter = ObjectStoreAdapter::new(store.backend());
+        adapter
+            .create_if_absent(&coordinate, body(b"pack"))
+            .await
+            .expect("test object stores");
+
+        let outcome = adapter.delete_idempotent(&coordinate).await;
+        assert!(
+            matches!(outcome, Err(StoreError::Retryable { .. })),
+            "{case} transport loss is retryable, got {outcome:?}"
+        );
+        assert_eq!(
+            remains,
+            adapter
+                .read(&coordinate, read_bound())
+                .await
+                .expect("state observation passes through")
+                .is_some(),
+            "{case} durable effect differs at the response-loss boundary"
+        );
+        store.verify().expect("the delete fault ran");
+    }
 }
