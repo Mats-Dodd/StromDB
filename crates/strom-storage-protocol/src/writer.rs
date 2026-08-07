@@ -6,13 +6,13 @@ use strom_domain::{
 use strom_storage_domain::{
     AttemptId, BatchId, DirectoryEntry, DirectoryKey, EncodedAuthoritySeal, EncodedWal,
     OperationFact, OwnerToken, PartitionId, Seal, SealGeneration, WAL_RUN_FACTS_MAX,
-    WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WAL_SUFFIX_COORDINATES_MAX_V2, WalBody, WalFacts,
-    WalObject, WalReplayPoint,
+    WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WalBody, WalFacts, WalObject, WalReplayPoint,
 };
 use tokio::sync::oneshot;
 
 use crate::forest::{Applied, FoldContradiction, Forest};
 use crate::outcome::{SealPublication, TypedStoreError, WalEstablishment};
+use crate::suffix;
 
 /// The maximum ordered work emitted by one machine event.
 pub const WRITER_OUTPUTS_PER_STEP_MAX: usize = 4;
@@ -949,7 +949,8 @@ impl WriterMachine {
     )]
     fn take_checkpoint(&mut self) -> Option<CheckpointInput> {
         if self.checkpoint.is_some()
-            || suffix_span(self.seal.replay(), self.durable_batch)
+            || suffix::span_through(self.seal.replay().batch(), self.durable_batch)
+                .expect("the durable WAL head never precedes the replay cut")
                 < WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER
         {
             return None;
@@ -1036,7 +1037,7 @@ impl WriterMachine {
         admitted: AdmittedCommand,
         completion: Completion,
     ) -> Option<Completion> {
-        if !decide_suffix_room(self.seal.replay().batch(), self.next_batch) {
+        if !suffix::run_leaves_takeover_room(self.seal.replay().batch(), self.next_batch) {
             self.retry_checkpoint_at = Some(self.durable_batch);
             return Some(completion.refusal(AdmissionRefusal::Overloaded));
         }
@@ -1266,48 +1267,7 @@ fn apply_fact(
     }
 }
 
-#[must_use]
-fn decide_suffix_room(cut: Option<BatchId>, proposed: BatchId) -> bool {
-    let cut = cut.map_or(0, BatchId::get);
-    proposed
-        .successor()
-        .ok()
-        .and_then(|reserved_fence| reserved_fence.get().checked_sub(cut))
-        .is_some_and(|span| span > 1 && span <= WAL_SUFFIX_COORDINATES_MAX_V2)
-}
-
-const fn suffix_span(replay: WalReplayPoint, durable_batch: BatchId) -> u64 {
-    let cut = match replay.batch() {
-        None => 0,
-        Some(batch) => batch.get(),
-    };
-    durable_batch
-        .get()
-        .checked_sub(cut)
-        .expect("the durable WAL head never precedes the replay cut")
-}
-
 fn pending_facts(facts: Vec<OperationFact>) -> WalFacts {
     WalFacts::try_from(facts)
         .expect("pending RUN construction enforces nonempty and fact-count bounds")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn suffix_room_reserves_one_takeover_coordinate() -> Result<(), Box<dyn std::error::Error>> {
-        let last_genesis_run = BatchId::try_from(WAL_SUFFIX_COORDINATES_MAX_V2 - 1)?;
-        assert!(decide_suffix_room(None, last_genesis_run));
-        assert!(!decide_suffix_room(None, last_genesis_run.successor()?));
-
-        let cut = BatchId::try_from(u64::MAX - 2)?;
-        assert!(decide_suffix_room(
-            Some(cut),
-            BatchId::try_from(u64::MAX - 1)?
-        ));
-        assert!(!decide_suffix_room(Some(cut), BatchId::try_from(u64::MAX)?));
-        Ok(())
-    }
 }

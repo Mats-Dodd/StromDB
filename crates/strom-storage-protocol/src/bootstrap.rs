@@ -11,6 +11,7 @@ use strom_storage_domain::{
     StreamUid, TableRef, WAL_SUFFIX_COORDINATES_MAX_V2, WalBody, WalObject, WalReplayPoint,
 };
 
+use crate::suffix::{self, TakeoverFence, TakeoverFenceError};
 use crate::writer::AuthoredClaim;
 use crate::{
     Forest, ForestContradiction, GenesisEstablishment, SealPublication, TypedStoreError,
@@ -103,12 +104,12 @@ enum BootstrapState {
     },
     ReadingWalTail {
         loaded: LoadedBootstrap,
-        fence: BoundedFence,
+        fence: TakeoverFence,
         listed_tail: BatchId,
     },
     EstablishingFence {
         loaded: LoadedBootstrap,
-        fence: BoundedFence,
+        fence: TakeoverFence,
     },
     Replaying(Replay),
     RefreshingAnomaly {
@@ -138,13 +139,8 @@ struct LoadedBootstrap {
 struct Replay {
     loaded: LoadedBootstrap,
     next: BatchId,
-    fence: BoundedFence,
+    fence: TakeoverFence,
     owner: Option<OwnerToken>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct BoundedFence {
-    batch: BatchId,
 }
 
 #[derive(Debug)]
@@ -500,9 +496,9 @@ impl BootstrapMachine {
             }
             Some(_) | None => {}
         }
-        let fence = match bound_fence(cut, candidate) {
+        let fence = match suffix::bound_takeover_fence(cut, candidate) {
             Ok(fence) => fence,
-            Err(exit) => return self.exit(exit),
+            Err(error) => return self.exit(map_takeover_fence_error(error)),
         };
         if let Some(tail) = listed_tail.filter(|tail| cut.is_none_or(|cut| *tail > cut)) {
             let partition = loaded.claimed.seal.partition();
@@ -551,7 +547,7 @@ impl BootstrapMachine {
     fn handle_tail_read(
         &mut self,
         loaded: LoadedBootstrap,
-        fence: BoundedFence,
+        fence: TakeoverFence,
         listed_tail: BatchId,
         observed: Option<WalObject>,
     ) -> BootstrapStep {
@@ -583,10 +579,10 @@ impl BootstrapMachine {
         }
     }
 
-    fn establish_fence(&mut self, loaded: LoadedBootstrap, fence: BoundedFence) -> BootstrapStep {
+    fn establish_fence(&mut self, loaded: LoadedBootstrap, fence: TakeoverFence) -> BootstrapStep {
         let object = WalObject::new(
             loaded.claimed.seal.partition(),
-            fence.batch,
+            fence.batch(),
             loaded.claimed.claim.owner(),
             WalBody::Fence,
         );
@@ -633,14 +629,14 @@ impl BootstrapMachine {
             WalEstablishment::Occupied => self.effect(
                 BootstrapState::ObservingWalTail {
                     loaded,
-                    occupied: Some(fence.batch),
+                    occupied: Some(fence.batch()),
                 },
                 BootstrapEffect::ObserveWalTail,
             ),
             WalEstablishment::UnresolvedAbsent => self.exit(BootstrapExit::Retryable {
                 detail: format!(
                     "takeover FENCE create at {:?} is unresolved and absent on reconciliation",
-                    fence.batch
+                    fence.batch()
                 ),
             }),
         }
@@ -667,7 +663,7 @@ impl BootstrapMachine {
             observed.partition(),
             "a replay completion retains its exact issued partition"
         );
-        if replay.next == replay.fence.batch {
+        if replay.next == replay.fence.batch() {
             assert!(
                 matches!(observed.body(), WalBody::Fence),
                 "the established takeover coordinate reads back as a FENCE"
@@ -707,7 +703,7 @@ impl BootstrapMachine {
         if let Some(detail) = anomaly {
             return self.refresh_anomaly(replay.loaded.claimed.claim, detail);
         }
-        if replay.next == replay.fence.batch {
+        if replay.next == replay.fence.batch() {
             assert_eq!(
                 Some(replay.loaded.claimed.claim.owner()),
                 replay.owner,
@@ -718,7 +714,7 @@ impl BootstrapMachine {
                 seal: replay.loaded.claimed.seal,
                 base: replay.loaded.base,
                 durable: replay.loaded.durable,
-                durable_batch: replay.fence.batch,
+                durable_batch: replay.fence.batch(),
             };
             return self.effect(
                 BootstrapState::RefreshingFinal { recovery },
@@ -913,28 +909,20 @@ fn plan_fence_candidate(
     }
 }
 
-fn bound_fence(cut: Option<BatchId>, fence: BatchId) -> Result<BoundedFence, BootstrapExit> {
-    fence
-        .successor()
-        .map_err(|_exhausted| BootstrapExit::Retryable {
+fn map_takeover_fence_error(error: TakeoverFenceError) -> BootstrapExit {
+    match error {
+        TakeoverFenceError::NoRunCoordinate => BootstrapExit::Retryable {
             detail: "WAL coordinate space has no RUN coordinate after the takeover FENCE".into(),
-        })?;
-    let cut = cut.map_or(0, BatchId::get);
-    let span = fence
-        .get()
-        .checked_sub(cut)
-        .filter(|span| *span > 0)
-        .ok_or_else(|| BootstrapExit::Contradiction {
+        },
+        TakeoverFenceError::NotAfterCut => BootstrapExit::Contradiction {
             detail: "takeover FENCE is not strictly after the Seal replay cut".into(),
-        })?;
-    if span > WAL_SUFFIX_COORDINATES_MAX_V2 {
-        return Err(BootstrapExit::Retryable {
+        },
+        TakeoverFenceError::SpanExceeded { span } => BootstrapExit::Retryable {
             detail: format!(
                 "WAL suffix through takeover FENCE spans {span} coordinates; the bound is {WAL_SUFFIX_COORDINATES_MAX_V2}"
             ),
-        });
+        },
     }
-    Ok(BoundedFence { batch: fence })
 }
 
 const fn replay_owner(replay: WalReplayPoint) -> Option<OwnerToken> {

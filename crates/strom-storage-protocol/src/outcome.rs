@@ -1,4 +1,4 @@
-//! Decided typed-store outcomes observed by the writer machine.
+//! Decided typed-store outcomes observed by the protocol machines.
 
 /// Decided outcome of establishing the canonical genesis Seal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

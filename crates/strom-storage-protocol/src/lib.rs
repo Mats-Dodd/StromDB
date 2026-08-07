@@ -3,6 +3,7 @@
 mod bootstrap;
 mod forest;
 mod outcome;
+mod suffix;
 mod writer;
 
 pub use bootstrap::{
