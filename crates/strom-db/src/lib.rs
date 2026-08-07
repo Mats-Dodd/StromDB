@@ -17,18 +17,18 @@
 //! let store = Arc::new(strom_db::object_store::memory::InMemory::new());
 //! let db = Db::open(store).await?;
 //!
-//! let id: strom_db::StreamId = "events/a".parse()?;
+//! let path: strom_db::StreamPath = "events/a".parse()?;
 //! assert_eq!(
 //!     CreateOutcome::Created,
 //!     db.create_stream(
-//!         &id,
+//!         &path,
 //!         StreamContentType::octet_stream(),
 //!         ExpiryPolicy::None,
 //!         StreamLifecycle::Open,
 //!     )
 //!     .await?
 //! );
-//! assert!(matches!(db.stream(&id)?, StreamStatus::Live { .. }));
+//! assert!(matches!(db.stream(&path)?, StreamStatus::Live { .. }));
 //!
 //! db.close().await;
 //! # Ok(())
@@ -41,8 +41,8 @@
 /// trait object you inject and the one `strom-db` expects are the same type.
 pub use object_store;
 pub use strom_domain::{
-    CloseStreamOutcome, CreateOutcome, ExpiryPolicy, StreamContentType, StreamId, StreamIdError,
-    StreamLifecycle, StreamStatus,
+    CloseStreamOutcome, CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle,
+    StreamPath, StreamPathError, StreamStatus,
 };
 pub use strom_storage_engine::{CloseOutcome, OpenError, PartitionId, SealGeneration, StreamError};
 
@@ -82,7 +82,7 @@ impl Db {
         self.engine.partition_id()
     }
 
-    /// Create one stream at `id`, or confirm it already exists at the same configuration.
+    /// Create one stream at `path`, or confirm it already exists at the same configuration.
     ///
     /// A same-configuration retry returns [`CreateOutcome::AlreadyExists`]
     /// (protocol §5.1). A path that is occupied with a different content type,
@@ -94,13 +94,13 @@ impl Db {
     /// without a determinate durable outcome.
     pub async fn create_stream(
         &self,
-        id: &StreamId,
+        path: &StreamPath,
         content_type: StreamContentType,
         expiry: ExpiryPolicy,
         lifecycle: StreamLifecycle,
     ) -> Result<CreateOutcome, StreamError> {
         self.engine
-            .create_stream(id, content_type, expiry, lifecycle)
+            .create_stream(path, content_type, expiry, lifecycle)
             .await
     }
 
@@ -113,8 +113,8 @@ impl Db {
     ///
     /// Returns [`StreamError`] when the command is refused, shed, or left
     /// without a determinate durable outcome.
-    pub async fn close_stream(&self, id: &StreamId) -> Result<CloseStreamOutcome, StreamError> {
-        self.engine.close_stream(id).await
+    pub async fn close_stream(&self, path: &StreamPath) -> Result<CloseStreamOutcome, StreamError> {
+        self.engine.close_stream(path).await
     }
 
     /// Delete the stream at `id`; the path stays permanently occupied.
@@ -123,8 +123,8 @@ impl Db {
     ///
     /// Returns [`StreamError`] when the command is refused, shed, or left
     /// without a determinate durable outcome.
-    pub async fn delete_stream(&self, id: &StreamId) -> Result<(), StreamError> {
-        self.engine.delete_stream(id).await
+    pub async fn delete_stream(&self, path: &StreamPath) -> Result<(), StreamError> {
+        self.engine.delete_stream(path).await
     }
 
     /// Report the current status of the stream at `id`.
@@ -133,8 +133,8 @@ impl Db {
     ///
     /// Returns [`StreamError::Unavailable`] after this partition has stopped
     /// serving.
-    pub fn stream(&self, id: &StreamId) -> Result<StreamStatus, StreamError> {
-        self.engine.stream(id)
+    pub fn stream(&self, path: &StreamPath) -> Result<StreamStatus, StreamError> {
+        self.engine.stream(path)
     }
 
     /// Close ingress, drain every accepted command, and stop serving.

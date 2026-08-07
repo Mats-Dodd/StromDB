@@ -202,12 +202,12 @@ mod tests {
 
     use object_store::path::Path;
     use object_store::{ObjectStoreExt as _, PutPayload};
-    use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
+    use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle, StreamPath};
     use strom_object_store::test_support::{BackendFailure, Fault, FaultStore, Selection, Target};
     use strom_object_store::{CreateEvidence, PutBody};
     use strom_storage_domain::{
-        AttemptId, DecodedTable, DirectoryEntry, DirectoryKey, EncodedTable, FreshIdentity,
-        LedgerCell, SealGeneration, StreamRecord, StreamUid, TableObjectId, encode_directory_sst,
+        AttemptId, DecodedTable, DirectoryEntry, EncodedTable, FreshIdentity, LedgerCell,
+        SealGeneration, StreamRecord, StreamUid, TableObjectId, encode_directory_sst,
         encode_ledger_sst,
     };
 
@@ -341,7 +341,7 @@ mod tests {
         let store = TableStore::new(adapter.clone());
         let key = table_key(StoreKind::Directory)?;
         let rows = vec![(
-            directory_key("events/a")?,
+            stream_path("events/a")?,
             DirectoryEntry::Live(StreamUid::try_from(1)?),
         )];
         let bytes = encode_directory_sst(partition(), &key, &rows)?;
@@ -403,7 +403,7 @@ mod tests {
         let encoded_key = table_key_at(StoreKind::Directory, 2)?;
         let planted_key = table_key_at(StoreKind::Directory, 3)?;
         let rows = vec![(
-            directory_key("events/a")?,
+            stream_path("events/a")?,
             DirectoryEntry::Live(StreamUid::try_from(1)?),
         )];
         let wrong_identity_bytes = encode_directory_sst(partition(), &encoded_key, &rows)?;
@@ -437,7 +437,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let key = table_key(StoreKind::Directory)?;
         let rows = vec![(
-            directory_key("events/a")?,
+            stream_path("events/a")?,
             DirectoryEntry::Live(StreamUid::try_from(1)?),
         )];
         let bytes = encode_directory_sst(partition(), &key, &rows)?;
@@ -507,7 +507,7 @@ mod tests {
             .first()
             .copied()
             .expect("the fixture marker is nonempty");
-        let path = directory_key(&format!("events/{marker}"))
+        let path = stream_path(&format!("events/{marker}"))
             .expect("the fixture path is a valid Directory key");
         let rows = [(
             path,
@@ -521,8 +521,8 @@ mod tests {
         .expect("the fixture table encodes")
     }
 
-    fn directory_key(raw: &str) -> Result<DirectoryKey, Box<dyn std::error::Error>> {
-        Ok(DirectoryKey::try_from(Box::<[u8]>::from(raw.as_bytes()))?)
+    fn stream_path(raw: &str) -> Result<StreamPath, Box<dyn std::error::Error>> {
+        Ok(raw.parse()?)
     }
 
     fn partition() -> PartitionId {

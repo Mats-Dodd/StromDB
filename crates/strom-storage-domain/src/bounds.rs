@@ -54,9 +54,6 @@ const _: () = assert!(
     "a complete maximum-capacity Directory and Ledger base must fit the V2 bootstrap byte bound"
 );
 
-/// Largest canonical Directory key.
-pub const DIRECTORY_KEY_BYTES_MAX: usize = 512;
-
 /// Most lifetime path occupancies in one V2 partition.
 pub const PARTITION_PATH_OCCUPANCIES_MAX_V2: u64 = 10_000_000;
 
@@ -91,11 +88,6 @@ pub const LEDGER_VALUE_ROW_LOGICAL_BYTES_MAX: u64 = 1_035;
 
 /// Resident logical bytes charged for a Ledger delete before newest-wins merge.
 pub const LEDGER_DELETE_ROW_LOGICAL_BYTES: u64 = 9;
-
-const _: () = assert!(
-    DIRECTORY_KEY_BYTES_MAX == strom_domain::STREAM_ID_BYTES_MAX,
-    "Directory keys and protocol stream identifiers share one path bound"
-);
 
 const _: () = assert!(
     PARTITION_PATH_OCCUPANCIES_MAX_V2

@@ -18,7 +18,7 @@ mod wal;
 
 pub use archive::{DecodeError, EncodeError};
 pub use bounds::{
-    DIRECTORY_KEY_BYTES_MAX, DIRECTORY_ROW_ENCODED_BYTES_MAX, DIRECTORY_ROW_LOGICAL_BYTES_MAX,
+    DIRECTORY_ROW_ENCODED_BYTES_MAX, DIRECTORY_ROW_LOGICAL_BYTES_MAX,
     LEDGER_DELETE_ROW_ENCODED_BYTES_MAX, LEDGER_DELETE_ROW_LOGICAL_BYTES,
     LEDGER_VALUE_ROW_ENCODED_BYTES_MAX, LEDGER_VALUE_ROW_LOGICAL_BYTES_MAX,
     PARTITION_BOOTSTRAP_BYTES_MAX_V2, PARTITION_BOOTSTRAP_OBJECTS_MAX_V2,
@@ -32,7 +32,7 @@ pub use candidate::{
     SealCandidateError,
 };
 pub use coordinate::{BatchId, CoordinateExhausted, SealGeneration, StreamUid, ZeroCoordinate};
-pub use directory::{DirectoryEntry, DirectoryKey, DirectoryKeyError};
+pub use directory::DirectoryEntry;
 pub use ledger::{LedgerCell, StreamRecord};
 pub use owner::OwnerToken;
 pub use partition::{PartitionId, PartitionIdError};

@@ -1,14 +1,61 @@
 //! Directory SST archive root.
 
-use rkyv::rancor::Failure;
+use rkyv::Place;
+use rkyv::rancor::{Failure, Fallible, Source};
+use rkyv::ser::{Allocator, Writer};
+use rkyv::vec::{ArchivedVec, VecResolver};
+use rkyv::with::{ArchiveWith, AsString, SerializeWith};
+use strom_domain::{STREAM_PATH_BYTES_MAX, StreamPath};
 
 use super::{SstDecodeError, SstEncodeError, check_decode_bound, check_encode_rows};
 use crate::archive;
 use crate::bounds::{
-    DIRECTORY_KEY_BYTES_MAX, DIRECTORY_ROW_LOGICAL_BYTES_MAX, PARTITION_PATH_OCCUPANCIES_MAX_V2,
+    DIRECTORY_ROW_LOGICAL_BYTES_MAX, PARTITION_PATH_OCCUPANCIES_MAX_V2,
     PARTITION_RESIDENT_LOGICAL_BYTES_MAX_V2, SST_OBJECT_BYTES_MAX_USIZE,
 };
-use crate::{DirectoryEntry, DirectoryKey, FreshIdentity, PartitionId, StoreKind, TableKey};
+use crate::{DirectoryEntry, FreshIdentity, PartitionId, StoreKind, TableKey};
+
+#[derive(Clone, Copy, rkyv::Archive, rkyv::Serialize)]
+// This adapter view borrows one row only while the enclosing slice is serialized synchronously.
+// ast-grep-ignore: types-own-their-data
+struct DirectoryRowArchive<'row> {
+    #[rkyv(with = AsString)]
+    path: &'row str,
+    entry: DirectoryEntry,
+}
+
+struct DirectoryRowsAsArchive;
+
+impl<'rows> ArchiveWith<&'rows [(StreamPath, DirectoryEntry)]> for DirectoryRowsAsArchive {
+    type Archived = ArchivedVec<ArchivedDirectoryRowArchive<'rows>>;
+    type Resolver = VecResolver;
+
+    fn resolve_with(
+        field: &&'rows [(StreamPath, DirectoryEntry)],
+        resolver: Self::Resolver,
+        out: Place<Self::Archived>,
+    ) {
+        ArchivedVec::resolve_from_len(field.len(), resolver, out);
+    }
+}
+
+impl<'rows, SerializerType> SerializeWith<&'rows [(StreamPath, DirectoryEntry)], SerializerType>
+    for DirectoryRowsAsArchive
+where
+    SerializerType: Fallible + Allocator + Writer + ?Sized,
+    SerializerType::Error: Source,
+{
+    fn serialize_with(
+        field: &&'rows [(StreamPath, DirectoryEntry)],
+        serializer: &mut SerializerType,
+    ) -> Result<Self::Resolver, SerializerType::Error> {
+        let rows = field.iter().map(|(path, entry)| DirectoryRowArchive {
+            path: path.as_str(),
+            entry: *entry,
+        });
+        ArchivedVec::serialize_from_iter(rows, serializer)
+    }
+}
 
 #[derive(Debug, rkyv::Archive, rkyv::Serialize)]
 #[rkyv(bytecheck(bounds(__C: rkyv::validation::ArchiveContext)))]
@@ -17,8 +64,8 @@ use crate::{DirectoryEntry, DirectoryKey, FreshIdentity, PartitionId, StoreKind,
 struct DirectorySstArchive<'rows> {
     partition: PartitionId,
     fresh: FreshIdentity,
-    #[rkyv(with = rkyv::with::InlineAsBox)]
-    rows: &'rows [(DirectoryKey, DirectoryEntry)],
+    #[rkyv(with = DirectoryRowsAsArchive)]
+    rows: &'rows [(StreamPath, DirectoryEntry)],
 }
 
 /// Encodes one non-empty, strictly ordered Directory table.
@@ -30,7 +77,7 @@ struct DirectorySstArchive<'rows> {
 pub fn encode_directory_sst(
     partition: PartitionId,
     expected: &TableKey,
-    rows: &[(DirectoryKey, DirectoryEntry)],
+    rows: &[(StreamPath, DirectoryEntry)],
 ) -> Result<Vec<u8>, SstEncodeError> {
     if expected.object().store() != StoreKind::Directory {
         return Err(SstEncodeError::StoreMismatch);
@@ -38,7 +85,7 @@ pub fn encode_directory_sst(
     if rows.is_empty() {
         return Err(SstEncodeError::EmptyTable);
     }
-    check_encode_rows::<(DirectoryKey, DirectoryEntry)>(rows.len())?;
+    check_encode_rows::<DirectoryRowArchive<'static>>(rows.len())?;
     let mut previous = None;
     for (key, _entry) in rows {
         if previous.is_some_and(|previous_key| key.as_bytes() <= previous_key) {
@@ -65,7 +112,7 @@ pub fn decode_directory_sst(
     expected_partition: PartitionId,
     expected: &TableKey,
     bytes: &[u8],
-) -> Result<Vec<(DirectoryKey, DirectoryEntry)>, SstDecodeError> {
+) -> Result<Vec<(StreamPath, DirectoryEntry)>, SstDecodeError> {
     check_decode_bound(bytes)?;
     if expected.object().store() != StoreKind::Directory {
         return Err(SstDecodeError::StoreMismatch);
@@ -92,8 +139,8 @@ pub fn decode_directory_sst(
     let mut previous = None;
     let mut resident_bytes = 0u64;
     for row in root.rows.iter() {
-        let key_bytes = row.0.as_bytes();
-        if key_bytes.is_empty() || key_bytes.len() > DIRECTORY_KEY_BYTES_MAX {
+        let key_bytes = row.path.as_bytes();
+        if key_bytes.is_empty() || key_bytes.len() > STREAM_PATH_BYTES_MAX {
             return Err(SstDecodeError::InvalidBody);
         }
         if previous.is_some_and(|previous_key| key_bytes <= previous_key) {
@@ -106,8 +153,11 @@ pub fn decode_directory_sst(
             return Err(SstDecodeError::ResourceBound);
         }
         rows.push((
-            DirectoryKey::try_from(&row.0).map_err(|_domain_error| SstDecodeError::InvalidBody)?,
-            DirectoryEntry::from(&row.1),
+            row.path
+                .as_str()
+                .parse()
+                .map_err(|_domain_error| SstDecodeError::InvalidBody)?,
+            DirectoryEntry::from(&row.entry),
         ));
         previous = Some(key_bytes);
     }
@@ -138,8 +188,8 @@ mod tests {
             "fixed accounting dominates empty archive framing and identity"
         );
 
-        let raw = format!("a/{}", "b".repeat(DIRECTORY_KEY_BYTES_MAX - 2));
-        let key = DirectoryKey::try_from(raw.into_bytes().into_boxed_slice())?;
+        let raw = format!("a/{}", "b".repeat(STREAM_PATH_BYTES_MAX - 2));
+        let key = raw.parse()?;
         let rows = [(key, DirectoryEntry::Live(StreamUid::try_from(u64::MAX)?))];
         let bytes = encode_directory_sst(partition, &expected, &rows)?;
         assert!(
@@ -155,9 +205,7 @@ mod tests {
     {
         let expected = table_key()?;
         let partition = partition()?;
-        let key = "events/a"
-            .parse::<strom_domain::StreamId>()
-            .map(|stream_id| DirectoryKey::from(&stream_id))?;
+        let key = "events/a".parse::<StreamPath>()?;
         let rows = [
             (key.clone(), DirectoryEntry::Live(StreamUid::try_from(1)?)),
             (key, DirectoryEntry::Tombstone(StreamUid::try_from(2)?)),

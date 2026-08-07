@@ -4,10 +4,11 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
 use proptest::prelude::{Just, Strategy, prop_oneof};
+use strom_domain::StreamPath;
 
 use crate::{
-    BatchId, DirectoryEntry, DirectoryKey, LedgerCell, OperationFact, OwnerToken, PartitionId,
-    Seal, SealGeneration, StreamRecord, StreamUid, TreeVersion, WalBody, WalFacts, WalObject,
+    BatchId, DirectoryEntry, LedgerCell, OperationFact, OwnerToken, PartitionId, Seal,
+    SealGeneration, StreamRecord, StreamUid, TreeVersion, WalBody, WalFacts, WalObject,
     WalReplayPoint,
 };
 
@@ -20,8 +21,8 @@ pub fn ledger_rows() -> impl Strategy<Value = Vec<(StreamUid, LedgerCell)>> {
     })
 }
 
-pub fn directory_rows() -> impl Strategy<Value = Vec<(DirectoryKey, DirectoryEntry)>> {
-    proptest::collection::vec((directory_key(), directory_entry()), 1..=16).prop_map(|rows| {
+pub fn directory_rows() -> impl Strategy<Value = Vec<(StreamPath, DirectoryEntry)>> {
+    proptest::collection::vec((stream_path(), directory_entry()), 1..=16).prop_map(|rows| {
         rows.into_iter()
             .collect::<BTreeMap<_, _>>()
             .into_iter()
@@ -83,7 +84,7 @@ pub fn partition_id() -> impl Strategy<Value = PartitionId> {
 pub fn operation_fact() -> impl Strategy<Value = OperationFact> {
     prop_oneof![
         (
-            directory_key(),
+            stream_path(),
             stream_uid(),
             strom_domain::strategy::stream_content_type(),
             strom_domain::strategy::expiry_policy(),
@@ -98,15 +99,15 @@ pub fn operation_fact() -> impl Strategy<Value = OperationFact> {
                     lifecycle,
                 }
             }),
-        (directory_key(), stream_uid())
+        (stream_path(), stream_uid())
             .prop_map(|(path, uid)| OperationFact::StreamClosed { path, uid }),
-        (directory_key(), stream_uid())
+        (stream_path(), stream_uid())
             .prop_map(|(path, uid)| OperationFact::StreamDeleted { path, uid }),
     ]
 }
 
-pub fn directory_key() -> impl Strategy<Value = DirectoryKey> {
-    strom_domain::strategy::stream_id().prop_map(|stream_id| DirectoryKey::from(&stream_id))
+pub fn stream_path() -> impl Strategy<Value = StreamPath> {
+    strom_domain::strategy::stream_path()
 }
 
 pub fn directory_entry() -> impl Strategy<Value = DirectoryEntry> {

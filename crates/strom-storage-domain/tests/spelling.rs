@@ -2,12 +2,11 @@ use std::cmp::Ordering;
 use std::num::NonZeroU64;
 
 use proptest::prelude::*;
-use strom_domain::StreamId;
+use strom_domain::StreamPath;
 use strom_storage_domain::{
-    AttemptId, BatchId, CoordinateExhausted, DirectoryKey, FreshIdentity, KeySpellingError,
-    OperationFact, PartitionId, PartitionIdError, SealGeneration, SealKey, SealNamespace,
-    StoreKind, StreamUid, TableKey, TableObjectId, WAL_RUN_FACTS_MAX, WalFacts, WalFactsError,
-    WalKey, WalNamespace,
+    AttemptId, BatchId, CoordinateExhausted, FreshIdentity, KeySpellingError, OperationFact,
+    PartitionId, PartitionIdError, SealGeneration, SealKey, SealNamespace, StoreKind, StreamUid,
+    TableKey, TableObjectId, WAL_RUN_FACTS_MAX, WalFacts, WalFactsError, WalKey, WalNamespace,
 };
 
 #[test]
@@ -60,7 +59,7 @@ fn nonzero_coordinates_have_checked_successors() -> Result<(), Box<dyn std::erro
 #[test]
 fn wal_facts_crosses_both_count_boundaries() -> Result<(), Box<dyn std::error::Error>> {
     let uid = StreamUid::try_from(1)?;
-    let path = DirectoryKey::from(&"events/abc".parse::<StreamId>()?);
+    let path = "events/abc".parse::<StreamPath>()?;
     let deleted = OperationFact::StreamDeleted { path, uid };
 
     assert_eq!(
@@ -257,23 +256,6 @@ fn malformed_table_key_spellings_fail_closed() {
 }
 
 proptest! {
-    #[test]
-    fn directory_key_order_is_stream_id_utf8_byte_order(
-        left_segments in prop::collection::vec("[a-z0-9_-]{1,8}", 1..4),
-        right_segments in prop::collection::vec("[a-z0-9_-]{1,8}", 1..4),
-    ) {
-        let left_raw = left_segments.join("/");
-        let right_raw = right_segments.join("/");
-        let left_stream = left_raw.parse::<StreamId>();
-        let right_stream = right_raw.parse::<StreamId>();
-        prop_assert!(left_stream.is_ok() && right_stream.is_ok());
-        if let (Ok(left_stream), Ok(right_stream)) = (left_stream, right_stream) {
-            let left_key = DirectoryKey::from(&left_stream);
-            let right_key = DirectoryKey::from(&right_stream);
-            prop_assert_eq!(left_key.cmp(&right_key), left_raw.as_bytes().cmp(right_raw.as_bytes()));
-        }
-    }
-
     #[test]
     fn reverse_spelling_inverts_every_distinct_generation_pair(
         left in 1u64..,

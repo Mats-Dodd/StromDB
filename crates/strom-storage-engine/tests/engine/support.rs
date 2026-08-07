@@ -5,7 +5,7 @@ use futures::TryStreamExt as _;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt as _};
 use strom_common::{Entropy, Seed};
-use strom_domain::{CreateOutcome, ExpiryPolicy, StreamContentType, StreamId, StreamLifecycle};
+use strom_domain::{CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamPath};
 use strom_object_store::ObjectKey;
 use strom_object_store::test_support::FaultStore;
 use strom_storage_domain::{
@@ -25,10 +25,13 @@ pub(crate) struct CheckpointKeys {
     pub(crate) ledger: ObjectKey,
 }
 
-pub(crate) async fn create(engine: &Engine, id: &StreamId) -> Result<CreateOutcome, StreamError> {
+pub(crate) async fn create(
+    engine: &Engine,
+    path: &StreamPath,
+) -> Result<CreateOutcome, StreamError> {
     engine
         .create_stream(
-            id,
+            path,
             StreamContentType::octet_stream(),
             ExpiryPolicy::None,
             StreamLifecycle::Open,
@@ -125,10 +128,10 @@ pub(crate) async fn observe_checkpoint_keys() -> Result<CheckpointKeys, Box<dyn 
 
 pub(crate) async fn drive_checkpoint_span(
     engine: &Engine,
-) -> Result<Vec<StreamId>, Box<dyn std::error::Error>> {
+) -> Result<Vec<StreamPath>, Box<dyn std::error::Error>> {
     let mut streams = Vec::new();
     for ordinal in 0..WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER {
-        let id: StreamId = format!("checkpoint/{ordinal}").parse()?;
+        let id: StreamPath = format!("checkpoint/{ordinal}").parse()?;
         assert_eq!(
             CreateOutcome::Created,
             create(engine, &id).await?,

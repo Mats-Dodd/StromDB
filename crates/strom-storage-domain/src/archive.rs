@@ -9,7 +9,8 @@ use rkyv::ser::allocator::{Arena, ArenaHandle};
 use rkyv::ser::{Positional, Writer};
 
 pub(crate) use adapter::{
-    ContentTypeAsString, ExpiryAsArchive, LifecycleAsArchive, decode_content_type,
+    ContentTypeAsString, ExpiryAsArchive, LifecycleAsArchive, StreamPathAsString,
+    decode_content_type, decode_stream_path,
 };
 
 /// A durable object could not be encoded.

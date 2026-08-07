@@ -1,10 +1,8 @@
 //! Behavioral claims for the resident forest fold.
 
 use proptest::prelude::*;
-use strom_domain::{ExpiryPolicy, StreamContentType, StreamId, StreamLifecycle};
-use strom_storage_domain::{
-    BatchId, DirectoryEntry, DirectoryKey, LedgerCell, OperationFact, StreamUid,
-};
+use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle, StreamPath};
+use strom_storage_domain::{BatchId, DirectoryEntry, LedgerCell, OperationFact, StreamUid};
 use strom_storage_protocol::{Applied, FoldContradiction, Forest};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -18,7 +16,7 @@ proptest! {
                 .expect("test index fits in u64")
                 .checked_add(1)
                 .expect("test ordinal fits in u64");
-            let path = directory_key(&format!("events/{index}"))
+            let path = stream_path(&format!("events/{index}"))
                 .expect("generated path is valid");
             let uid = StreamUid::try_from(ordinal).expect("ordinal is nonzero");
             let batch = BatchId::try_from(ordinal).expect("ordinal is nonzero");
@@ -35,7 +33,7 @@ proptest! {
 #[test]
 fn create_close_delete_follows_the_fact_effects() -> TestResult {
     let mut forest = Forest::empty();
-    let path = directory_key("events/a")?;
+    let path = stream_path("events/a")?;
     let uid = StreamUid::try_from(1)?;
     let created_at = BatchId::try_from(1)?;
 
@@ -81,7 +79,7 @@ fn create_close_delete_follows_the_fact_effects() -> TestResult {
     );
     assert_eq!(None, forest.record(uid));
 
-    let path_b = directory_key("events/b")?;
+    let path_b = stream_path("events/b")?;
     let uid_2 = StreamUid::try_from(2)?;
     assert_eq!(
         Applied,
@@ -97,8 +95,8 @@ fn create_close_delete_follows_the_fact_effects() -> TestResult {
 
 #[test]
 fn checkpoint_cells_emit_final_rows_without_ledger_deletes() -> TestResult {
-    let path_a = directory_key("events/a")?;
-    let path_b = directory_key("events/b")?;
+    let path_a = stream_path("events/a")?;
+    let path_b = stream_path("events/b")?;
     let uid_a = StreamUid::try_from(1)?;
     let uid_b = StreamUid::try_from(2)?;
     let mut forest = Forest::empty();
@@ -132,9 +130,9 @@ fn checkpoint_cells_emit_final_rows_without_ledger_deletes() -> TestResult {
 
 #[test]
 fn every_rejected_fact_leaves_the_forest_unchanged() -> TestResult {
-    let path = directory_key("events/live")?;
-    let closed_path = directory_key("events/closed")?;
-    let absent = directory_key("events/absent")?;
+    let path = stream_path("events/live")?;
+    let closed_path = stream_path("events/closed")?;
+    let absent = stream_path("events/absent")?;
     let uid = StreamUid::try_from(1)?;
     let closed_uid = StreamUid::try_from(2)?;
     let wrong_uid = StreamUid::try_from(4)?;
@@ -159,7 +157,7 @@ fn every_rejected_fact_leaves_the_forest_unchanged() -> TestResult {
         ),
         (
             FoldContradiction::UidNotDenseSuccessor,
-            create(directory_key("events/gap")?, wrong_uid),
+            create(stream_path("events/gap")?, wrong_uid),
         ),
         (
             FoldContradiction::PathNotLive,
@@ -196,11 +194,11 @@ fn every_rejected_fact_leaves_the_forest_unchanged() -> TestResult {
     Ok(())
 }
 
-fn directory_key(raw: &str) -> Result<DirectoryKey, Box<dyn std::error::Error>> {
-    Ok(DirectoryKey::from(&raw.parse::<StreamId>()?))
+fn stream_path(raw: &str) -> Result<StreamPath, Box<dyn std::error::Error>> {
+    Ok(raw.parse()?)
 }
 
-const fn create(path: DirectoryKey, uid: StreamUid) -> OperationFact {
+const fn create(path: StreamPath, uid: StreamUid) -> OperationFact {
     OperationFact::StreamCreated {
         path,
         uid,

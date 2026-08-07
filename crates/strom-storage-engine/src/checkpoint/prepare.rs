@@ -1,11 +1,12 @@
 //! Pure advancing-checkpoint preparation.
 
+use strom_domain::StreamPath;
 use strom_storage_domain::{
-    AttemptId, BatchId, DIRECTORY_ROW_ENCODED_BYTES_MAX, DirectoryEntry, DirectoryKey,
-    FreshIdentity, LEDGER_DELETE_ROW_ENCODED_BYTES_MAX, LEDGER_VALUE_ROW_ENCODED_BYTES_MAX,
-    LedgerCell, OwnerToken, PARTITION_BOOTSTRAP_BYTES_MAX_V2, PARTITION_BOOTSTRAP_OBJECTS_MAX_V2,
-    PartitionId, SST_ARCHIVE_FIXED_BYTES_MAX, SST_TABLE_TARGET_BYTES, Seal, SealGeneration,
-    SortedRun, StoreKind, StreamUid, TREE_RUNS_MAX, TableKey, TableObjectId, TableRef, TreeVersion,
+    AttemptId, BatchId, DIRECTORY_ROW_ENCODED_BYTES_MAX, DirectoryEntry, FreshIdentity,
+    LEDGER_DELETE_ROW_ENCODED_BYTES_MAX, LEDGER_VALUE_ROW_ENCODED_BYTES_MAX, LedgerCell,
+    OwnerToken, PARTITION_BOOTSTRAP_BYTES_MAX_V2, PARTITION_BOOTSTRAP_OBJECTS_MAX_V2, PartitionId,
+    SST_ARCHIVE_FIXED_BYTES_MAX, SST_TABLE_TARGET_BYTES, Seal, SealGeneration, SortedRun,
+    StoreKind, StreamUid, TREE_RUNS_MAX, TableKey, TableObjectId, TableRef, TreeVersion,
     WalReplayPoint,
 };
 use strom_storage_domain::{EncodedAuthoritySeal, EncodedTable};
@@ -148,7 +149,7 @@ fn plan_delta_rows(base: &Forest, snapshot: &Forest) -> PlannedRows {
 #[cfg(test)]
 #[derive(Debug)]
 struct PlannedRows {
-    directory: Vec<Vec<(DirectoryKey, DirectoryEntry)>>,
+    directory: Vec<Vec<(StreamPath, DirectoryEntry)>>,
     ledger: Vec<Vec<(StreamUid, LedgerCell)>>,
 }
 
@@ -247,7 +248,7 @@ fn build_directory_tree(
     generation: SealGeneration,
     attempt: AttemptId,
     ordinal: &mut u32,
-    rows: impl IntoIterator<Item = (DirectoryKey, DirectoryEntry)>,
+    rows: impl IntoIterator<Item = (StreamPath, DirectoryEntry)>,
     carried: Option<&TreeVersion>,
     emit: &mut impl FnMut(EncodedTable) -> bool,
 ) -> Option<TreeVersion> {
@@ -467,7 +468,7 @@ mod tests {
     #[test]
     fn create_then_delete_emits_a_directory_tombstone_and_no_ledger_row()
     -> Result<(), Box<dyn std::error::Error>> {
-        let path = directory_key("events/a")?;
+        let path = stream_path("events/a")?;
         let uid = StreamUid::try_from(1)?;
         let mut snapshot = Forest::empty();
         snapshot.strict_fold(
@@ -563,7 +564,7 @@ mod tests {
             TreeVersion::try_from(runs)?,
             TreeVersion::empty(),
         )?;
-        let path = directory_key("events/a")?;
+        let path = stream_path("events/a")?;
         let uid = StreamUid::try_from(1)?;
         let mut snapshot = Forest::empty();
         snapshot.strict_fold(
@@ -692,7 +693,7 @@ mod tests {
     }
 
     fn create_for_index(forest: &Forest, index: usize, batch: u64) -> OperationFact {
-        let path = directory_key(&format!("events/generated-{batch}-{index}"))
+        let path = stream_path(&format!("events/generated-{batch}-{index}"))
             .expect("generated path is canonical");
         let uid = u64::try_from(forest.checkpoint_cells().directory.len())
             .expect("the generated forest row count fits in u64")
@@ -714,8 +715,8 @@ mod tests {
             .expect("test partition is canonical")
     }
 
-    fn directory_key(raw: &str) -> Result<DirectoryKey, Box<dyn std::error::Error>> {
-        Ok(DirectoryKey::try_from(Box::<[u8]>::from(raw.as_bytes()))?)
+    fn stream_path(raw: &str) -> Result<StreamPath, Box<dyn std::error::Error>> {
+        Ok(raw.parse()?)
     }
 
     fn prepare_checkpoint_for_test(

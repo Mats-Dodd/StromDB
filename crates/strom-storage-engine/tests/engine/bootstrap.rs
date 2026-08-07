@@ -3,16 +3,15 @@ use std::sync::Arc;
 
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload};
-use strom_domain::{ExpiryPolicy, StreamContentType, StreamId, StreamLifecycle, StreamStatus};
+use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle, StreamPath, StreamStatus};
 use strom_object_store::ObjectKey;
 use strom_object_store::test_support::{
     BackendFailure, Fault, FaultStore, Gate, Operation, Selection, Target,
 };
 use strom_storage_domain::{
-    AttemptId, BatchId, DirectoryEntry, DirectoryKey, FreshIdentity, LedgerCell, OwnerToken,
-    PartitionId, Seal, SealGeneration, SortedRun, StoreKind, StreamRecord, StreamUid, TableKey,
-    TableObjectId, TableRef, TreeVersion, WalReplayPoint, encode_directory_sst, encode_ledger_sst,
-    encode_seal,
+    AttemptId, BatchId, DirectoryEntry, FreshIdentity, LedgerCell, OwnerToken, PartitionId, Seal,
+    SealGeneration, SortedRun, StoreKind, StreamRecord, StreamUid, TableKey, TableObjectId,
+    TableRef, TreeVersion, WalReplayPoint, encode_directory_sst, encode_ledger_sst, encode_seal,
 };
 use strom_storage_engine::{CloseOutcome, Engine, OpenError};
 
@@ -89,8 +88,8 @@ async fn planted_tables_and_wal_replay_open_the_expected_view() -> TestResult {
     let partition = partition();
     let generation_1 = SealGeneration::genesis();
     let generation_2 = generation_1.successor()?;
-    let base = "events/base".parse::<StreamId>()?;
-    let deleted = "events/deleted".parse::<StreamId>()?;
+    let base = "events/base".parse::<StreamPath>()?;
+    let deleted = "events/deleted".parse::<StreamPath>()?;
     let uid = StreamUid::try_from(1)?;
     let deleted_uid = StreamUid::try_from(2)?;
     let created_at = BatchId::try_from(1)?;
@@ -100,11 +99,8 @@ async fn planted_tables_and_wal_replay_open_the_expected_view() -> TestResult {
         partition,
         &directory_key,
         &[
-            (DirectoryKey::from(&base), DirectoryEntry::Live(uid)),
-            (
-                DirectoryKey::from(&deleted),
-                DirectoryEntry::Tombstone(deleted_uid),
-            ),
+            (base.clone(), DirectoryEntry::Live(uid)),
+            (deleted.clone(), DirectoryEntry::Tombstone(deleted_uid)),
         ],
     )?;
     let directory_ref = plant_table(&backend, &directory_key, directory_bytes).await?;

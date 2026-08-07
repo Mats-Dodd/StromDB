@@ -6,13 +6,13 @@
 //! rather than inside an unrelated downstream test.
 
 use proptest::prelude::*;
-use strom_domain::{ExpiresAt, StreamContentType, StreamId, StreamTtl, strategy};
+use strom_domain::{ExpiresAt, StreamContentType, StreamPath, StreamTtl, strategy};
 
 proptest! {
     #[test]
-    fn generated_stream_ids_reparse(stream_id in strategy::stream_id()) {
-        let reparsed = stream_id.as_str().parse::<StreamId>();
-        prop_assert_eq!(reparsed.ok(), Some(stream_id));
+    fn generated_stream_paths_reparse(stream_path in strategy::stream_path()) {
+        let reparsed = stream_path.as_str().parse::<StreamPath>();
+        prop_assert_eq!(reparsed.ok(), Some(stream_path));
     }
 
     #[test]

@@ -1,9 +1,9 @@
 //! Durable Streams protocol vocabulary and caller-visible outcomes.
 //!
 //! ```
-//! use strom_domain::{ExpiryPolicy, StreamId, StreamTtl};
+//! use strom_domain::{ExpiryPolicy, StreamPath, StreamTtl};
 //!
-//! let stream_id: StreamId = "events/abc".parse()?;
+//! let stream_path: StreamPath = "events/abc".parse()?;
 //! let ttl: StreamTtl = "3600".parse()?;
 //! let policy = ExpiryPolicy::try_from((Some(ttl), None))?;
 //! assert!(matches!(policy, ExpiryPolicy::SlidingTtl(_)));
@@ -16,7 +16,7 @@ mod lifecycle;
 mod outcome;
 #[cfg(feature = "proptest")]
 pub mod strategy;
-mod stream_id;
+mod stream_path;
 
 pub use content_type::{CONTENT_TYPE_BYTES_MAX, ContentTypeError, StreamContentType};
 pub use expiry::{
@@ -25,4 +25,4 @@ pub use expiry::{
 };
 pub use lifecycle::StreamLifecycle;
 pub use outcome::{CloseStreamOutcome, CreateOutcome, StreamStatus};
-pub use stream_id::{STREAM_ID_BYTES_MAX, StreamId, StreamIdError};
+pub use stream_path::{STREAM_PATH_BYTES_MAX, StreamPath, StreamPathError};

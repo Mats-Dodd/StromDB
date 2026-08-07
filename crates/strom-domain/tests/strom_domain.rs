@@ -1,19 +1,19 @@
 use proptest::prelude::*;
 use strom_domain::{
     CONTENT_TYPE_BYTES_MAX, ContentTypeError, ExpiresAt, ExpiresAtError, ExpiresAtRangeError,
-    ExpiryPolicy, ExpiryPolicyConflict, STREAM_ID_BYTES_MAX, StreamContentType, StreamId,
-    StreamIdError, StreamLifecycle, StreamTtl, StreamTtlError,
+    ExpiryPolicy, ExpiryPolicyConflict, STREAM_PATH_BYTES_MAX, StreamContentType, StreamLifecycle,
+    StreamPath, StreamPathError, StreamTtl, StreamTtlError,
 };
 
 #[test]
-fn stream_id_accepts_protocol_example_paths() -> Result<(), StreamIdError> {
-    let events: StreamId = "events/abc".parse()?;
+fn stream_path_accepts_protocol_examples() -> Result<(), StreamPathError> {
+    let events: StreamPath = "events/abc".parse()?;
     assert_eq!(
         "events/abc",
         events.as_str(),
         "parsing must preserve the exact path"
     );
-    let wake: StreamId = "wake/pool".parse()?;
+    let wake: StreamPath = "wake/pool".parse()?;
     assert_eq!(
         "wake/pool",
         wake.as_str(),
@@ -23,98 +23,98 @@ fn stream_id_accepts_protocol_example_paths() -> Result<(), StreamIdError> {
 }
 
 #[test]
-fn stream_id_reserves_ds_root_but_not_lookalikes() {
+fn stream_path_reserves_ds_root_but_not_lookalikes() {
     assert_eq!(
-        Some(StreamIdError::ReservedRootSegment),
-        "__ds".parse::<StreamId>().err(),
+        Some(StreamPathError::ReservedRootSegment),
+        "__ds".parse::<StreamPath>().err(),
         "§6: the bare control root is reserved"
     );
     assert_eq!(
-        Some(StreamIdError::ReservedRootSegment),
-        "__ds/subscriptions/sub-1".parse::<StreamId>().err(),
-        "§6: control paths must not be stream ids"
+        Some(StreamPathError::ReservedRootSegment),
+        "__ds/subscriptions/sub-1".parse::<StreamPath>().err(),
+        "§6: control paths must not be application stream paths"
     );
     assert_eq!(
         None,
-        "__dsx/foo".parse::<StreamId>().err(),
+        "__dsx/foo".parse::<StreamPath>().err(),
         "one character past the reserved segment is an ordinary stream"
     );
     assert_eq!(
         None,
-        "events/__ds".parse::<StreamId>().err(),
+        "events/__ds".parse::<StreamPath>().err(),
         "§6 reserves the first segment only"
     );
 }
 
 #[test]
-fn stream_id_rejects_structural_hazards() {
+fn stream_path_rejects_structural_hazards() {
     let hazards = [
-        ("", StreamIdError::EmptySegment),
-        ("/events", StreamIdError::EmptySegment),
-        ("events/", StreamIdError::EmptySegment),
-        ("events//abc", StreamIdError::EmptySegment),
-        (".", StreamIdError::RelativeSegment),
-        ("..", StreamIdError::RelativeSegment),
-        ("events/../secrets", StreamIdError::RelativeSegment),
-        ("events/\u{7}bell", StreamIdError::ControlCharacter),
-        ("events/line\nbreak", StreamIdError::ControlCharacter),
+        ("", StreamPathError::EmptySegment),
+        ("/events", StreamPathError::EmptySegment),
+        ("events/", StreamPathError::EmptySegment),
+        ("events//abc", StreamPathError::EmptySegment),
+        (".", StreamPathError::RelativeSegment),
+        ("..", StreamPathError::RelativeSegment),
+        ("events/../secrets", StreamPathError::RelativeSegment),
+        ("events/\u{7}bell", StreamPathError::ControlCharacter),
+        ("events/line\nbreak", StreamPathError::ControlCharacter),
     ];
     for (input, expected) in hazards {
         assert_eq!(
             Some(expected),
-            input.parse::<StreamId>().err(),
+            input.parse::<StreamPath>().err(),
             "structural hazard must be rejected: {input:?}"
         );
     }
 }
 
 #[test]
-fn stream_id_length_boundary_is_exact() {
-    let at_max = "a".repeat(STREAM_ID_BYTES_MAX);
+fn stream_path_length_boundary_is_exact() {
+    let at_max = "a".repeat(STREAM_PATH_BYTES_MAX);
     assert_eq!(
         None,
-        at_max.parse::<StreamId>().err(),
-        "an id at the bound is valid"
+        at_max.parse::<StreamPath>().err(),
+        "a path at the bound is valid"
     );
-    let over_max = "a".repeat(STREAM_ID_BYTES_MAX.saturating_add(1));
+    let over_max = "a".repeat(STREAM_PATH_BYTES_MAX.saturating_add(1));
     assert_eq!(
-        Some(StreamIdError::OverMaxBytes),
-        over_max.parse::<StreamId>().err(),
+        Some(StreamPathError::OverMaxBytes),
+        over_max.parse::<StreamPath>().err(),
         "one byte over the bound is rejected"
     );
 }
 
 proptest! {
     #[test]
-    fn stream_id_parse_is_total_and_identity(input in any::<String>()) {
-        if let Ok(stream_id) = input.parse::<StreamId>() {
-            prop_assert_eq!(stream_id.as_str(), input.as_str());
+    fn stream_path_parse_is_total_and_identity(input in any::<String>()) {
+        if let Ok(stream_path) = input.parse::<StreamPath>() {
+            prop_assert_eq!(stream_path.as_str(), input.as_str());
         }
     }
 
     #[test]
-    fn stream_id_valid_paths_roundtrip(
+    fn stream_path_valid_paths_roundtrip(
         segments in prop::collection::vec("[a-z0-9._-]{1,12}", 1..6),
     ) {
         prop_assume!(segments.iter().all(|segment| segment != "." && segment != ".."));
         prop_assume!(segments.first().map(String::as_str) != Some("__ds"));
         let path = segments.join("/");
-        let parsed = path.parse::<StreamId>();
+        let parsed = path.parse::<StreamPath>();
         prop_assert!(parsed.is_ok(), "constructively valid path must parse: {:?}", parsed);
-        if let Ok(stream_id) = parsed {
-            prop_assert_eq!(stream_id.to_string(), path);
+        if let Ok(stream_path) = parsed {
+            prop_assert_eq!(stream_path.to_string(), path);
         }
     }
 
     #[test]
-    fn stream_id_order_is_byte_order(
+    fn stream_path_order_is_byte_order(
         left_segments in prop::collection::vec("[a-z0-9_-]{1,8}", 1..4),
         right_segments in prop::collection::vec("[a-z0-9_-]{1,8}", 1..4),
     ) {
         let left_path = left_segments.join("/");
         let right_path = right_segments.join("/");
-        let left = left_path.parse::<StreamId>();
-        let right = right_path.parse::<StreamId>();
+        let left = left_path.parse::<StreamPath>();
+        let right = right_path.parse::<StreamPath>();
         prop_assume!(left.is_ok() && right.is_ok());
         if let (Ok(left), Ok(right)) = (left, right) {
             prop_assert_eq!(left.cmp(&right), left_path.as_bytes().cmp(right_path.as_bytes()));

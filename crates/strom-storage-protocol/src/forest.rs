@@ -4,23 +4,23 @@ use std::num::NonZeroU64;
 
 use imbl::OrdMap;
 use imbl::ordmap::DiffItem;
-use strom_domain::StreamLifecycle;
+use strom_domain::{StreamLifecycle, StreamPath};
 use strom_storage_domain::{
-    BatchId, DirectoryEntry, DirectoryKey, LedgerCell, OperationFact,
-    PARTITION_PATH_OCCUPANCIES_MAX_V2, StreamRecord, StreamUid,
+    BatchId, DirectoryEntry, LedgerCell, OperationFact, PARTITION_PATH_OCCUPANCIES_MAX_V2,
+    StreamRecord, StreamUid,
 };
 
 /// Resident Directory and Ledger under the no-forks cross-store invariants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Forest {
-    directory: OrdMap<DirectoryKey, DirectoryEntry>,
+    directory: OrdMap<StreamPath, DirectoryEntry>,
     ledger: OrdMap<StreamUid, StreamRecord>,
 }
 
 /// Directory and Ledger rows that transform `base` into `self`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForestDelta {
-    pub directory: Vec<(DirectoryKey, DirectoryEntry)>,
+    pub directory: Vec<(StreamPath, DirectoryEntry)>,
     pub ledger: Vec<(StreamUid, LedgerCell)>,
 }
 
@@ -235,7 +235,7 @@ impl Forest {
     }
 
     #[must_use]
-    pub fn resolve(&self, path: &DirectoryKey) -> Option<DirectoryEntry> {
+    pub fn resolve(&self, path: &StreamPath) -> Option<DirectoryEntry> {
         self.directory.get(path).copied()
     }
 
@@ -280,7 +280,7 @@ impl Forest {
 
 impl
     TryFrom<(
-        OrdMap<DirectoryKey, DirectoryEntry>,
+        OrdMap<StreamPath, DirectoryEntry>,
         OrdMap<StreamUid, StreamRecord>,
     )> for Forest
 {
@@ -288,7 +288,7 @@ impl
 
     fn try_from(
         (directory, ledger): (
-            OrdMap<DirectoryKey, DirectoryEntry>,
+            OrdMap<StreamPath, DirectoryEntry>,
             OrdMap<StreamUid, StreamRecord>,
         ),
     ) -> Result<Self, Self::Error> {
@@ -400,9 +400,9 @@ mod tests {
     #[test]
     fn merged_constructor_enumerates_every_cross_store_contradiction()
     -> Result<(), Box<dyn std::error::Error>> {
-        let path_a = directory_key("events/a")?;
-        let path_b = directory_key("events/b")?;
-        let path_c = directory_key("events/c")?;
+        let path_a = stream_path("events/a")?;
+        let path_b = stream_path("events/b")?;
+        let path_c = stream_path("events/c")?;
         let uid_1 = StreamUid::try_from(1)?;
         let uid_2 = StreamUid::try_from(2)?;
         let uid_3 = StreamUid::try_from(3)?;
@@ -449,8 +449,8 @@ mod tests {
     #[test]
     fn merged_constructor_accepts_exact_live_and_tombstone_correspondence()
     -> Result<(), Box<dyn std::error::Error>> {
-        let path_live = directory_key("events/live")?;
-        let path_deleted = directory_key("events/deleted")?;
+        let path_live = stream_path("events/live")?;
+        let path_deleted = stream_path("events/deleted")?;
         let uid_live = StreamUid::try_from(1)?;
         let uid_deleted = StreamUid::try_from(2)?;
         let forest = Forest::try_from((
@@ -474,13 +474,13 @@ mod tests {
         Ok(())
     }
 
-    fn directory_key(raw: &str) -> Result<DirectoryKey, Box<dyn std::error::Error>> {
-        Ok(DirectoryKey::try_from(Box::<[u8]>::from(raw.as_bytes()))?)
+    fn stream_path(raw: &str) -> Result<StreamPath, Box<dyn std::error::Error>> {
+        Ok(raw.parse()?)
     }
 
     fn directory<const ROWS: usize>(
-        rows: [(DirectoryKey, DirectoryEntry); ROWS],
-    ) -> OrdMap<DirectoryKey, DirectoryEntry> {
+        rows: [(StreamPath, DirectoryEntry); ROWS],
+    ) -> OrdMap<StreamPath, DirectoryEntry> {
         rows.into_iter().collect()
     }
 

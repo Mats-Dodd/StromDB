@@ -1,10 +1,10 @@
 use std::num::NonZeroU64;
 
-use strom_domain::{CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle};
+use strom_domain::{CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamPath};
 use strom_storage_domain::{
-    AttemptId, BatchId, DecodedTable, DirectoryKey, EncodedAuthoritySeal, FreshIdentity,
-    OwnerToken, Seal, SealGeneration, SortedRun, StoreKind, TableObjectId, TableRef, TreeVersion,
-    WalBody, WalObject, WalReplayPoint,
+    AttemptId, BatchId, DecodedTable, EncodedAuthoritySeal, FreshIdentity, OwnerToken, Seal,
+    SealGeneration, SortedRun, StoreKind, TableObjectId, TableRef, TreeVersion, WalBody, WalObject,
+    WalReplayPoint,
 };
 use strom_storage_protocol::{
     AdmissionRefusal, BootstrapEffect, BootstrapEvent, BootstrapMachine, BootstrapStep,
@@ -33,8 +33,8 @@ pub(super) fn create(raw: &str) -> TestResult<(CommandEnvelope, CreateReply)> {
     ))
 }
 
-pub(super) fn path(raw: &str) -> TestResult<DirectoryKey> {
-    Ok(DirectoryKey::try_from(Box::<[u8]>::from(raw.as_bytes()))?)
+pub(super) fn path(raw: &str) -> TestResult<StreamPath> {
+    Ok(raw.parse()?)
 }
 
 pub(super) fn machine_at(durable: u64) -> TestResult<WriterMachine> {

@@ -7,11 +7,11 @@ use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::IntoResponse;
 use strom_db::{
-    CloseStreamOutcome, CreateOutcome, Db, StreamError, StreamId, StreamLifecycle, StreamStatus,
+    CloseStreamOutcome, CreateOutcome, Db, StreamError, StreamLifecycle, StreamPath, StreamStatus,
 };
 
 use crate::error::ApiError;
-use crate::extract::{Expiry, Lifecycle, RequestContentType, StreamPath};
+use crate::extract::{Expiry, Lifecycle, RequestContentType, RequestStreamPath};
 use crate::respond::{ClosedHeader, ContentTypeHeader, ExpiryHeaders, Location};
 
 /// Create or ensure a stream (`PUT`, §5.1).
@@ -20,7 +20,7 @@ use crate::respond::{ClosedHeader, ContentTypeHeader, ExpiryHeaders, Location};
 /// engine owns offsets.
 pub(crate) async fn put(
     State(db): State<Arc<Db>>,
-    StreamPath(id): StreamPath,
+    RequestStreamPath(path): RequestStreamPath,
     RequestContentType(content_type): RequestContentType,
     Expiry(expiry): Expiry,
     Lifecycle(lifecycle): Lifecycle,
@@ -33,7 +33,7 @@ pub(crate) async fn put(
         ));
     }
     let outcome = db
-        .create_stream(&id, content_type.clone(), expiry, lifecycle)
+        .create_stream(&path, content_type.clone(), expiry, lifecycle)
         .await?;
     let status = match outcome {
         CreateOutcome::Created => StatusCode::CREATED,
@@ -50,12 +50,12 @@ pub(crate) async fn put(
 /// Close a stream, or refuse append (`POST`, §5.2 / §5.3).
 pub(crate) async fn post(
     State(db): State<Arc<Db>>,
-    StreamPath(id): StreamPath,
+    RequestStreamPath(path): RequestStreamPath,
     Lifecycle(lifecycle): Lifecycle,
     body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
     match (lifecycle, body.is_empty()) {
-        (StreamLifecycle::Closed, true) => close_stream(&db, &id).await,
+        (StreamLifecycle::Closed, true) => close_stream(&db, &path).await,
         (StreamLifecycle::Open | StreamLifecycle::Closed, false) => Err(ApiError::NotImplemented(
             "append is not implemented".to_owned(),
         )),
@@ -71,9 +71,9 @@ pub(crate) async fn post(
 /// engine owns offsets.
 pub(crate) async fn head(
     State(db): State<Arc<Db>>,
-    StreamPath(id): StreamPath,
+    RequestStreamPath(path): RequestStreamPath,
 ) -> Result<impl IntoResponse, ApiError> {
-    match db.stream(&id)? {
+    match db.stream(&path)? {
         StreamStatus::Missing => Err(ApiError::NotFound),
         StreamStatus::Deleted => Err(ApiError::Gone),
         StreamStatus::Live {
@@ -93,20 +93,20 @@ pub(crate) async fn head(
 /// Soft-delete a stream (`DELETE`, §5.4).
 pub(crate) async fn delete(
     State(db): State<Arc<Db>>,
-    StreamPath(id): StreamPath,
+    RequestStreamPath(path): RequestStreamPath,
 ) -> Result<StatusCode, ApiError> {
-    match db.delete_stream(&id).await {
+    match db.delete_stream(&path).await {
         Ok(()) => Ok(StatusCode::NO_CONTENT),
-        Err(StreamError::NotLive) => Err(refuse_not_live(&db, &id)),
+        Err(StreamError::NotLive) => Err(refuse_not_live(&db, &path)),
         Err(error) => Err(ApiError::from(error)),
     }
 }
 
 /// Read is not implemented yet (`GET`, §5.6+).
 ///
-/// [`StreamPath`] must stay in the signature: a malformed stream id is a
+/// [`RequestStreamPath`] must stay in the signature: a malformed stream path is a
 /// protocol 400 and takes precedence over this 501.
-pub(crate) async fn get(StreamPath(_id): StreamPath) -> Result<(), ApiError> {
+pub(crate) async fn get(RequestStreamPath(_path): RequestStreamPath) -> Result<(), ApiError> {
     Err(ApiError::NotImplemented(
         "read is not implemented".to_owned(),
     ))
@@ -117,20 +117,20 @@ pub(crate) async fn reserved_not_found() -> impl IntoResponse {
     ApiError::NotFound
 }
 
-async fn close_stream(db: &Db, id: &StreamId) -> Result<(StatusCode, ClosedHeader), ApiError> {
-    match db.close_stream(id).await {
+async fn close_stream(db: &Db, path: &StreamPath) -> Result<(StatusCode, ClosedHeader), ApiError> {
+    match db.close_stream(path).await {
         Ok(CloseStreamOutcome::Closed | CloseStreamOutcome::AlreadyClosed) => Ok((
             StatusCode::NO_CONTENT,
             ClosedHeader(StreamLifecycle::Closed),
         )),
-        Err(StreamError::NotLive) => Err(refuse_not_live(db, id)),
+        Err(StreamError::NotLive) => Err(refuse_not_live(db, path)),
         Err(error) => Err(ApiError::from(error)),
     }
 }
 
 /// Split [`StreamError::NotLive`] into protocol 404 vs 410 via one status read.
-fn refuse_not_live(db: &Db, id: &StreamId) -> ApiError {
-    match db.stream(id) {
+fn refuse_not_live(db: &Db, path: &StreamPath) -> ApiError {
+    match db.stream(path) {
         Ok(StreamStatus::Missing) => ApiError::NotFound,
         Ok(StreamStatus::Deleted) => ApiError::Gone,
         Ok(StreamStatus::Live { .. }) => ApiError::Indeterminate,

@@ -1,11 +1,11 @@
 //! Pure admission-to-durability writer machine.
 
 use strom_domain::{
-    CloseStreamOutcome, CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle,
+    CloseStreamOutcome, CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamPath,
 };
 use strom_storage_domain::{
-    AttemptId, BatchId, DirectoryEntry, DirectoryKey, EncodedAuthoritySeal, EncodedWal,
-    OperationFact, OwnerToken, PartitionId, Seal, SealGeneration, WAL_RUN_FACTS_MAX,
+    AttemptId, BatchId, DirectoryEntry, EncodedAuthoritySeal, EncodedWal, OperationFact,
+    OwnerToken, PartitionId, Seal, SealGeneration, WAL_RUN_FACTS_MAX,
     WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WalBody, WalFacts, WalObject, WalReplayPoint,
 };
 use tokio::sync::oneshot;
@@ -19,7 +19,7 @@ pub const WRITER_OUTPUTS_PER_STEP_MAX: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateStream {
-    pub path: DirectoryKey,
+    pub path: StreamPath,
     pub content_type: StreamContentType,
     pub expiry: ExpiryPolicy,
     pub lifecycle: StreamLifecycle,
@@ -45,11 +45,11 @@ pub enum CommandEnvelope {
         reply: oneshot::Sender<Result<CreateOutcome, AdmissionRefusal>>,
     },
     Close {
-        path: DirectoryKey,
+        path: StreamPath,
         reply: oneshot::Sender<Result<CloseStreamOutcome, AdmissionRefusal>>,
     },
     Delete {
-        path: DirectoryKey,
+        path: StreamPath,
         reply: oneshot::Sender<Result<(), AdmissionRefusal>>,
     },
 }
@@ -1193,7 +1193,7 @@ fn admit_create(
 
 fn admit_close(
     admitted: &Forest,
-    path: &DirectoryKey,
+    path: &StreamPath,
     batch: BatchId,
 ) -> Result<CloseAdmission, AdmissionRefusal> {
     let uid = resolve_live_uid(admitted, path)?;
@@ -1216,7 +1216,7 @@ fn admit_close(
 
 fn admit_delete(
     admitted: &Forest,
-    path: &DirectoryKey,
+    path: &StreamPath,
     batch: BatchId,
 ) -> Result<AdmittedCommand, AdmissionRefusal> {
     apply_fact(
@@ -1242,7 +1242,7 @@ impl FoldContradiction {
 
 fn resolve_live_uid(
     forest: &Forest,
-    path: &DirectoryKey,
+    path: &StreamPath,
 ) -> Result<strom_storage_domain::StreamUid, AdmissionRefusal> {
     match forest.resolve(path) {
         Some(DirectoryEntry::Live(uid)) => Ok(uid),

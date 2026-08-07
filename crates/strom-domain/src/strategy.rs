@@ -10,16 +10,16 @@ use std::num::NonZeroU64;
 use jiff::Timestamp;
 use proptest::prelude::{Just, Strategy, prop_oneof};
 
-use crate::{ExpiresAt, ExpiryPolicy, StreamContentType, StreamId, StreamLifecycle, StreamTtl};
+use crate::{ExpiresAt, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamPath, StreamTtl};
 
 /// # Panics
 ///
-/// Panics if a path of alphanumeric segments stops parsing as a stream id.
-pub fn stream_id() -> impl Strategy<Value = StreamId> {
+/// Panics if a path of alphanumeric segments stops parsing as a stream path.
+pub fn stream_path() -> impl Strategy<Value = StreamPath> {
     proptest::collection::vec("[a-z0-9]{1,8}", 1..4usize).prop_map(|segments| {
         segments
             .join("/")
-            .parse::<StreamId>()
+            .parse::<StreamPath>()
             .expect("alphanumeric segments joined by `/` are neither empty, relative, nor reserved")
     })
 }

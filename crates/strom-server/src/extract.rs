@@ -8,24 +8,24 @@ use std::convert::Infallible;
 use axum::extract::{FromRequestParts, Path};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, header};
-use strom_db::StreamId;
+use strom_db::StreamPath;
 use strom_domain::{ExpiresAt, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamTtl};
 
 use crate::error::ApiError;
 use crate::headers::{STREAM_CLOSED, STREAM_EXPIRES_AT, STREAM_TTL};
 
-/// The stream-root-relative request path parsed into a [`StreamId`].
+/// The stream-root-relative request path parsed into a [`StreamPath`].
 #[derive(Debug)]
-pub(crate) struct StreamPath(pub(crate) StreamId);
+pub(crate) struct RequestStreamPath(pub(crate) StreamPath);
 
-impl<S: Send + Sync> FromRequestParts<S> for StreamPath {
+impl<S: Send + Sync> FromRequestParts<S> for RequestStreamPath {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let Path(path) = Path::<String>::from_request_parts(parts, state)
             .await
             .map_err(|rejection| ApiError::BadRequest(rejection.to_string()))?;
-        stream_id(&path).map(Self)
+        stream_path(&path).map(Self)
     }
 }
 
@@ -67,9 +67,9 @@ impl<S: Send + Sync> FromRequestParts<S> for Lifecycle {
     }
 }
 
-fn stream_id(path: &str) -> Result<StreamId, ApiError> {
+fn stream_path(path: &str) -> Result<StreamPath, ApiError> {
     path.parse()
-        .map_err(|error: strom_db::StreamIdError| ApiError::BadRequest(error.to_string()))
+        .map_err(|error: strom_db::StreamPathError| ApiError::BadRequest(error.to_string()))
 }
 
 fn content_type(headers: &HeaderMap) -> Result<StreamContentType, ApiError> {
@@ -133,22 +133,22 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
     use strom_domain::StreamLifecycle;
 
-    use super::{content_type, expiry, lifecycle, stream_id};
+    use super::{content_type, expiry, lifecycle, stream_path};
     use crate::error::ApiError;
     use crate::headers::{STREAM_CLOSED, STREAM_EXPIRES_AT, STREAM_TTL};
 
     #[test]
-    fn stream_id_rejects_reserved_root() {
+    fn stream_path_rejects_reserved_root() {
         assert!(matches!(
-            stream_id("__ds/subscriptions/x"),
+            stream_path("__ds/subscriptions/x"),
             Err(ApiError::BadRequest(_))
         ));
     }
 
     #[test]
-    fn stream_id_accepts_nested_path() {
-        let id = stream_id("events/a").expect("valid stream id");
-        assert_eq!("events/a", id.as_str());
+    fn stream_path_accepts_nested_path() {
+        let path = stream_path("events/a").expect("valid stream path");
+        assert_eq!("events/a", path.as_str());
     }
 
     #[test]

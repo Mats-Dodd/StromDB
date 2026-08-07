@@ -1,11 +1,11 @@
 use std::num::NonZeroU64;
 
-use strom_domain::{ExpiryPolicy, StreamContentType, StreamId};
+use strom_domain::{ExpiryPolicy, StreamContentType, StreamPath};
 use strom_storage_domain::{
-    AttemptId, BatchId, DecodeError, DirectoryKey, FreshIdentity, OperationFact, OwnerToken,
-    PartitionId, SEAL_ENCODED_BYTES_MAX, Seal, SealGeneration, SortedRun, StoreKind, StreamUid,
-    TableObjectId, TableRef, TreeVersion, WAL_ENCODED_BYTES_MAX, WalBody, WalFacts, WalObject,
-    WalReplayPoint, decode_seal, decode_wal, encode_seal, encode_wal,
+    AttemptId, BatchId, DecodeError, FreshIdentity, OperationFact, OwnerToken, PartitionId,
+    SEAL_ENCODED_BYTES_MAX, Seal, SealGeneration, SortedRun, StoreKind, StreamUid, TableObjectId,
+    TableRef, TreeVersion, WAL_ENCODED_BYTES_MAX, WalBody, WalFacts, WalObject, WalReplayPoint,
+    decode_seal, decode_wal, encode_seal, encode_wal,
 };
 
 const SEAL_ARCHIVE_FIXTURE: &[u8] = &[
@@ -17,7 +17,7 @@ const SEAL_ARCHIVE_FIXTURE: &[u8] = &[
 const WAL_ARCHIVE_FIXTURE: &[u8] = &[
     101, 118, 101, 110, 116, 115, 47, 97, 98, 99, 97, 112, 112, 108, 105, 99, 97, 116, 105, 111,
     110, 47, 106, 115, 111, 110, 59, 32, 99, 104, 97, 114, 115, 101, 116, 61, 117, 116, 102, 45,
-    56, 0, 214, 255, 255, 255, 10, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 159, 0, 0, 0, 208, 255, 255,
+    56, 0, 138, 0, 0, 0, 214, 255, 255, 255, 7, 0, 0, 0, 0, 0, 0, 0, 159, 0, 0, 0, 208, 255, 255,
     255, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 17, 34, 51, 68, 85, 102, 119,
     136, 153, 170, 187, 204, 221, 238, 255, 9, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 180,
     255, 255, 255, 1, 0, 0, 0,
@@ -84,7 +84,7 @@ fn nonempty_seal_manifest_roundtrips() -> Result<(), Box<dyn std::error::Error>>
 
 #[test]
 fn every_wal_fact_variant_roundtrips() -> Result<(), Box<dyn std::error::Error>> {
-    let path = directory_key("events/abc")?;
+    let path = stream_path("events/abc")?;
     let uid = uid(7)?;
     let object = WalObject::new(
         partition()?,
@@ -219,7 +219,7 @@ fn canonical_content_type_boundary_roundtrips_through_wal() -> Result<(), Box<dy
         BatchId::try_from(1)?,
         OwnerToken::from(SealGeneration::genesis()),
         WalBody::Run(WalFacts::try_from(vec![OperationFact::StreamCreated {
-            path: directory_key("events/abc")?,
+            path: stream_path("events/abc")?,
             uid: uid(1)?,
             content_type,
             expiry: ExpiryPolicy::None,
@@ -295,7 +295,7 @@ fn genesis_seal() -> Result<Seal, Box<dyn std::error::Error>> {
 
 fn one_fact_run() -> Result<WalObject, Box<dyn std::error::Error>> {
     let fact = OperationFact::StreamCreated {
-        path: directory_key("events/abc")?,
+        path: stream_path("events/abc")?,
         uid: uid(7)?,
         content_type: "application/json; charset=utf-8".parse()?,
         expiry: ExpiryPolicy::None,
@@ -318,9 +318,8 @@ fn fence() -> Result<WalObject, Box<dyn std::error::Error>> {
     ))
 }
 
-fn directory_key(raw: &str) -> Result<DirectoryKey, strom_domain::StreamIdError> {
-    raw.parse::<StreamId>()
-        .map(|stream_id| DirectoryKey::from(&stream_id))
+fn stream_path(raw: &str) -> Result<StreamPath, strom_domain::StreamPathError> {
+    raw.parse()
 }
 
 fn uid(raw: u64) -> Result<StreamUid, strom_storage_domain::ZeroCoordinate> {

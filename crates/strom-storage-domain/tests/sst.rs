@@ -1,16 +1,14 @@
-use strom_domain::{ExpiryPolicy, StreamId, StreamLifecycle, StreamTtl};
+use strom_domain::{ExpiryPolicy, StreamLifecycle, StreamPath, StreamTtl};
 use strom_storage_domain::{
-    AttemptId, BatchId, DirectoryEntry, DirectoryKey, FreshIdentity, LedgerCell, PartitionId,
-    SealGeneration, SstDecodeError, SstEncodeError, StoreKind, StreamRecord, StreamUid, TableKey,
-    TableObjectId, decode_directory_sst, decode_ledger_sst, encode_directory_sst,
-    encode_ledger_sst,
+    AttemptId, BatchId, DirectoryEntry, FreshIdentity, LedgerCell, PartitionId, SealGeneration,
+    SstDecodeError, SstEncodeError, StoreKind, StreamRecord, StreamUid, TableKey, TableObjectId,
+    decode_directory_sst, decode_ledger_sst, encode_directory_sst, encode_ledger_sst,
 };
 
 const DIRECTORY_ONE_ROW: &[u8] = &[
-    101, 118, 101, 110, 116, 115, 47, 97, 248, 255, 255, 255, 8, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0,
-    0, 0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204, 221, 238, 255, 2, 0, 0, 0, 0, 0,
-    0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 195, 255, 255, 255, 1, 0, 0,
-    0,
+    101, 118, 101, 110, 116, 115, 47, 97, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 17, 34, 51, 68, 85, 102,
+    119, 136, 153, 170, 187, 204, 221, 238, 255, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 195, 255, 255, 255, 1, 0, 0, 0,
 ];
 
 const LEDGER_ONE_DELETE: &[u8] = &[
@@ -244,7 +242,7 @@ fn table_key(store: StoreKind) -> Result<TableKey, Box<dyn std::error::Error>> {
     Ok(TableKey::new(TableObjectId::new(fresh, store)))
 }
 
-fn directory_rows() -> Result<Vec<(DirectoryKey, DirectoryEntry)>, Box<dyn std::error::Error>> {
+fn directory_rows() -> Result<Vec<(StreamPath, DirectoryEntry)>, Box<dyn std::error::Error>> {
     Ok(vec![
         (key("events/a")?, DirectoryEntry::Live(uid(7)?)),
         (key("events/ab")?, DirectoryEntry::Tombstone(uid(8)?)),
@@ -286,9 +284,8 @@ fn ledger_rows() -> Result<Vec<(StreamUid, LedgerCell)>, Box<dyn std::error::Err
     ])
 }
 
-fn key(raw: &str) -> Result<DirectoryKey, strom_domain::StreamIdError> {
-    raw.parse::<StreamId>()
-        .map(|stream_id| DirectoryKey::from(&stream_id))
+fn key(raw: &str) -> Result<StreamPath, strom_domain::StreamPathError> {
+    raw.parse()
 }
 
 fn uid(raw: u64) -> Result<StreamUid, strom_storage_domain::ZeroCoordinate> {

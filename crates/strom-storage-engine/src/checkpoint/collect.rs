@@ -81,15 +81,15 @@ mod tests {
 
     use object_store::path::Path;
     use object_store::{ObjectStore, ObjectStoreExt as _};
-    use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
+    use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle, StreamPath};
     use strom_object_store::test_support::{
         BackendFailure, Fault, FaultStore, Operation, Selection, Target,
     };
     use strom_object_store::{CreateEvidence, ObjectKey, ObjectStoreAdapter, PutBody};
     use strom_storage_domain::{
-        AttemptId, DirectoryKey, FreshIdentity, OperationFact, OwnerToken, SealGeneration, SealKey,
-        SortedRun, StoreKind, StreamUid, TableKey, TableObjectId, TableRef, TreeVersion, WalBody,
-        WalFacts, WalKey, WalObject, WalReplayPoint, encode_seal, encode_wal,
+        AttemptId, FreshIdentity, OperationFact, OwnerToken, SealGeneration, SealKey, SortedRun,
+        StoreKind, StreamUid, TableKey, TableObjectId, TableRef, TreeVersion, WalBody, WalFacts,
+        WalKey, WalObject, WalReplayPoint, encode_seal, encode_wal,
     };
 
     use super::*;
@@ -494,7 +494,7 @@ mod tests {
 
     fn wal_run(partition: PartitionId, batch: u64, owner: OwnerToken) -> TestResult<WalObject> {
         let fact = OperationFact::StreamCreated {
-            path: directory_key(&format!("collection/run-{batch}"))?,
+            path: stream_path(&format!("collection/run-{batch}"))?,
             uid: StreamUid::try_from(batch)?,
             content_type: StreamContentType::octet_stream(),
             expiry: ExpiryPolicy::None,
@@ -567,8 +567,8 @@ mod tests {
             .expect("test partition is canonical")
     }
 
-    fn directory_key(raw: &str) -> TestResult<DirectoryKey> {
-        Ok(DirectoryKey::try_from(Box::<[u8]>::from(raw.as_bytes()))?)
+    fn stream_path(raw: &str) -> TestResult<StreamPath> {
+        Ok(raw.parse()?)
     }
 
     fn object_key(spelling: impl std::fmt::Display) -> ObjectKey {

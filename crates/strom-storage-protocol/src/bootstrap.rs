@@ -3,10 +3,11 @@
 use std::collections::VecDeque;
 
 use imbl::OrdMap;
+use strom_domain::StreamPath;
 use strom_storage_domain::{
-    BatchId, DIRECTORY_ROW_LOGICAL_BYTES_MAX, DecodedTable, DirectoryEntry, DirectoryKey,
-    EncodedAuthoritySeal, EncodedGenesisSeal, EncodedWal, LEDGER_VALUE_ROW_LOGICAL_BYTES_MAX,
-    LedgerCell, OwnerToken, PARTITION_BOOTSTRAP_BYTES_MAX_V2, PARTITION_BOOTSTRAP_OBJECTS_MAX_V2,
+    BatchId, DIRECTORY_ROW_LOGICAL_BYTES_MAX, DecodedTable, DirectoryEntry, EncodedAuthoritySeal,
+    EncodedGenesisSeal, EncodedWal, LEDGER_VALUE_ROW_LOGICAL_BYTES_MAX, LedgerCell, OwnerToken,
+    PARTITION_BOOTSTRAP_BYTES_MAX_V2, PARTITION_BOOTSTRAP_OBJECTS_MAX_V2,
     PARTITION_RESIDENT_LOGICAL_BYTES_MAX_V2, PartitionId, Seal, SealGeneration, StreamRecord,
     StreamUid, TableRef, WAL_SUFFIX_COORDINATES_MAX_V2, WalBody, WalObject, WalReplayPoint,
 };
@@ -154,13 +155,13 @@ struct BaseLoad {
     claimed: ClaimedBootstrap,
     remaining: VecDeque<PlannedTable>,
     merged: MergedRows,
-    previous_directory: Option<DirectoryKey>,
+    previous_directory: Option<StreamPath>,
     previous_ledger: Option<StreamUid>,
 }
 
 #[derive(Debug, Default)]
 struct MergedRows {
-    directory: OrdMap<DirectoryKey, DirectoryEntry>,
+    directory: OrdMap<StreamPath, DirectoryEntry>,
     ledger: OrdMap<StreamUid, StreamRecord>,
     resident_bytes: u64,
 }
@@ -833,9 +834,9 @@ fn tree_sources(tree: &strom_storage_domain::TreeVersion) -> Vec<PlannedTable> {
 
 fn merge_directory_table(
     merged: &mut MergedRows,
-    previous_last: Option<&DirectoryKey>,
-    rows: Vec<(DirectoryKey, DirectoryEntry)>,
-) -> Result<Option<DirectoryKey>, BootstrapExit> {
+    previous_last: Option<&StreamPath>,
+    rows: Vec<(StreamPath, DirectoryEntry)>,
+) -> Result<Option<StreamPath>, BootstrapExit> {
     let first = rows
         .first()
         .expect("checked SST decoding produces a nonempty table");

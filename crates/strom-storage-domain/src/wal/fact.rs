@@ -1,9 +1,11 @@
 //! Already-decided stream mutation facts.
 
-use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
+use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle, StreamPath};
 
-use crate::archive::{ContentTypeAsString, ExpiryAsArchive, LifecycleAsArchive};
-use crate::{DirectoryKey, StreamUid};
+use crate::StreamUid;
+use crate::archive::{
+    ContentTypeAsString, ExpiryAsArchive, LifecycleAsArchive, StreamPathAsString,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize)]
 #[rkyv(attr(expect(
@@ -12,7 +14,8 @@ use crate::{DirectoryKey, StreamUid};
 )))]
 pub enum OperationFact {
     StreamCreated {
-        path: DirectoryKey,
+        #[rkyv(with = StreamPathAsString)]
+        path: StreamPath,
         uid: StreamUid,
         #[rkyv(with = ContentTypeAsString)]
         content_type: StreamContentType,
@@ -22,11 +25,13 @@ pub enum OperationFact {
         lifecycle: StreamLifecycle,
     },
     StreamClosed {
-        path: DirectoryKey,
+        #[rkyv(with = StreamPathAsString)]
+        path: StreamPath,
         uid: StreamUid,
     },
     StreamDeleted {
-        path: DirectoryKey,
+        #[rkyv(with = StreamPathAsString)]
+        path: StreamPath,
         uid: StreamUid,
     },
 }

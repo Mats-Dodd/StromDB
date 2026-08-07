@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload};
-use strom_domain::{CreateOutcome, StreamId, StreamStatus};
+use strom_domain::{CreateOutcome, StreamPath, StreamStatus};
 use strom_object_store::ObjectKey;
 use strom_object_store::test_support::{
     BackendFailure, Fault, FaultStore, Gate, Operation, Selection, Target,
@@ -349,7 +349,7 @@ async fn advancing_publication_starts_leak_only_collection_without_poisoning_the
     delete_gate.wait_until_blocked().await;
     delete_gate.release();
     delete_gate.wait_until_finished().await;
-    let after_collection: StreamId = "checkpoint/after-collection-fault".parse()?;
+    let after_collection: StreamPath = "checkpoint/after-collection-fault".parse()?;
     assert_eq!(
         CreateOutcome::Created,
         create(&engine, &after_collection).await?
@@ -365,7 +365,7 @@ async fn advancing_publication_starts_leak_only_collection_without_poisoning_the
 
 async fn assert_reopens_with_streams(
     backend: Arc<dyn ObjectStore>,
-    streams: &[StreamId],
+    streams: &[StreamPath],
 ) -> TestResult {
     let reopened = Engine::open(backend, entropy()).await?;
     for id in streams {

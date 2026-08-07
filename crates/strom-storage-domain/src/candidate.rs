@@ -3,12 +3,13 @@
 use std::num::NonZeroU64;
 
 use bytes::Bytes;
+use strom_domain::StreamPath;
 
 use crate::{
-    BatchId, DirectoryEntry, DirectoryKey, EncodeError, LedgerCell, PartitionId,
-    SEAL_ENCODED_BYTES_MAX, SST_OBJECT_BYTES_MAX, Seal, SealGeneration, SstEncodeError, StreamUid,
-    TableKey, TableRef, WAL_ENCODED_BYTES_MAX, WalObject, encode_directory_sst, encode_ledger_sst,
-    encode_seal, encode_wal,
+    BatchId, DirectoryEntry, EncodeError, LedgerCell, PartitionId, SEAL_ENCODED_BYTES_MAX,
+    SST_OBJECT_BYTES_MAX, Seal, SealGeneration, SstEncodeError, StreamUid, TableKey, TableRef,
+    WAL_ENCODED_BYTES_MAX, WalObject, encode_directory_sst, encode_ledger_sst, encode_seal,
+    encode_wal,
 };
 
 /// One WAL candidate whose identity and exact sent bytes agree by construction.
@@ -155,7 +156,7 @@ impl EncodedTable {
     pub fn encode_directory(
         partition: PartitionId,
         key: TableKey,
-        rows: &[(DirectoryKey, DirectoryEntry)],
+        rows: &[(StreamPath, DirectoryEntry)],
     ) -> Result<Self, SstEncodeError> {
         Ok(Self::from_encoded(
             key,
@@ -214,7 +215,7 @@ impl EncodedTable {
 /// Checked rows decoded from either supported SST kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodedTable {
-    Directory(Vec<(DirectoryKey, DirectoryEntry)>),
+    Directory(Vec<(StreamPath, DirectoryEntry)>),
     Ledger(Vec<(StreamUid, LedgerCell)>),
 }
 

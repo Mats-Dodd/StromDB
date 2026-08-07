@@ -257,13 +257,12 @@ fn wal_read_bound() -> ByteBound {
 mod tests {
     use object_store::path::Path;
     use object_store::{ObjectStoreExt as _, PutPayload};
+    use strom_domain::StreamPath;
     use strom_object_store::ObjectKey;
     use strom_object_store::test_support::{
         BackendFailure, Fault, FaultStore, Operation, Selection, Target,
     };
-    use strom_storage_domain::{
-        DirectoryKey, OperationFact, OwnerToken, SealGeneration, StreamUid, WalFacts,
-    };
+    use strom_storage_domain::{OperationFact, OwnerToken, SealGeneration, StreamUid, WalFacts};
 
     use super::*;
 
@@ -500,7 +499,8 @@ mod tests {
     }
 
     fn deleted_fact() -> OperationFact {
-        let path = DirectoryKey::try_from(Box::<[u8]>::from(b"events/abc".as_slice()))
+        let path = "events/abc"
+            .parse::<StreamPath>()
             .expect("test stream path is canonical");
         let uid = StreamUid::try_from(1).expect("test uid is nonzero");
         OperationFact::StreamDeleted { path, uid }

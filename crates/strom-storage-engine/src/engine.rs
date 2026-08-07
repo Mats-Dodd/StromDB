@@ -5,12 +5,12 @@ use std::sync::Arc;
 use object_store::ObjectStore;
 use strom_common::Entropy;
 use strom_domain::{
-    CloseStreamOutcome, CreateOutcome, ExpiryPolicy, StreamContentType, StreamId, StreamLifecycle,
-    StreamStatus,
+    CloseStreamOutcome, CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle,
+    StreamPath, StreamStatus,
 };
 use strom_object_store::ObjectStoreAdapter;
 use strom_storage_domain::{
-    DirectoryEntry, DirectoryKey, PartitionId, SealGeneration, WRITER_INGRESS_COMMANDS_MAX,
+    DirectoryEntry, PartitionId, SealGeneration, WRITER_INGRESS_COMMANDS_MAX,
 };
 use strom_storage_protocol::{
     AdmissionRefusal, BootstrapExit, CommandEnvelope, CreateStream, Forest, WriterExit,
@@ -31,8 +31,8 @@ impl PublishedView {
         Self { forest }
     }
 
-    fn stream(&self, id: &StreamId) -> StreamStatus {
-        match self.forest.resolve(&DirectoryKey::from(id)) {
+    fn stream(&self, path: &StreamPath) -> StreamStatus {
+        match self.forest.resolve(path) {
             None => StreamStatus::Missing,
             Some(DirectoryEntry::Tombstone(_uid)) => StreamStatus::Deleted,
             Some(DirectoryEntry::Live(uid)) => {
@@ -96,14 +96,14 @@ impl Engine {
     /// or left without a determinate durable outcome.
     pub async fn create_stream(
         &self,
-        id: &StreamId,
+        path: &StreamPath,
         content_type: StreamContentType,
         expiry: ExpiryPolicy,
         lifecycle: StreamLifecycle,
     ) -> Result<CreateOutcome, StreamError> {
         let (reply, outcome) = oneshot::channel();
         let command = CreateStream {
-            path: DirectoryKey::from(id),
+            path: path.clone(),
             content_type,
             expiry,
             lifecycle,
@@ -122,10 +122,10 @@ impl Engine {
     ///
     /// Returns [`StreamError`] when the command is refused, shed, unavailable,
     /// or left without a determinate durable outcome.
-    pub async fn close_stream(&self, id: &StreamId) -> Result<CloseStreamOutcome, StreamError> {
+    pub async fn close_stream(&self, path: &StreamPath) -> Result<CloseStreamOutcome, StreamError> {
         let (reply, outcome) = oneshot::channel();
         self.enqueue(CommandEnvelope::Close {
-            path: DirectoryKey::from(id),
+            path: path.clone(),
             reply,
         })?;
         match outcome.await {
@@ -141,10 +141,10 @@ impl Engine {
     ///
     /// Returns [`StreamError`] when the command is refused, shed, unavailable,
     /// or left without a determinate durable outcome.
-    pub async fn delete_stream(&self, id: &StreamId) -> Result<(), StreamError> {
+    pub async fn delete_stream(&self, path: &StreamPath) -> Result<(), StreamError> {
         let (reply, outcome) = oneshot::channel();
         self.enqueue(CommandEnvelope::Delete {
-            path: DirectoryKey::from(id),
+            path: path.clone(),
             reply,
         })?;
         match outcome.await {
@@ -159,11 +159,11 @@ impl Engine {
     /// # Errors
     ///
     /// Returns [`StreamError::Unavailable`] after the writer revokes readiness.
-    pub fn stream(&self, id: &StreamId) -> Result<StreamStatus, StreamError> {
+    pub fn stream(&self, path: &StreamPath) -> Result<StreamStatus, StreamError> {
         if self.commands.is_closed() {
             return Err(StreamError::Unavailable);
         }
-        Ok(self.view.borrow().stream(id))
+        Ok(self.view.borrow().stream(path))
     }
 
     fn enqueue(&self, command: CommandEnvelope) -> Result<(), StreamError> {

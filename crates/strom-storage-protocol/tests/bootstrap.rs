@@ -7,13 +7,13 @@
 use std::num::NonZeroU64;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
+use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle, StreamPath};
 use strom_storage_domain::{
-    AttemptId, BatchId, DecodedTable, DirectoryEntry, DirectoryKey, FreshIdentity, LedgerCell,
-    OperationFact, OwnerToken, PARTITION_BOOTSTRAP_BYTES_MAX_V2,
-    PARTITION_BOOTSTRAP_OBJECTS_MAX_V2, PartitionId, SST_OBJECT_BYTES_MAX, Seal, SealGeneration,
-    SortedRun, StoreKind, StreamRecord, StreamUid, TableObjectId, TableRef, TreeVersion,
-    WAL_SUFFIX_COORDINATES_MAX_V2, WalBody, WalFacts, WalObject, WalReplayPoint,
+    AttemptId, BatchId, DecodedTable, DirectoryEntry, FreshIdentity, LedgerCell, OperationFact,
+    OwnerToken, PARTITION_BOOTSTRAP_BYTES_MAX_V2, PARTITION_BOOTSTRAP_OBJECTS_MAX_V2, PartitionId,
+    SST_OBJECT_BYTES_MAX, Seal, SealGeneration, SortedRun, StoreKind, StreamRecord, StreamUid,
+    TableObjectId, TableRef, TreeVersion, WAL_SUFFIX_COORDINATES_MAX_V2, WalBody, WalFacts,
+    WalObject, WalReplayPoint,
 };
 use strom_storage_protocol::{
     BootstrapEffect, BootstrapEvent, BootstrapExit, BootstrapMachine, BootstrapStep,
@@ -244,9 +244,7 @@ fn replay_accepts_owner_succession_and_strictly_folds_runs() -> TestResult {
         Some(DirectoryEntry::Live(StreamUid::try_from(1)?)),
         recovery
             .durable_forest()
-            .resolve(&DirectoryKey::try_from(Box::<[u8]>::from(
-                b"events/a".as_slice()
-            ))?)
+            .resolve(&"events/a".parse::<StreamPath>()?)
     );
     Ok(())
 }
@@ -305,7 +303,7 @@ fn replay_gap_with_a_current_claim_is_a_contradiction() -> TestResult {
 #[test]
 fn table_reads_merge_oldest_to_newest_before_wal_replay() -> TestResult {
     let uid = StreamUid::try_from(1)?;
-    let path = DirectoryKey::try_from(Box::<[u8]>::from(b"events/base".as_slice()))?;
+    let path = "events/base".parse::<StreamPath>()?;
     let head = seal_with_tables()?;
     let claim_generation = head.generation().successor()?;
     let mut machine = BootstrapMachine::new();
@@ -483,8 +481,8 @@ fn same_run_overlap_is_a_contradiction() -> TestResult {
     )?;
 
     let (mut overlap, first_table) = machine_reading_first_table(head);
-    let later = DirectoryKey::try_from(Box::<[u8]>::from(b"events/z".as_slice()))?;
-    let earlier = DirectoryKey::try_from(Box::<[u8]>::from(b"events/a".as_slice()))?;
+    let later = "events/z".parse::<StreamPath>()?;
+    let earlier = "events/a".parse::<StreamPath>()?;
     let second_table = assert_read_table(
         overlap.handle(BootstrapEvent::TableRead {
             table: first_table,
@@ -630,8 +628,7 @@ fn terminal_run_and_miscorrelated_table_completion_panic() -> TestResult {
         table_machine.handle(BootstrapEvent::TableRead {
             table: other,
             decoded: DecodedTable::Directory(vec![(
-                DirectoryKey::try_from(Box::<[u8]>::from(b"events/a".as_slice()))
-                    .expect("fixture path is canonical"),
+                "events/a".parse().expect("fixture path is canonical"),
                 DirectoryEntry::Live(StreamUid::try_from(1).expect("uid one is canonical")),
             )]),
         })
@@ -929,7 +926,7 @@ mod support {
 
     pub(super) fn create_fact(path: &str, uid: u64) -> TestResult<OperationFact> {
         Ok(OperationFact::StreamCreated {
-            path: DirectoryKey::try_from(Box::<[u8]>::from(path.as_bytes()))?,
+            path: path.parse()?,
             uid: StreamUid::try_from(uid)?,
             content_type: StreamContentType::octet_stream(),
             expiry: ExpiryPolicy::None,

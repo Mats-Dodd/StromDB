@@ -207,10 +207,9 @@ fn send_replies(replies: Vec<Completion>) {
 mod tests {
     use std::future::pending;
 
-    use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
+    use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle, StreamPath};
     use strom_storage_domain::{
-        BatchId, DirectoryKey, OwnerToken, Seal, SealGeneration, TreeVersion, WalBody, WalObject,
-        WalReplayPoint,
+        BatchId, OwnerToken, Seal, SealGeneration, TreeVersion, WalBody, WalObject, WalReplayPoint,
     };
     use strom_storage_protocol::{
         BootstrapEffect, BootstrapEvent, BootstrapMachine, BootstrapStep, CommandEnvelope,
@@ -378,8 +377,8 @@ mod tests {
         Ok(WriterMachine::from_recovery(recovery))
     }
 
-    fn path(raw: &str) -> Result<DirectoryKey, Box<dyn std::error::Error>> {
-        Ok(DirectoryKey::try_from(Box::<[u8]>::from(raw.as_bytes()))?)
+    fn path(raw: &str) -> Result<StreamPath, Box<dyn std::error::Error>> {
+        Ok(raw.parse()?)
     }
 
     fn wal_batch(step: WriterStep) -> Option<BatchId> {

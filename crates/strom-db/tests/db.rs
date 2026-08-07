@@ -8,7 +8,7 @@ use strom_db::object_store::ObjectStore;
 use strom_db::object_store::memory::InMemory;
 use strom_db::{
     CloseOutcome, CloseStreamOutcome, CreateOutcome, Db, ExpiryPolicy, StreamContentType,
-    StreamError, StreamId, StreamLifecycle, StreamStatus,
+    StreamError, StreamLifecycle, StreamPath, StreamStatus,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -16,7 +16,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 #[tokio::test]
 async fn every_verb_is_visible_by_status_and_survives_reopen() -> TestResult {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let id: StreamId = "events/a".parse()?;
+    let id: StreamPath = "events/a".parse()?;
 
     let db = Db::open(Arc::clone(&store)).await?;
     let partition = db.partition_id();
@@ -87,7 +87,7 @@ async fn every_verb_is_visible_by_status_and_survives_reopen() -> TestResult {
 #[tokio::test]
 async fn typed_refusal_does_not_change_stream_status() -> TestResult {
     let db = Db::open(Arc::new(InMemory::new())).await?;
-    let missing: StreamId = "events/missing".parse()?;
+    let missing: StreamPath = "events/missing".parse()?;
     assert_eq!(Err(StreamError::NotLive), db.delete_stream(&missing).await);
     assert_eq!(StreamStatus::Missing, db.stream(&missing)?);
     assert_eq!(CloseOutcome::Shutdown, db.close().await);
@@ -97,7 +97,7 @@ async fn typed_refusal_does_not_change_stream_status() -> TestResult {
 #[tokio::test]
 async fn duplicate_create_returns_already_exists() -> TestResult {
     let db = Db::open(Arc::new(InMemory::new())).await?;
-    let id: StreamId = "events/a".parse()?;
+    let id: StreamPath = "events/a".parse()?;
     assert_eq!(
         CreateOutcome::Created,
         db.create_stream(
@@ -126,7 +126,7 @@ async fn duplicate_create_returns_already_exists() -> TestResult {
 #[tokio::test]
 async fn config_mismatch_create_refuses_occupied() -> TestResult {
     let db = Db::open(Arc::new(InMemory::new())).await?;
-    let id: StreamId = "events/a".parse()?;
+    let id: StreamPath = "events/a".parse()?;
     db.create_stream(
         &id,
         StreamContentType::octet_stream(),
@@ -152,7 +152,7 @@ async fn config_mismatch_create_refuses_occupied() -> TestResult {
 #[tokio::test]
 async fn create_closed_is_visible_and_survives_reopen() -> TestResult {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let id: StreamId = "events/closed".parse()?;
+    let id: StreamPath = "events/closed".parse()?;
 
     let db = Db::open(Arc::clone(&store)).await?;
     let partition = db.partition_id();
@@ -194,7 +194,7 @@ async fn create_closed_is_visible_and_survives_reopen() -> TestResult {
 #[tokio::test]
 async fn duplicate_close_returns_already_closed() -> TestResult {
     let db = Db::open(Arc::new(InMemory::new())).await?;
-    let id: StreamId = "events/a".parse()?;
+    let id: StreamPath = "events/a".parse()?;
     db.create_stream(
         &id,
         StreamContentType::octet_stream(),

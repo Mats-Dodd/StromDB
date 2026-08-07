@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use object_store::path::Path;
 use object_store::{ObjectStoreExt as _, PutPayload};
-use strom_domain::{CreateOutcome, StreamId, StreamStatus};
+use strom_domain::{CreateOutcome, StreamPath, StreamStatus};
 use strom_object_store::test_support::{
     BackendFailure, Fault, FaultStore, Gate, Operation, Selection, Target,
 };
@@ -18,7 +18,7 @@ use super::support::{TestResult, create, entropy, observe_checkpoint_keys, wal_k
 async fn direct_wal_create_commits_once_and_survives_reopen() -> TestResult {
     let wal_key = wal_key(2);
     let store = FaultStore::new();
-    let id: StreamId = "events/direct".parse()?;
+    let id: StreamPath = "events/direct".parse()?;
 
     let engine = Engine::open(store.backend(), entropy()).await?;
     assert_eq!(CreateOutcome::Created, create(&engine, &id).await?);
@@ -40,7 +40,7 @@ async fn ambiguous_wal_create_with_matching_bytes_commits_without_resend() -> Te
     let store = FaultStore::new().inject(Fault::CreateThenLoseResponse {
         target: Target::Key(wal_key.clone()),
     })?;
-    let id: StreamId = "events/ambiguous".parse()?;
+    let id: StreamPath = "events/ambiguous".parse()?;
 
     let engine = Engine::open(store.backend(), entropy()).await?;
     assert_eq!(CreateOutcome::Created, create(&engine, &id).await?);
@@ -72,7 +72,7 @@ async fn ambiguous_wal_create_with_foreign_bytes_fences_without_resend() -> Test
             create_gate.clone(),
         )?;
     let backend = store.backend();
-    let id: StreamId = "events/foreign".parse()?;
+    let id: StreamPath = "events/foreign".parse()?;
     let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
     let partition = engine.partition_id();
 
@@ -120,7 +120,7 @@ async fn ambiguous_wal_create_absent_on_reconciliation_poisoned_without_resend()
         selection: Selection::create(Target::Key(wal_key.clone())),
         failure: BackendFailure::Transport,
     })?;
-    let id: StreamId = "events/absent".parse()?;
+    let id: StreamPath = "events/absent".parse()?;
 
     let engine = Engine::open(store.backend(), entropy()).await?;
     assert_eq!(Err(StreamError::Indeterminate), create(&engine, &id).await);
@@ -151,7 +151,7 @@ async fn failed_wal_reconciliation_poisoned_without_resend() -> TestResult {
             selection: Selection::read(Target::Key(wal_key.clone())),
             failure: BackendFailure::Transport,
         })?;
-    let id: StreamId = "events/reconciliation-failed".parse()?;
+    let id: StreamPath = "events/reconciliation-failed".parse()?;
 
     let engine = Engine::open(store.backend(), entropy()).await?;
     assert_eq!(Err(StreamError::Indeterminate), create(&engine, &id).await);
@@ -176,7 +176,7 @@ async fn rejected_wal_create_poisoned_without_resend() -> TestResult {
         selection: Selection::create(Target::Key(wal_key.clone())),
         failure: BackendFailure::PermissionDenied,
     })?;
-    let id: StreamId = "events/rejected".parse()?;
+    let id: StreamPath = "events/rejected".parse()?;
 
     let engine = Engine::open(store.backend(), entropy()).await?;
     assert_eq!(Err(StreamError::Indeterminate), create(&engine, &id).await);
@@ -194,7 +194,7 @@ async fn wal_commit_is_published_before_the_success_reply_is_released() -> TestR
     let wal_key = wal_key(2);
     let gate = Gate::new();
     let store = FaultStore::new().gate(Selection::create(Target::Key(wal_key)), gate.clone())?;
-    let id: StreamId = "events/visibility".parse()?;
+    let id: StreamPath = "events/visibility".parse()?;
     let engine = Engine::open(store.backend(), entropy()).await?;
 
     let outcome = {
@@ -221,8 +221,8 @@ async fn successor_writer_fences_the_previous_writer_and_preserves_its_own_work(
     let store = FaultStore::new();
     let previous = Engine::open(store.backend(), entropy()).await?;
     let current = Engine::open(store.backend(), entropy()).await?;
-    let rejected: StreamId = "events/previous".parse()?;
-    let accepted: StreamId = "events/current".parse()?;
+    let rejected: StreamPath = "events/previous".parse()?;
+    let accepted: StreamPath = "events/current".parse()?;
 
     assert_eq!(
         Err(StreamError::Indeterminate),
@@ -253,7 +253,7 @@ async fn successor_writer_fences_the_previous_writer_and_preserves_its_own_work(
 async fn wal_run_retains_matching_state_and_shell_flights_until_completion() -> TestResult {
     let gate = Gate::new();
     let store = FaultStore::new().gate(Selection::create(Target::Key(wal_key(2))), gate.clone())?;
-    let id: StreamId = "events/shutdown".parse()?;
+    let id: StreamPath = "events/shutdown".parse()?;
     let engine = Engine::open(store.backend(), entropy()).await?;
 
     {
@@ -291,23 +291,23 @@ async fn held_checkpoint_cannot_extend_the_bounded_wal_suffix() -> TestResult {
         .expect("the suffix reserves a genesis FENCE and one successor FENCE");
     let checkpoint_trigger_count = WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER;
     for ordinal in 0..checkpoint_trigger_count {
-        let id: StreamId = format!("events/bounded-{ordinal}").parse()?;
+        let id: StreamPath = format!("events/bounded-{ordinal}").parse()?;
         assert_eq!(CreateOutcome::Created, create(&engine, &id).await?);
     }
     seal_gate.wait_until_blocked().await;
 
     for ordinal in checkpoint_trigger_count..accepted_count {
-        let id: StreamId = format!("events/bounded-{ordinal}").parse()?;
+        let id: StreamPath = format!("events/bounded-{ordinal}").parse()?;
         assert_eq!(CreateOutcome::Created, create(&engine, &id).await?);
     }
-    let refused: StreamId = "events/bounded-refused".parse()?;
+    let refused: StreamPath = "events/bounded-refused".parse()?;
     assert_eq!(
         Err(StreamError::Overloaded),
         create(&engine, &refused).await
     );
 
-    let first: StreamId = "events/bounded-0".parse()?;
-    let last: StreamId = format!(
+    let first: StreamPath = "events/bounded-0".parse()?;
+    let last: StreamPath = format!(
         "events/bounded-{}",
         accepted_count
             .checked_sub(1)

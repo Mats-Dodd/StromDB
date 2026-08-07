@@ -4,9 +4,11 @@ use rkyv::rancor::Failure;
 
 use super::fact::ArchivedOperationFact;
 use super::{ArchivedWalBody, ArchivedWalObject, OperationFact, WalBody, WalFacts, WalObject};
-use crate::archive::{DecodeError, EncodeError, decode_bound, decode_content_type, encode};
+use crate::archive::{
+    DecodeError, EncodeError, decode_bound, decode_content_type, decode_stream_path, encode,
+};
 use crate::bounds::{WAL_ENCODED_BYTES_MAX, WAL_RUN_FACTS_MAX};
-use crate::{BatchId, DirectoryKey, OwnerToken, PartitionId, StreamUid};
+use crate::{BatchId, OwnerToken, PartitionId, StreamUid};
 
 /// # Errors
 ///
@@ -69,18 +71,18 @@ fn decode_fact(fact: &ArchivedOperationFact) -> Result<OperationFact, DecodeErro
             expiry,
             lifecycle,
         } => Ok(OperationFact::StreamCreated {
-            path: DirectoryKey::try_from(path)?,
+            path: decode_stream_path(path)?,
             uid: StreamUid::from(uid),
             content_type: decode_content_type(content_type)?,
             expiry: strom_domain::ExpiryPolicy::try_from(expiry)?,
             lifecycle: strom_domain::StreamLifecycle::from(lifecycle),
         }),
         ArchivedOperationFact::StreamClosed { path, uid } => Ok(OperationFact::StreamClosed {
-            path: DirectoryKey::try_from(path)?,
+            path: decode_stream_path(path)?,
             uid: StreamUid::from(uid),
         }),
         ArchivedOperationFact::StreamDeleted { path, uid } => Ok(OperationFact::StreamDeleted {
-            path: DirectoryKey::try_from(path)?,
+            path: decode_stream_path(path)?,
             uid: StreamUid::from(uid),
         }),
     }
@@ -135,11 +137,9 @@ mod tests {
         let partition = partition()?;
         let batch = BatchId::try_from(1)?;
         let owner = OwnerToken::from(SealGeneration::genesis());
-        let path = DirectoryKey::try_from(
-            "a".repeat(strom_domain::STREAM_ID_BYTES_MAX)
-                .into_bytes()
-                .into_boxed_slice(),
-        )?;
+        let path = "a"
+            .repeat(strom_domain::STREAM_PATH_BYTES_MAX)
+            .parse::<strom_domain::StreamPath>()?;
         let content_type: StreamContentType =
             format!("a/{}", "b".repeat(strom_domain::CONTENT_TYPE_BYTES_MAX - 2)).parse()?;
         let uid = StreamUid::try_from(1)?;
@@ -174,10 +174,10 @@ mod tests {
         facts_count: usize,
     ) -> Result<WalObject, Box<dyn std::error::Error>> {
         let uid = StreamUid::try_from(1)?;
-        let path = "events/abc".parse::<strom_domain::StreamId>()?;
+        let path = "events/abc".parse::<strom_domain::StreamPath>()?;
         let facts = (0..facts_count)
             .map(|_ordinal| OperationFact::StreamDeleted {
-                path: DirectoryKey::from(&path),
+                path: path.clone(),
                 uid,
             })
             .collect();

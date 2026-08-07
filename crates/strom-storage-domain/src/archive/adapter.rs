@@ -4,7 +4,9 @@ use rkyv::rancor::{Fallible, Source};
 use rkyv::string::{ArchivedString, StringResolver};
 use rkyv::with::{ArchiveWith, SerializeWith};
 use rkyv::{Archive, Archived, Place, Resolver, Serialize, SerializeUnsized};
-use strom_domain::{ExpiresAt, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamTtl};
+use strom_domain::{
+    ExpiresAt, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamPath, StreamTtl,
+};
 
 use super::DecodeError;
 
@@ -18,6 +20,38 @@ pub(crate) fn decode_content_type(
         .parse()
         .map_err(|_domain_error| DecodeError::InvalidBody)?;
     Ok(parsed)
+}
+
+pub(crate) fn decode_stream_path(stream_path: &ArchivedString) -> Result<StreamPath, DecodeError> {
+    stream_path
+        .as_str()
+        .parse()
+        .map_err(|_domain_error| DecodeError::InvalidBody)
+}
+
+pub(crate) struct StreamPathAsString;
+
+impl ArchiveWith<StreamPath> for StreamPathAsString {
+    type Archived = ArchivedString;
+    type Resolver = StringResolver;
+
+    fn resolve_with(field: &StreamPath, resolver: Self::Resolver, out: Place<Self::Archived>) {
+        ArchivedString::resolve_from_str(field.as_str(), resolver, out);
+    }
+}
+
+impl<SerializerType> SerializeWith<StreamPath, SerializerType> for StreamPathAsString
+where
+    SerializerType: Fallible + ?Sized,
+    SerializerType::Error: Source,
+    str: SerializeUnsized<SerializerType>,
+{
+    fn serialize_with(
+        field: &StreamPath,
+        serializer: &mut SerializerType,
+    ) -> Result<Self::Resolver, SerializerType::Error> {
+        ArchivedString::serialize_from_str(field.as_str(), serializer)
+    }
 }
 
 pub(crate) struct ContentTypeAsString;
@@ -165,7 +199,7 @@ impl From<&ArchivedLifecycleArchive> for StreamLifecycle {
 mod tests {
     use rkyv::rancor::Failure;
     use rkyv::{Archive, Serialize};
-    use strom_domain::{ExpiresAt, ExpiryPolicy, StreamContentType, StreamLifecycle};
+    use strom_domain::{ExpiresAt, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamPath};
 
     use super::*;
     use crate::archive::encode;
@@ -174,6 +208,8 @@ mod tests {
 
     #[derive(Archive, Serialize)]
     struct ProtocolFields {
+        #[rkyv(with = StreamPathAsString)]
+        stream_path: StreamPath,
         #[rkyv(with = ContentTypeAsString)]
         content_type: StreamContentType,
         #[rkyv(with = ExpiryAsArchive)]
@@ -185,6 +221,9 @@ mod tests {
     #[test]
     fn protocol_adapters_round_trip_through_canonical_domain_construction() {
         let fields = ProtocolFields {
+            stream_path: "events/adapter"
+                .parse()
+                .expect("the fixture stream path is canonical"),
             content_type: "text/plain; charset=utf-8"
                 .parse()
                 .expect("the fixture content type is canonical"),
@@ -199,6 +238,11 @@ mod tests {
         let archived = rkyv::access::<ArchivedProtocolFields, Failure>(&bytes)
             .expect("the encoder produces a checked archive");
 
+        assert_eq!(
+            decode_stream_path(&archived.stream_path),
+            Ok(fields.stream_path),
+            "stream path is reconstructed through its canonical parser"
+        );
         assert_eq!(
             decode_content_type(&archived.content_type),
             Ok(fields.content_type),
