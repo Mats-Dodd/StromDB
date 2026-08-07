@@ -206,9 +206,12 @@ Normal caller maps after the change:
 | `SealPublication::NoAuthority` | `Fenced` | `Fenced` |
 | `SealPublication::Unresolved` | `Poisoned` | `Retryable` (never serve) |
 
-The writer never calls `publish_authority` itself; the checkpoint module
-does (decision 4). The Writer column for the Seal rows names the exits the
-writer reaches through `CheckpointCompletion`.
+Superseded placement (`refactor3.md` decision 6): the checkpoint effect now
+ends at `CheckpointPrepared`; the pure writer machine issues
+`PublishAuthority` and maps `SealPublication` beside the WAL outcome maps. The
+typed `SealStore` still exclusively owns evidence classification and the
+send-once publication operation, so this decision's correctness substance is
+unchanged.
 
 Genesis has its own map: `Established` continues provisioning, `LostRace`
 rediscovers and adopts the winner, and `Unresolved` returns `Retryable`.

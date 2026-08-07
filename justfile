@@ -7,8 +7,12 @@ fmt:
 fmt-check:
     cargo fmt --all --check
 
-check: fmt-check clippy lint-style
+check: fmt-check clippy lint-style protocol-boundary
     cargo check --workspace --all-targets --all-features
+
+protocol-boundary:
+    @if rg --line-number '\b(runtime|select|spawn|task|time)\b' crates/strom-storage-protocol/src; then echo 'strom-storage-protocol must not name runtime execution' >&2; exit 1; fi
+    cargo check -p strom-storage-protocol
 
 clippy:
     cargo clippy --workspace --all-targets --all-features -- -D warnings

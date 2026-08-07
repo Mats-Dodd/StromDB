@@ -83,7 +83,7 @@ mod tests {
     use strom_object_store::test_support::{
         BackendFailure, Fault, FaultStore, Operation, Selection, Target,
     };
-    use strom_object_store::{CreateEvidence, FrozenBytes, ObjectKey};
+    use strom_object_store::{CreateEvidence, ObjectKey, PutBody};
     use strom_storage_domain::{
         AttemptId, DirectoryKey, FreshIdentity, OperationFact, OwnerToken, SealGeneration, SealKey,
         SortedRun, StoreKind, StreamUid, TableKey, TableObjectId, TableRef, TreeVersion, WalBody,
@@ -498,7 +498,7 @@ mod tests {
 
     async fn plant_wal(adapter: &ObjectStoreAdapter, wal: &WalObject) -> TestResult {
         let key = object_key(WalKey::from(wal.batch()));
-        let body = FrozenBytes::try_from(encode_wal(wal)?)?;
+        let body = PutBody::try_from(encode_wal(wal)?)?;
         assert_eq!(
             CreateEvidence::Direct,
             adapter.create_if_absent(&key, body).await?
@@ -508,7 +508,7 @@ mod tests {
 
     async fn plant_seal(adapter: &ObjectStoreAdapter, seal: &Seal) -> TestResult {
         let key = object_key(SealKey::from(seal.generation()));
-        let body = FrozenBytes::try_from(encode_seal(seal)?)?;
+        let body = PutBody::try_from(encode_seal(seal)?)?;
         assert_eq!(
             CreateEvidence::Direct,
             adapter.create_if_absent(&key, body).await?
@@ -518,7 +518,7 @@ mod tests {
 
     async fn plant_table(adapter: &ObjectStoreAdapter, table: &TableRef) -> TestResult {
         let key = object_key(TableKey::new(table.object()));
-        let body = FrozenBytes::try_from(TABLE_MARKER.to_vec())?;
+        let body = PutBody::try_from(TABLE_MARKER.to_vec())?;
         assert_eq!(
             CreateEvidence::Direct,
             adapter.create_if_absent(&key, body).await?

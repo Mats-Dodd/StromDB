@@ -4,7 +4,6 @@
 mod bootstrap;
 mod checkpoint;
 mod engine;
-mod forest;
 mod store;
 mod writer;
 

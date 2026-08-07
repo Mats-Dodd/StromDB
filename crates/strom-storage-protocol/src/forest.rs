@@ -12,25 +12,25 @@ use strom_storage_domain::{
 
 /// Resident Directory and Ledger under the no-forks cross-store invariants.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Forest {
+pub struct Forest {
     directory: OrdMap<DirectoryKey, DirectoryEntry>,
     ledger: OrdMap<StreamUid, StreamRecord>,
 }
 
 /// Directory and Ledger rows that transform `base` into `self`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ForestDelta {
-    pub(crate) directory: Vec<(DirectoryKey, DirectoryEntry)>,
-    pub(crate) ledger: Vec<(StreamUid, LedgerCell)>,
+pub struct ForestDelta {
+    pub directory: Vec<(DirectoryKey, DirectoryEntry)>,
+    pub ledger: Vec<(StreamUid, LedgerCell)>,
 }
 
 /// Zero-sized witness that one fact applied exactly once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Applied;
+pub struct Applied;
 
 /// A fact that cannot join this forest under strict fold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum FoldContradiction {
+pub enum FoldContradiction {
     /// Create: the path already has a Live or Tombstone row.
     #[error("path is already occupied")]
     PathOccupied,
@@ -53,7 +53,7 @@ pub(crate) enum FoldContradiction {
 
 /// Merged Directory and Ledger rows that cannot form a complete forest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum ForestContradiction {
+pub enum ForestContradiction {
     #[error("Directory stream uids are not dense and unique")]
     UidGap,
     #[error("Directory row count differs from the maximum allocated stream uid")]
@@ -74,75 +74,12 @@ enum UidState {
 }
 
 impl Forest {
-    #[cfg(test)]
     #[must_use]
-    pub(crate) fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             directory: OrdMap::new(),
             ledger: OrdMap::new(),
         }
-    }
-
-    /// Construct one all-or-nothing resident forest from newest-wins rows.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first cross-store contradiction without exposing a partial
-    /// forest.
-    pub(crate) fn try_from_merged(
-        directory: OrdMap<DirectoryKey, DirectoryEntry>,
-        ledger: OrdMap<StreamUid, StreamRecord>,
-    ) -> Result<Self, ForestContradiction> {
-        let path_count = u64::try_from(directory.len())
-            .map_err(|_overflow| ForestContradiction::CountMismatch)?;
-        if path_count > PARTITION_PATH_OCCUPANCIES_MAX_V2 {
-            return Err(ForestContradiction::CountMismatch);
-        }
-
-        let path_count_usize =
-            usize::try_from(path_count).map_err(|_overflow| ForestContradiction::CountMismatch)?;
-        let mut uid_states = vec![None; path_count_usize];
-        for entry in directory.values() {
-            let index = stream_uid_value(directory_entry_uid(entry))
-                .checked_sub(1)
-                .and_then(|zero_based| usize::try_from(zero_based).ok())
-                .ok_or(ForestContradiction::UidGap)?;
-            let Some(slot) = uid_states.get_mut(index) else {
-                return Err(ForestContradiction::CountMismatch);
-            };
-            if slot.is_some() {
-                return Err(ForestContradiction::UidGap);
-            }
-            *slot = Some(match entry {
-                DirectoryEntry::Live(_) => UidState::LiveMissingRecord,
-                DirectoryEntry::Tombstone(_) => UidState::Tombstone,
-            });
-        }
-        if uid_states.iter().any(Option::is_none) {
-            return Err(ForestContradiction::UidGap);
-        }
-
-        for uid in ledger.keys() {
-            let index = stream_uid_value(*uid)
-                .checked_sub(1)
-                .and_then(|zero_based| usize::try_from(zero_based).ok())
-                .ok_or(ForestContradiction::RecordWithoutLive)?;
-            let Some(state) = uid_states.get_mut(index).and_then(Option::as_mut) else {
-                return Err(ForestContradiction::RecordWithoutLive);
-            };
-            match state {
-                UidState::LiveMissingRecord => *state = UidState::LiveWithRecord,
-                UidState::Tombstone => return Err(ForestContradiction::TombstoneWithRecord),
-                UidState::LiveWithRecord => {
-                    return Err(ForestContradiction::RecordWithoutLive);
-                }
-            }
-        }
-        if uid_states.contains(&Some(UidState::LiveMissingRecord)) {
-            return Err(ForestContradiction::LiveWithoutRecord);
-        }
-
-        Ok(Self { directory, ledger })
     }
 
     /// Apply one fact at `batch` under the strict fold rules.
@@ -156,7 +93,7 @@ impl Forest {
     /// Panics when a Live directory row has no ledger record. That breaks the
     /// cross-store invariant established by [`Forest::empty`] and preserved by
     /// every successful fold.
-    pub(crate) fn strict_fold(
+    pub fn strict_fold(
         &mut self,
         batch: BatchId,
         fact: &OperationFact,
@@ -239,8 +176,12 @@ impl Forest {
     ///
     /// Directory path occupancy is permanent: a remove in the `imbl` diff is an
     /// invariant failure, not a delete cell.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the current forest removed a permanent Directory occupancy.
     #[must_use]
-    pub(crate) fn delta_since(&self, base: &Self) -> ForestDelta {
+    pub fn delta_since(&self, base: &Self) -> ForestDelta {
         let directory = base
             .directory
             .diff(&self.directory)
@@ -275,12 +216,12 @@ impl Forest {
     }
 
     #[must_use]
-    pub(crate) fn resolve(&self, path: &DirectoryKey) -> Option<DirectoryEntry> {
+    pub fn resolve(&self, path: &DirectoryKey) -> Option<DirectoryEntry> {
         self.directory.get(path).copied()
     }
 
     #[must_use]
-    pub(crate) fn record(&self, uid: StreamUid) -> Option<&StreamRecord> {
+    pub fn record(&self, uid: StreamUid) -> Option<&StreamRecord> {
         self.ledger.get(&uid)
     }
 
@@ -293,6 +234,10 @@ impl Forest {
     }
 
     /// Allocate the next dense stream identity after proving path capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldContradiction::PathCapacityExhausted`] at the path bound.
     pub(crate) fn successor_uid(&self) -> Result<StreamUid, FoldContradiction> {
         Self::successor_uid_after(self.path_count())
     }
@@ -308,17 +253,86 @@ impl Forest {
         Ok(StreamUid::from(successor))
     }
 
-    pub(crate) const fn directory_rows(&self) -> &OrdMap<DirectoryKey, DirectoryEntry> {
+    #[must_use]
+    pub const fn directory_rows(&self) -> &OrdMap<DirectoryKey, DirectoryEntry> {
         &self.directory
     }
 
-    pub(crate) const fn ledger_rows(&self) -> &OrdMap<StreamUid, StreamRecord> {
+    #[must_use]
+    pub const fn ledger_rows(&self) -> &OrdMap<StreamUid, StreamRecord> {
         &self.ledger
     }
 
     #[must_use]
     pub(crate) fn shares_roots_with(&self, other: &Self) -> bool {
         self.directory.ptr_eq(&other.directory) && self.ledger.ptr_eq(&other.ledger)
+    }
+}
+
+impl
+    TryFrom<(
+        OrdMap<DirectoryKey, DirectoryEntry>,
+        OrdMap<StreamUid, StreamRecord>,
+    )> for Forest
+{
+    type Error = ForestContradiction;
+
+    fn try_from(
+        (directory, ledger): (
+            OrdMap<DirectoryKey, DirectoryEntry>,
+            OrdMap<StreamUid, StreamRecord>,
+        ),
+    ) -> Result<Self, Self::Error> {
+        let path_count = u64::try_from(directory.len())
+            .map_err(|_overflow| ForestContradiction::CountMismatch)?;
+        if path_count > PARTITION_PATH_OCCUPANCIES_MAX_V2 {
+            return Err(ForestContradiction::CountMismatch);
+        }
+
+        let path_count_usize =
+            usize::try_from(path_count).map_err(|_overflow| ForestContradiction::CountMismatch)?;
+        let mut uid_states = vec![None; path_count_usize];
+        for entry in directory.values() {
+            let index = stream_uid_value(directory_entry_uid(entry))
+                .checked_sub(1)
+                .and_then(|zero_based| usize::try_from(zero_based).ok())
+                .ok_or(ForestContradiction::UidGap)?;
+            let Some(slot) = uid_states.get_mut(index) else {
+                return Err(ForestContradiction::CountMismatch);
+            };
+            if slot.is_some() {
+                return Err(ForestContradiction::UidGap);
+            }
+            *slot = Some(match entry {
+                DirectoryEntry::Live(_) => UidState::LiveMissingRecord,
+                DirectoryEntry::Tombstone(_) => UidState::Tombstone,
+            });
+        }
+        if uid_states.iter().any(Option::is_none) {
+            return Err(ForestContradiction::UidGap);
+        }
+
+        for uid in ledger.keys() {
+            let index = stream_uid_value(*uid)
+                .checked_sub(1)
+                .and_then(|zero_based| usize::try_from(zero_based).ok())
+                .ok_or(ForestContradiction::RecordWithoutLive)?;
+            let Some(state) = uid_states.get_mut(index).and_then(Option::as_mut) else {
+                return Err(ForestContradiction::RecordWithoutLive);
+            };
+            match state {
+                UidState::LiveMissingRecord => *state = UidState::LiveWithRecord,
+                UidState::Tombstone => return Err(ForestContradiction::TombstoneWithRecord),
+                UidState::LiveWithRecord => {
+                    return Err(ForestContradiction::RecordWithoutLive);
+                }
+            }
+        }
+        if uid_states.contains(&Some(UidState::LiveMissingRecord)) {
+            return Err(ForestContradiction::LiveWithoutRecord);
+        }
+
+        Ok(Self { directory, ledger })
     }
 }
 
@@ -387,7 +401,7 @@ mod tests {
         let count_mismatch = directory([(path_a.clone(), DirectoryEntry::Live(uid_2))]);
         assert_eq!(
             Err(ForestContradiction::CountMismatch),
-            Forest::try_from_merged(count_mismatch, OrdMap::new())
+            Forest::try_from((count_mismatch, OrdMap::new()))
         );
 
         let uid_gap = directory([
@@ -397,28 +411,28 @@ mod tests {
         ]);
         assert_eq!(
             Err(ForestContradiction::UidGap),
-            Forest::try_from_merged(uid_gap, OrdMap::new())
+            Forest::try_from((uid_gap, OrdMap::new()))
         );
 
         let live_without_record = directory([(path_a.clone(), DirectoryEntry::Live(uid_1))]);
         assert_eq!(
             Err(ForestContradiction::LiveWithoutRecord),
-            Forest::try_from_merged(live_without_record, OrdMap::new())
+            Forest::try_from((live_without_record, OrdMap::new()))
         );
 
         let tombstone_with_record = directory([(path_a.clone(), DirectoryEntry::Tombstone(uid_1))]);
         assert_eq!(
             Err(ForestContradiction::TombstoneWithRecord),
-            Forest::try_from_merged(tombstone_with_record, ledger([(uid_1, record()?)]))
+            Forest::try_from((tombstone_with_record, ledger([(uid_1, record()?)]),))
         );
 
         let record_without_live = directory([(path_a, DirectoryEntry::Live(uid_1))]);
         assert_eq!(
             Err(ForestContradiction::RecordWithoutLive),
-            Forest::try_from_merged(
+            Forest::try_from((
                 record_without_live,
                 ledger([(uid_1, record()?), (uid_2, record()?)]),
-            )
+            ))
         );
         Ok(())
     }
@@ -430,13 +444,13 @@ mod tests {
         let path_deleted = directory_key("events/deleted")?;
         let uid_live = StreamUid::try_from(1)?;
         let uid_deleted = StreamUid::try_from(2)?;
-        let forest = Forest::try_from_merged(
+        let forest = Forest::try_from((
             directory([
                 (path_deleted.clone(), DirectoryEntry::Tombstone(uid_deleted)),
                 (path_live.clone(), DirectoryEntry::Live(uid_live)),
             ]),
             ledger([(uid_live, record()?)]),
-        )?;
+        ))?;
         assert_eq!(2, forest.path_count());
         assert_eq!(
             Some(DirectoryEntry::Live(uid_live)),

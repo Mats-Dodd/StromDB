@@ -2,99 +2,21 @@
 
 use std::str::FromStr as _;
 
-use strom_object_store::{
-    ByteBound, CreateEvidence, FrozenBytes, ListPageRequest, ObjectStoreAdapter,
-};
+use strom_object_store::{ByteBound, CreateEvidence, ListPageRequest, ObjectStoreAdapter, PutBody};
 use strom_storage_domain::{
-    EncodeError, SEAL_ENCODED_BYTES_MAX, Seal, SealGeneration, SealKey, SealNamespace, decode_seal,
-    encode_seal,
+    EncodedAuthoritySeal, EncodedGenesisSeal, SEAL_ENCODED_BYTES_MAX, Seal, SealGeneration,
+    SealKey, SealNamespace, decode_seal,
 };
 
-use super::{TypedStoreError, newest_keys_bound, object_key};
-
-/// One Seal candidate, encoded exactly once. Key and body agree by construction.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EncodedSeal {
-    generation: SealGeneration,
-    bytes: FrozenBytes,
-}
-
-impl EncodedSeal {
-    /// Encode `seal` once and freeze the exact bytes that will be sent.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EncodeError`] when serialization fails or the archive exceeds
-    /// [`SEAL_ENCODED_BYTES_MAX`].
-    fn new(seal: &Seal) -> Result<Self, EncodeError> {
-        let bytes = encode_seal(seal)?;
-        Ok(Self::from_encoded(seal.generation(), bytes))
-    }
-
-    fn from_encoded(generation: SealGeneration, bytes: Vec<u8>) -> Self {
-        let frozen = FrozenBytes::try_from(bytes)
-            .expect("encode_seal yields a non-empty body within PUT_BYTES_MAX");
-        Self {
-            generation,
-            bytes: frozen,
-        }
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    const fn generation(&self) -> SealGeneration {
-        self.generation
-    }
-
-    /// Exact frozen bytes of this candidate. After an ambiguous create, reconcile
-    /// with one bounded GET compared against these bytes—never re-encode.
-    #[cfg(test)]
-    #[must_use]
-    fn as_slice(&self) -> &[u8] {
-        self.bytes.as_slice()
-    }
-}
-
-/// A canonical generation-zero Seal candidate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EncodedGenesisSeal(EncodedSeal);
-
-impl EncodedGenesisSeal {
-    pub(crate) fn new(seal: &Seal) -> Result<Self, EncodeError> {
-        assert_eq!(
-            SealGeneration::genesis(),
-            seal.generation(),
-            "a genesis candidate has the canonical genesis coordinate"
-        );
-        EncodedSeal::new(seal).map(Self)
-    }
-}
-
-/// A non-genesis Seal candidate whose direct creation grants writer authority.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EncodedAuthoritySeal(EncodedSeal);
-
-impl EncodedAuthoritySeal {
-    pub(crate) fn new(seal: &Seal) -> Result<Self, EncodeError> {
-        assert!(
-            seal.generation() > SealGeneration::genesis(),
-            "an authority candidate advances beyond the genesis coordinate"
-        );
-        EncodedSeal::new(seal).map(Self)
-    }
-}
+use super::{
+    SealPublication, TypedStoreError, newest_keys_bound, object_key, typed_store_contradiction,
+    typed_store_error,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GenesisEstablishment {
     Established,
     LostRace,
-    Unresolved,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SealPublication {
-    Authored,
-    NoAuthority,
     Unresolved,
 }
 
@@ -114,7 +36,10 @@ impl SealStore {
         &self,
         candidate: &EncodedGenesisSeal,
     ) -> Result<GenesisEstablishment, TypedStoreError> {
-        match self.create_seal(&candidate.0).await? {
+        match self
+            .create_seal(candidate.generation(), candidate.bytes())
+            .await?
+        {
             CreateEvidence::Direct | CreateEvidence::DurableMatch => {
                 Ok(GenesisEstablishment::Established)
             }
@@ -127,7 +52,10 @@ impl SealStore {
         &self,
         candidate: &EncodedAuthoritySeal,
     ) -> Result<SealPublication, TypedStoreError> {
-        match self.create_seal(&candidate.0).await? {
+        match self
+            .create_seal(candidate.generation(), candidate.bytes())
+            .await?
+        {
             CreateEvidence::Direct => Ok(SealPublication::Authored),
             CreateEvidence::DurableMatch | CreateEvidence::NotOurs => {
                 Ok(SealPublication::NoAuthority)
@@ -138,13 +66,18 @@ impl SealStore {
 
     async fn create_seal(
         &self,
-        candidate: &EncodedSeal,
+        generation: SealGeneration,
+        bytes: &bytes::Bytes,
     ) -> Result<CreateEvidence, TypedStoreError> {
-        let key = object_key(SealKey::from(candidate.generation));
+        let key = object_key(SealKey::from(generation));
         self.adapter
-            .create_if_absent(&key, candidate.bytes.clone())
+            .create_if_absent(
+                &key,
+                PutBody::try_from(bytes.clone())
+                    .expect("an encoded Seal fits the adapter PUT bound"),
+            )
             .await
-            .map_err(TypedStoreError::from_store)
+            .map_err(typed_store_error)
     }
 
     /// Newest generation via one ascending list page with `keys_max = 1`.
@@ -164,12 +97,12 @@ impl SealStore {
                 keys_max: newest_keys_bound(),
             })
             .await
-            .map_err(TypedStoreError::from_store)?;
+            .map_err(typed_store_error)?;
         let Some(listed) = page.keys().first() else {
             return Ok(None);
         };
         let key = SealKey::from_str(listed.as_str()).map_err(|source| {
-            TypedStoreError::contradiction(format!(
+            typed_store_contradiction(format!(
                 "listed key {listed} under the Seal namespace is not a Seal key: {source}"
             ))
         })?;
@@ -192,14 +125,14 @@ impl SealStore {
             .adapter
             .read(&key, bound)
             .await
-            .map_err(TypedStoreError::from_store)?
+            .map_err(typed_store_error)?
         else {
             return Ok(None);
         };
         decode_seal(generation, observed.body())
             .map(Some)
             .map_err(|source| {
-                TypedStoreError::contradiction(format!(
+                typed_store_contradiction(format!(
                     "Seal body at {key} failed checked decode for {generation:?}: {source}"
                 ))
             })
@@ -218,13 +151,13 @@ mod tests {
     use strom_object_store::test_support::{
         BackendFailure, Fault, FaultStore, Operation, Selection, Target,
     };
-    use strom_storage_domain::{PartitionId, TreeVersion, WalReplayPoint};
+    use strom_storage_domain::{PartitionId, TreeVersion, WalReplayPoint, encode_seal};
 
     #[tokio::test]
     async fn genesis_establishment_decides_every_evidence_class()
     -> Result<(), Box<dyn std::error::Error>> {
         let genesis = seal_at(SealGeneration::genesis());
-        let candidate = EncodedGenesisSeal::new(&genesis)?;
+        let candidate = EncodedGenesisSeal::try_from(&genesis)?;
         let store = SealStore::new(ObjectStoreAdapter::in_memory());
         assert_eq!(
             GenesisEstablishment::Established,
@@ -245,7 +178,7 @@ mod tests {
         )?;
         let occupied_store = SealStore::new(ObjectStoreAdapter::in_memory());
         occupied_store
-            .establish_genesis(&EncodedGenesisSeal::new(&foreign)?)
+            .establish_genesis(&EncodedGenesisSeal::try_from(&foreign)?)
             .await?;
         assert_eq!(
             GenesisEstablishment::LostRace,
@@ -275,7 +208,7 @@ mod tests {
     async fn authority_publication_requires_direct_authorship()
     -> Result<(), Box<dyn std::error::Error>> {
         let generation = SealGeneration::genesis().successor()?;
-        let candidate = EncodedAuthoritySeal::new(&seal_at(generation))?;
+        let candidate = EncodedAuthoritySeal::try_from(&seal_at(generation))?;
         let store = SealStore::new(ObjectStoreAdapter::in_memory());
         assert_eq!(
             SealPublication::Authored,
@@ -296,7 +229,7 @@ mod tests {
         )?;
         let occupied_store = SealStore::new(ObjectStoreAdapter::in_memory());
         occupied_store
-            .publish_authority(&EncodedAuthoritySeal::new(&foreign)?)
+            .publish_authority(&EncodedAuthoritySeal::try_from(&foreign)?)
             .await?;
         assert_eq!(
             SealPublication::NoAuthority,
@@ -326,8 +259,11 @@ mod tests {
     async fn created_seal_reads_back_equal_at_its_exact_identity() {
         let store = SealStore::new(ObjectStoreAdapter::in_memory());
         let seal = seal_at(SealGeneration::genesis());
-        let candidate = EncodedSeal::new(&seal).expect("genesis seal encodes");
-        let evidence = store.create_seal(&candidate).await.expect("create runs");
+        let candidate = EncodedGenesisSeal::try_from(&seal).expect("genesis seal encodes");
+        let evidence = store
+            .create_seal(candidate.generation(), candidate.bytes())
+            .await
+            .expect("create runs");
         assert_eq!(
             CreateEvidence::Direct,
             evidence,
@@ -358,8 +294,12 @@ mod tests {
         ] {
             let store = SealStore::new(ObjectStoreAdapter::in_memory());
             for generation in order {
-                let candidate = EncodedSeal::new(&seal_at(generation)).expect("seal encodes");
-                store.create_seal(&candidate).await.expect("create runs");
+                let seal = seal_at(generation);
+                let bytes = bytes::Bytes::from(encode_seal(&seal).expect("seal encodes"));
+                store
+                    .create_seal(generation, &bytes)
+                    .await
+                    .expect("create runs");
             }
             let newest = store.newest_generation().await.expect("list runs");
             assert_eq!(
@@ -377,7 +317,7 @@ mod tests {
         let identity = SealGeneration::genesis();
         let key = object_key(SealKey::from(identity));
         let garbage =
-            FrozenBytes::try_from(b"garbage-seal-body".to_vec()).expect("garbage body freezes");
+            PutBody::try_from(b"garbage-seal-body".to_vec()).expect("garbage body freezes");
         adapter
             .create_if_absent(&key, garbage)
             .await
@@ -398,7 +338,7 @@ mod tests {
         // `-` sorts before digits, so MaxKeys=1 surfaces this before any Seal key.
         let garbage_key = ObjectKey::try_from(format!("{SealNamespace}/-garbage"))
             .expect("garbage key is a legal ObjectKey");
-        let body = FrozenBytes::try_from(b"foreign".to_vec()).expect("body freezes");
+        let body = PutBody::try_from(b"foreign".to_vec()).expect("body freezes");
         adapter
             .create_if_absent(&garbage_key, body)
             .await
@@ -418,10 +358,11 @@ mod tests {
         let store = SealStore::new(adapter.clone());
         let generation_a = SealGeneration::genesis();
         let generation_b = generation_a.successor().expect("generation two exists");
-        let candidate_a = EncodedSeal::new(&seal_at(generation_a)).expect("seal a encodes");
+        let candidate_a =
+            EncodedGenesisSeal::try_from(&seal_at(generation_a)).expect("seal a encodes");
         let identity_b = generation_b;
-        let planted = FrozenBytes::try_from(candidate_a.as_slice().to_vec())
-            .expect("encoded seal body freezes");
+        let planted =
+            PutBody::try_from(candidate_a.bytes().clone()).expect("encoded seal body freezes");
         adapter
             .create_if_absent(&object_key(SealKey::from(identity_b)), planted)
             .await

@@ -566,19 +566,42 @@ returns retryable load shedding.
 Once submitted, client cancellation only drops the response waiter. It does
 not cancel a fact that may become durable.
 
-### pure admission
+### pure writer machine
 
-The writer shell owns I/O. Pure protocol state lives in `WriterState`. The
-shell decides requests in queue order through that state:
+`strom-storage-protocol` owns a synchronous `WriterMachine`. It cannot name the
+object-store adapter or the typed stores. Commands, ingress closure, and exact
+effect completions enter through one seam:
 
 ```rust
-fn admit(&mut self, command: CommandEnvelope) -> AdmissionDecision;
-
-enum AdmissionDecision {
-    Settled(Completion),
-    Queued,
-}
+fn handle(&mut self, event: WriterEvent) -> WriterStep;
 ```
+
+One step contains a bounded, totally ordered list of completion-producing
+effects and immediate actions, plus an optional exit. The engine's writer task
+is a thin interpreter: it executes outputs in order, runs effects in a keyed
+`JoinMap`, and returns each completion as a new event. The machine is the only
+record of WAL, checkpoint, and collector occupancy; the interpreter owns no
+mirrored protocol state.
+
+Before selecting ingress or completions, the interpreter feeds the machine
+one `Started` event. This schedules checkpoint work already due in recovered
+state even when no client command arrives; a second startup event is a
+protocol violation.
+
+```text
+command or exact effect completion
+  -> WriterMachine::handle
+  -> [PublishView | SendReplies | CancelPreparation | typed-store effect]
+  -> interpreter executes in list order
+  -> effect completion becomes the next WriterEvent
+```
+
+The writer protocol uses no timers. Its progress is self-clocking: only a
+matching completion releases an effect budget and can issue its successor.
+Protocol schedules are therefore tested as synchronous event scripts without
+storage, tasks, sleeps, or ambient time.
+
+Within the machine, admission still decides requests in ingress order.
 
 Accepted effects enter the admitted forest immediately, allowing a later
 request to observe earlier accepted pending work. They remain unreadable and
@@ -600,8 +623,10 @@ zero or one immutable WAL create in flight. While one PUT is pending, later
 requests accumulate in the next run; there is no batching timer required for
 group commit.
 
-The active flight owns its batch, owner, exact canonical bytes, facts, payload,
-waiters, and create future. It is never re-encoded after an ambiguous send.
+The machine's active flight owns its batch, proven post-run forest, and waiters. Its effect owns
+an `EncodedWal` from `strom-storage-domain`: partition, batch, and immutable
+canonical bytes agree by construction. It is never re-encoded after an
+ambiguous send.
 
 WAL completion is handled before more ingress because it releases the flight
 slot and waiting callers.
@@ -712,21 +737,25 @@ every successfully read coordinate.
 
 ## published and resident state
 
-One `WriterState` owns the three logical moments of writer progress. Combining
+One `WriterMachine` owns the three logical moments of writer progress. Combining
 them in the published contract would either expose pending work or make
 dependent admission incorrect:
 
 ```text
-WriterState
+WriterMachine
   admitted   durable + in-flight + pending effects; admission decisions only
   durable    newest Seal + proven WAL effects
   base       Seal forest at the last installed checkpoint
+  flight     zero or one issued WAL effect
+  checkpoint zero or one Preparing | Cancelling | Publishing marker
+  collector  zero or one issued collection cut
 
 PublishedView   immutable reader contract; durable forest only
 ```
 
-The shell publishes a `PublishedView` after it records WAL durability or
-installs a checkpoint. Readers never see admitted-only work.
+The machine emits `PublishView` before `SendReplies` after WAL durability, and
+emits `PublishView` after an authored checkpoint installs. The interpreter
+executes that order directly. Readers never see admitted-only work.
 
 The current published view is:
 

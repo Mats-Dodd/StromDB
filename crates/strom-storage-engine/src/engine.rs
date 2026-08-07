@@ -12,12 +12,12 @@ use strom_object_store::ObjectStoreAdapter;
 use strom_storage_domain::{
     DirectoryEntry, DirectoryKey, PartitionId, WRITER_INGRESS_COMMANDS_MAX,
 };
+use strom_storage_protocol::{AdmissionRefusal, CommandEnvelope, CreateStream, Forest, WriterExit};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::bootstrap::{BootstrapExit, bootstrap};
-use crate::forest::Forest;
-use crate::writer::{AdmissionRefusal, CommandEnvelope, CreateStream, WriterExit, spawn_writer};
+use crate::writer::spawn_writer;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PublishedView {
@@ -27,10 +27,6 @@ pub(crate) struct PublishedView {
 impl PublishedView {
     pub(crate) const fn new(forest: Forest) -> Self {
         Self { forest }
-    }
-
-    pub(crate) const fn forest(&self) -> &Forest {
-        &self.forest
     }
 
     fn stream(&self, id: &StreamId) -> StreamStatus {

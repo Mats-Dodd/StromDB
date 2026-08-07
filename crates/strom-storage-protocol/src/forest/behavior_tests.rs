@@ -1,4 +1,4 @@
-//! Behavioral claims for the private forest fold.
+//! Behavioral claims for the resident forest fold.
 
 use proptest::prelude::*;
 use strom_domain::{ExpiryPolicy, StreamContentType, StreamId, StreamLifecycle};

@@ -51,7 +51,7 @@ Extract a pure `WriterState` module. The writer task keeps I/O only.
 
 ### Decisions taken (and the tradeoffs behind them)
 
-1. **Middle cut.** `WriterState` owns the forests, the pending queue, the
+1. **Superseded by `refactor3.md`: middle cut.** `WriterState` owns the forests, the pending queue, the
    in-flight marker, and the checkpoint accounting, behind ~6 methods. We
    rejected the shallow cut (forests + admission gates only) because it
    leaves the call-site protocol — the bug habitat — in the shell. We
@@ -59,7 +59,10 @@ Extract a pure `WriterState` module. The writer task keeps I/O only.
    the writer has only three event sources today and the enum funnel costs
    legibility. If the writer grows more event sources (reads, subscriptions,
    timers), collapse the methods into `step` then; the middle cut keeps that
-   move cheap.
+   move cheap. The concrete shell/state mirroring, untested interleavings, and
+   shared checkpoint publication gate later justified completing that move.
+   `refactor3.md` replaces this seam with the pure
+   `WriterMachine::handle(Event) -> WriterStep` boundary.
 2. **Superseded: evidence classification stays in the shell.** `complete_flight`'s
    Direct/DurableMatch/NotOurs/Unresolved table performs a reconcile read
    (I/O), never touches the forests, and has strong integration coverage

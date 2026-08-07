@@ -1,0 +1,22 @@
+[package]
+name = "strom-storage-protocol"
+description = "Pure writer correctness protocol and resident forest for StromDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+imbl = { workspace = true }
+strom-domain = { path = "../strom-domain", version = "0.1.0" }
+strom-storage-domain = { path = "../strom-storage-domain", version = "0.1.0" }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+strom-domain = { path = "../strom-domain", version = "0.1.0", features = ["proptest"] }
+strom-storage-domain = { path = "../strom-storage-domain", version = "0.1.0", features = ["proptest"] }
+
+[lints]
+workspace = true

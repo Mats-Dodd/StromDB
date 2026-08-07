@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bytes = { workspace = true }
 futures = { workspace = true }
 imbl = { workspace = true }
 object_store = { workspace = true }
@@ -15,14 +16,17 @@ strom-common = { path = "../strom-common", version = "0.1.0" }
 strom-domain = { path = "../strom-domain", version = "0.1.0" }
 strom-object-store = { path = "../strom-object-store", version = "0.1.0" }
 strom-storage-domain = { path = "../strom-storage-domain", version = "0.1.0" }
+strom-storage-protocol = { path = "../strom-storage-protocol", version = "0.1.0" }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+tokio-util = { workspace = true, features = ["join-map"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
 strom-domain = { path = "../strom-domain", version = "0.1.0", features = ["proptest"] }
 strom-object-store = { path = "../strom-object-store", version = "0.1.0", features = ["test-support"] }
 strom-storage-domain = { path = "../strom-storage-domain", version = "0.1.0", features = ["proptest"] }
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

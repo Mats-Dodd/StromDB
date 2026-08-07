@@ -8,44 +8,25 @@ use std::fmt;
 
 use strom_object_store::{KeysBound, ObjectKey, PUT_BYTES_MAX, StoreError};
 use strom_storage_domain::{SEAL_ENCODED_BYTES_MAX, WAL_ENCODED_BYTES_MAX};
+pub(crate) use strom_storage_protocol::{SealPublication, TypedStoreError, WalEstablishment};
 
-pub(crate) use seal::{
-    EncodedAuthoritySeal, EncodedGenesisSeal, GenesisEstablishment, SealPublication, SealStore,
-};
-pub(crate) use table::{
-    EncodedTable, TableEstablishment, TableRows, TableStore, targeted_table_deletes,
-};
-pub(crate) use wal::{EncodedWal, WalEstablishment, WalStore};
+pub(crate) use seal::{GenesisEstablishment, SealStore};
+pub(crate) use table::{TableEstablishment, TableStore, targeted_table_deletes};
+pub(crate) use wal::WalStore;
 
-/// Failures of typed store operations, shaped for writer and bootstrap exits.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum TypedStoreError {
-    /// Transport trouble; a bounded retry of the same idempotent request is legal.
-    #[error("retryable store failure: {detail}")]
-    Retryable { detail: String },
-    /// The backend refused the request definitively; retrying cannot help.
-    #[error("store rejected the request: {detail}")]
-    Rejected { detail: String },
-    /// Durable bytes violate the storage model. The caller fails closed.
-    #[error("store durable contradiction: {detail}")]
-    Contradiction { detail: String },
+fn typed_store_error(error: StoreError) -> TypedStoreError {
+    match error {
+        StoreError::Retryable { detail } => TypedStoreError::Retryable { detail },
+        StoreError::Rejected { detail } => TypedStoreError::Rejected { detail },
+        StoreError::Contradiction(contradiction) => TypedStoreError::Contradiction {
+            detail: contradiction.to_string(),
+        },
+    }
 }
 
-impl TypedStoreError {
-    fn from_store(error: StoreError) -> Self {
-        match error {
-            StoreError::Retryable { detail } => Self::Retryable { detail },
-            StoreError::Rejected { detail } => Self::Rejected { detail },
-            StoreError::Contradiction(contradiction) => Self::Contradiction {
-                detail: contradiction.to_string(),
-            },
-        }
-    }
-
-    fn contradiction(detail: impl Into<String>) -> Self {
-        Self::Contradiction {
-            detail: detail.into(),
-        }
+fn typed_store_contradiction(detail: impl Into<String>) -> TypedStoreError {
+    TypedStoreError::Contradiction {
+        detail: detail.into(),
     }
 }
 

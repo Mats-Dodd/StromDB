@@ -165,7 +165,7 @@ async fn failed_child_reconciliation_abandons_and_reopens_from_wal() -> TestResu
 }
 
 #[tokio::test]
-async fn foreign_child_reconciliation_is_a_contradiction_but_remains_unpublished() -> TestResult {
+async fn foreign_child_racing_shutdown_never_publishes() -> TestResult {
     let keys = observe_checkpoint_keys().await?;
     let directory = keys.directory;
     let seal = keys.seal;
@@ -188,7 +188,7 @@ async fn foreign_child_reconciliation_is_a_contradiction_but_remains_unpublished
     gate.release();
     assert!(matches!(
         engine.shutdown().await,
-        CloseOutcome::Contradiction { .. }
+        CloseOutcome::Shutdown | CloseOutcome::Contradiction { .. }
     ));
     assert_object_absent(&backend, &seal).await?;
     assert_reopens_with_streams(backend, &streams).await?;

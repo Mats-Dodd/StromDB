@@ -934,7 +934,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::{ByteBound, CreateEvidence, FrozenBytes, ObjectStoreAdapter};
+    use crate::{ByteBound, CreateEvidence, ObjectStoreAdapter, PutBody};
 
     #[test]
     fn overlapping_faults_fail_during_configuration() {
@@ -961,8 +961,8 @@ mod tests {
         raw.parse().expect("test key is canonical")
     }
 
-    fn body(raw: &[u8]) -> FrozenBytes {
-        FrozenBytes::try_from(raw.to_vec()).expect("test body is legal")
+    fn body(raw: &[u8]) -> PutBody {
+        PutBody::try_from(raw.to_vec()).expect("test body is legal")
     }
 
     fn read_bound() -> ByteBound {

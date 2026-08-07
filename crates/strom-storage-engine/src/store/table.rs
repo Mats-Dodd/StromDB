@@ -1,52 +1,13 @@
 //! Typed SST store for checkpoint children and Seal-selected tables.
 
 use std::collections::BTreeSet;
-use std::num::NonZeroU64;
-
-use strom_object_store::{ByteBound, CreateEvidence, FrozenBytes, ObjectStoreAdapter};
+use strom_object_store::{ByteBound, CreateEvidence, ObjectStoreAdapter, PutBody};
 use strom_storage_domain::{
-    DirectoryEntry, DirectoryKey, LedgerCell, PartitionId, Seal, StoreKind, StreamUid, TableKey,
-    TableObjectId, TableRef, decode_directory_sst, decode_ledger_sst,
+    DecodedTable, EncodedTable, PartitionId, Seal, StoreKind, TableKey, TableObjectId, TableRef,
+    decode_directory_sst, decode_ledger_sst,
 };
 
-use super::{TypedStoreError, object_key};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum TableRows {
-    Directory(Vec<(DirectoryKey, DirectoryEntry)>),
-    Ledger(Vec<(StreamUid, LedgerCell)>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EncodedTable {
-    key: TableKey,
-    table: TableRef,
-    bytes: FrozenBytes,
-}
-
-impl EncodedTable {
-    pub(crate) fn new(key: TableKey, bytes: Vec<u8>) -> Self {
-        let object_bytes = u64::try_from(bytes.len())
-            .ok()
-            .and_then(NonZeroU64::new)
-            .expect("an encoded SST has a nonzero length representable by u64");
-        let table = TableRef::new(key.object(), object_bytes)
-            .expect("the SST encoder enforces the hard object bound");
-        let bytes = FrozenBytes::try_from(bytes)
-            .expect("an encoded SST is nonempty and fits the adapter PUT bound");
-        Self { key, table, bytes }
-    }
-
-    #[must_use]
-    pub(crate) const fn table(&self) -> TableRef {
-        self.table
-    }
-
-    #[must_use]
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        self.bytes.as_slice()
-    }
-}
+use super::{TypedStoreError, object_key, typed_store_contradiction, typed_store_error};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateTableEvidence {
@@ -112,27 +73,31 @@ impl TableStore {
         &self,
         candidate: &EncodedTable,
     ) -> Result<CreateEvidence, TypedStoreError> {
-        let key = object_key(candidate.key);
+        let key = object_key(candidate.key());
         self.adapter
-            .create_if_absent(&key, candidate.bytes.clone())
+            .create_if_absent(
+                &key,
+                PutBody::try_from(candidate.bytes().clone())
+                    .expect("an encoded SST fits the adapter PUT bound"),
+            )
             .await
-            .map_err(TypedStoreError::from_store)
+            .map_err(typed_store_error)
     }
 
     async fn reconcile_table(
         &self,
         candidate: &EncodedTable,
     ) -> Result<CandidateTableEvidence, TypedStoreError> {
-        let key = object_key(candidate.key);
-        let bound = ByteBound::try_from(candidate.table.object_bytes().get())
+        let key = object_key(candidate.key());
+        let bound = ByteBound::try_from(candidate.table().object_bytes().get())
             .expect("a TableRef carries a nonzero in-bound object length");
         let observed = self
             .adapter
             .read(&key, bound)
             .await
-            .map_err(TypedStoreError::from_store)?;
+            .map_err(typed_store_error)?;
         Ok(match observed {
-            Some(observed) if observed.body() == candidate.as_slice() => {
+            Some(observed) if observed.body() == candidate.bytes().as_ref() => {
                 CandidateTableEvidence::Match
             }
             Some(_foreign) => CandidateTableEvidence::Foreign,
@@ -148,14 +113,14 @@ impl TableStore {
         self.adapter
             .delete_idempotent(&key)
             .await
-            .map_err(TypedStoreError::from_store)
+            .map_err(typed_store_error)
     }
 
     pub(crate) async fn read_table(
         &self,
         partition: PartitionId,
         table: &TableRef,
-    ) -> Result<TableRows, TypedStoreError> {
+    ) -> Result<DecodedTable, TypedStoreError> {
         let key = TableKey::new(table.object());
         let object_key = object_key(key);
         let bound = ByteBound::try_from(table.object_bytes().get())
@@ -164,15 +129,15 @@ impl TableStore {
             .adapter
             .read(&object_key, bound)
             .await
-            .map_err(TypedStoreError::from_store)?
+            .map_err(typed_store_error)?
         else {
-            return Err(TypedStoreError::contradiction(format!(
+            return Err(typed_store_contradiction(format!(
                 "Seal-selected table {key} is absent"
             )));
         };
         let bytes_actual = u64::try_from(observed.body().len()).unwrap_or(u64::MAX);
         if bytes_actual != table.object_bytes().get() {
-            return Err(TypedStoreError::contradiction(format!(
+            return Err(typed_store_contradiction(format!(
                 "table {key} has {bytes_actual} bytes; its Seal records {}",
                 table.object_bytes()
             )));
@@ -180,20 +145,20 @@ impl TableStore {
 
         match table.object().store() {
             StoreKind::Directory => decode_directory_sst(partition, &key, observed.body())
-                .map(TableRows::Directory)
+                .map(DecodedTable::Directory)
                 .map_err(|source| {
-                    TypedStoreError::contradiction(format!(
+                    typed_store_contradiction(format!(
                         "Directory table {key} failed checked decode: {source}"
                     ))
                 }),
             StoreKind::Ledger => decode_ledger_sst(partition, &key, observed.body())
-                .map(TableRows::Ledger)
+                .map(DecodedTable::Ledger)
                 .map_err(|source| {
-                    TypedStoreError::contradiction(format!(
+                    typed_store_contradiction(format!(
                         "Ledger table {key} failed checked decode: {source}"
                     ))
                 }),
-            StoreKind::Tally | StoreKind::Annals => Err(TypedStoreError::contradiction(format!(
+            StoreKind::Tally | StoreKind::Annals => Err(typed_store_contradiction(format!(
                 "table {key} names a store with no resident decoder"
             ))),
         }
@@ -244,10 +209,11 @@ mod tests {
     use object_store::{ObjectStoreExt as _, PutPayload};
     use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
     use strom_object_store::test_support::{BackendFailure, Fault, FaultStore, Selection, Target};
-    use strom_object_store::{CreateEvidence, FrozenBytes};
+    use strom_object_store::{CreateEvidence, PutBody};
     use strom_storage_domain::{
-        AttemptId, FreshIdentity, SealGeneration, StreamRecord, StreamUid, TableObjectId,
-        encode_directory_sst, encode_ledger_sst,
+        AttemptId, DecodedTable, DirectoryEntry, DirectoryKey, EncodedTable, FreshIdentity,
+        LedgerCell, SealGeneration, StreamRecord, StreamUid, TableObjectId, encode_directory_sst,
+        encode_ledger_sst,
     };
 
     use super::*;
@@ -256,7 +222,7 @@ mod tests {
     async fn table_establishment_decides_direct_match_and_foreign_evidence() {
         let adapter = ObjectStoreAdapter::in_memory();
         let store = TableStore::new(adapter);
-        let candidate = candidate_table(vec![1]);
+        let candidate = candidate_table(&[1]);
         assert_eq!(
             TableEstablishment::Established,
             store.establish_table(&candidate).await,
@@ -267,7 +233,7 @@ mod tests {
             store.establish_table(&candidate).await,
             "matching durable content establishes the table"
         );
-        let foreign = candidate_table(vec![2]);
+        let foreign = candidate_table(&[2]);
         assert!(
             matches!(
                 store.establish_table(&foreign).await,
@@ -280,8 +246,8 @@ mod tests {
     #[tokio::test]
     async fn unresolved_table_establishment_reconciles_match_foreign_and_absence()
     -> Result<(), Box<dyn std::error::Error>> {
-        let candidate = candidate_table(vec![1]);
-        let key = object_key(candidate.key);
+        let candidate = candidate_table(&[1]);
+        let key = object_key(candidate.key());
         let matching_fault = FaultStore::new().inject(Fault::CreateThenLoseResponse {
             target: Target::Key(key.clone()),
         })?;
@@ -323,8 +289,8 @@ mod tests {
     #[tokio::test]
     async fn table_store_failures_map_to_abandon_or_contradiction()
     -> Result<(), Box<dyn std::error::Error>> {
-        let candidate = candidate_table(vec![1]);
-        let key = object_key(candidate.key);
+        let candidate = candidate_table(&[1]);
+        let key = object_key(candidate.key());
         for failure in [
             BackendFailure::PermissionDenied,
             BackendFailure::Unauthenticated,
@@ -389,7 +355,7 @@ mod tests {
 
         assert_eq!(
             store.read_table(partition(), &table).await?,
-            TableRows::Directory(rows),
+            DecodedTable::Directory(rows),
             "the typed store selects the Directory decoder and exact identity"
         );
         Ok(())
@@ -414,7 +380,7 @@ mod tests {
         plant(&adapter, key, bytes).await?;
 
         assert_eq!(
-            TableRows::Ledger(rows),
+            DecodedTable::Ledger(rows),
             store.read_table(partition(), &table).await?
         );
         Ok(())
@@ -527,7 +493,7 @@ mod tests {
         bytes: Vec<u8>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let evidence = adapter
-            .create_if_absent(&object_key(key), FrozenBytes::try_from(bytes)?)
+            .create_if_absent(&object_key(key), PutBody::try_from(bytes)?)
             .await?;
         assert_eq!(CreateEvidence::Direct, evidence);
         Ok(())
@@ -541,11 +507,33 @@ mod tests {
         )?)
     }
 
-    fn candidate_table(bytes: Vec<u8>) -> EncodedTable {
-        EncodedTable::new(
+    fn candidate_table(bytes: &[u8]) -> EncodedTable {
+        let marker = bytes
+            .first()
+            .copied()
+            .expect("the fixture marker is nonempty");
+        let path = directory_key(&format!("events/{marker}"))
+            .expect("the fixture path is a valid Directory key");
+        let rows = [(
+            path,
+            DirectoryEntry::Live(StreamUid::try_from(1).expect("one is nonzero")),
+        )];
+        EncodedTable::encode_directory(
+            partition(),
             table_key(StoreKind::Directory).expect("test table identity is valid"),
-            bytes,
+            &rows,
         )
+        .expect("the fixture table encodes")
+    }
+
+    fn directory_key(raw: &str) -> Result<DirectoryKey, Box<dyn std::error::Error>> {
+        Ok(DirectoryKey::try_from(Box::<[u8]>::from(raw.as_bytes()))?)
+    }
+
+    fn partition() -> PartitionId {
+        "00112233-4455-6677-8899-aabbccddeeff"
+            .parse()
+            .expect("test partition is canonical")
     }
 
     fn table_key(store: StoreKind) -> Result<TableKey, Box<dyn std::error::Error>> {
@@ -560,15 +548,5 @@ mod tests {
         let birth = owner.successor()?;
         let fresh = FreshIdentity::new(birth, AttemptId::new(owner, 7), ordinal)?;
         Ok(TableKey::new(TableObjectId::new(fresh, store)))
-    }
-
-    fn directory_key(raw: &str) -> Result<DirectoryKey, Box<dyn std::error::Error>> {
-        Ok(DirectoryKey::try_from(Box::<[u8]>::from(raw.as_bytes()))?)
-    }
-
-    fn partition() -> PartitionId {
-        "00112233-4455-6677-8899-aabbccddeeff"
-            .parse()
-            .expect("test partition is canonical")
     }
 }

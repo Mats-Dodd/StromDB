@@ -1,19 +1,15 @@
-//! Byte-plane vocabulary: frozen candidate bodies, read bounds, and validators.
+//! Byte-plane vocabulary: PUT bodies, read bounds, and validators.
 
 use std::fmt;
 use std::num::NonZeroU64;
 
 use crate::bounds::PUT_BYTES_MAX;
 
-/// An immutable, bounded object body, encoded exactly once.
-///
-/// Authority-bearing candidates are sent once and never re-encoded after an
-/// ambiguous response; freezing the bytes at construction is what makes the
-/// later byte-compare reconciliation sound.
+/// An immutable, non-empty object body accepted by the adapter's PUT seam.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FrozenBytes(bytes::Bytes);
+pub struct PutBody(bytes::Bytes);
 
-impl FrozenBytes {
+impl PutBody {
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
         &self.0
@@ -34,27 +30,35 @@ impl FrozenBytes {
     }
 }
 
-impl TryFrom<Vec<u8>> for FrozenBytes {
-    type Error = FrozenBytesError;
+impl TryFrom<bytes::Bytes> for PutBody {
+    type Error = PutBodyError;
 
-    fn try_from(raw: Vec<u8>) -> Result<Self, Self::Error> {
+    fn try_from(raw: bytes::Bytes) -> Result<Self, Self::Error> {
         if raw.is_empty() {
-            return Err(FrozenBytesError::Empty);
+            return Err(PutBodyError::Empty);
         }
         // A usize wider than u64 cannot occur on supported targets; saturating
         // keeps the impossible branch on the rejecting side.
         let bytes_actual = u64::try_from(raw.len()).unwrap_or(u64::MAX);
         if bytes_actual > PUT_BYTES_MAX {
-            return Err(FrozenBytesError::OverPutBound { bytes_actual });
+            return Err(PutBodyError::OverPutBound { bytes_actual });
         }
-        Ok(Self(bytes::Bytes::from(raw)))
+        Ok(Self(raw))
     }
 }
 
-/// Why a raw body cannot become a durable object candidate.
+impl TryFrom<Vec<u8>> for PutBody {
+    type Error = PutBodyError;
+
+    fn try_from(raw: Vec<u8>) -> Result<Self, Self::Error> {
+        Self::try_from(bytes::Bytes::from(raw))
+    }
+}
+
+/// Why opaque bytes cannot become an adapter PUT body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum FrozenBytesError {
-    /// Every typed durable object has a non-empty body.
+pub enum PutBodyError {
+    /// Every adapter PUT has a non-empty body.
     #[error("object body is empty")]
     Empty,
     #[error("object body is {bytes_actual} bytes; the bound is {PUT_BYTES_MAX}")]
@@ -125,8 +129,8 @@ mod tests {
     #[test]
     fn empty_bodies_and_zero_bounds_are_rejected() {
         assert_eq!(
-            Err(FrozenBytesError::Empty),
-            FrozenBytes::try_from(Vec::new()),
+            Err(PutBodyError::Empty),
+            PutBody::try_from(Vec::new()),
             "empty body is illegal"
         );
         assert_eq!(

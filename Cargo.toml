@@ -6,6 +6,7 @@ members = [
     "crates/strom-object-store",
     "crates/strom-server",
     "crates/strom-storage-domain",
+    "crates/strom-storage-protocol",
     "crates/strom-storage-engine",
     "crates/strom-db",
 ]
@@ -38,7 +39,8 @@ secretspec = { version = "0.18", default-features = false, features = ["keyring"
 secretspec-derive = "0.18"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tokio = { version = "1", features = ["time"] }
+tokio = "1"
+tokio-util = "0.7"
 tower = "0.5"
 tower-http = "0.6"
 tracing = "0.1"

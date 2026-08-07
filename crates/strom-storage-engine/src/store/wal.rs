@@ -4,68 +4,24 @@
 use std::str::FromStr as _;
 
 use strom_object_store::{
-    ByteBound, CreateEvidence, Etag, FrozenBytes, ListPageRequest, ObjectStoreAdapter,
+    ByteBound, CreateEvidence, Etag, ListPageRequest, ObjectStoreAdapter, PutBody,
 };
 use strom_storage_domain::{
-    BatchId, EncodeError, PartitionId, WAL_ENCODED_BYTES_MAX, WalBody, WalKey, WalNamespace,
-    WalObject, decode_wal, encode_wal,
+    BatchId, EncodedWal, PartitionId, WAL_ENCODED_BYTES_MAX, WalBody, WalKey, WalNamespace,
+    WalObject, decode_wal,
 };
 
-use super::{TypedStoreError, newest_keys_bound, object_key};
-
-/// One WAL candidate, encoded exactly once. Key and body agree by construction.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EncodedWal {
-    partition: PartitionId,
-    batch: BatchId,
-    bytes: FrozenBytes,
-}
-
-impl EncodedWal {
-    /// Encode `object` once and freeze the exact bytes that will be sent.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EncodeError`] when serialization fails or the archive exceeds
-    /// [`WAL_ENCODED_BYTES_MAX`].
-    pub(crate) fn new(object: &WalObject) -> Result<Self, EncodeError> {
-        let bytes = encode_wal(object)?;
-        Ok(Self::from_encoded(
-            object.partition(),
-            object.batch(),
-            bytes,
-        ))
-    }
-
-    fn from_encoded(partition: PartitionId, batch: BatchId, bytes: Vec<u8>) -> Self {
-        let frozen = FrozenBytes::try_from(bytes)
-            .expect("encode_wal yields a non-empty body within PUT_BYTES_MAX");
-        Self {
-            partition,
-            batch,
-            bytes: frozen,
-        }
-    }
-
-    #[must_use]
-    pub(crate) const fn batch(&self) -> BatchId {
-        self.batch
-    }
-
-    /// Exact frozen bytes of this candidate. After an ambiguous create, reconcile
-    /// with one bounded GET compared against these bytes—never re-encode.
-    #[must_use]
-    fn as_slice(&self) -> &[u8] {
-        self.bytes.as_slice()
-    }
-}
+use super::{
+    TypedStoreError, WalEstablishment, newest_keys_bound, object_key, typed_store_contradiction,
+    typed_store_error,
+};
 
 /// One decoded WAL object plus the exact validator that observed it.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ObservedWal {
     object: WalObject,
     validator: Etag,
-    bytes: FrozenBytes,
+    bytes: PutBody,
 }
 
 impl ObservedWal {
@@ -142,13 +98,6 @@ pub(crate) struct WalStore {
     adapter: ObjectStoreAdapter,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WalEstablishment {
-    Durable,
-    Occupied,
-    UnresolvedAbsent,
-}
-
 impl WalStore {
     #[must_use]
     pub(crate) const fn new(adapter: ObjectStoreAdapter) -> Self {
@@ -170,8 +119,11 @@ impl WalStore {
             CreateEvidence::Direct | CreateEvidence::DurableMatch => Ok(WalEstablishment::Durable),
             CreateEvidence::NotOurs => Ok(WalEstablishment::Occupied),
             CreateEvidence::Unresolved => {
-                match self.read_wal(candidate.partition, candidate.batch).await? {
-                    Some(observed) if observed.as_slice() == candidate.as_slice() => {
+                match self
+                    .read_wal(candidate.partition(), candidate.batch())
+                    .await?
+                {
+                    Some(observed) if observed.as_slice() == candidate.bytes().as_ref() => {
                         Ok(WalEstablishment::Durable)
                     }
                     Some(_foreign) => Ok(WalEstablishment::Occupied),
@@ -182,11 +134,15 @@ impl WalStore {
     }
 
     async fn create_wal(&self, candidate: &EncodedWal) -> Result<CreateEvidence, TypedStoreError> {
-        let key = object_key(WalKey::from(candidate.batch));
+        let key = object_key(WalKey::from(candidate.batch()));
         self.adapter
-            .create_if_absent(&key, candidate.bytes.clone())
+            .create_if_absent(
+                &key,
+                PutBody::try_from(candidate.bytes().clone())
+                    .expect("an encoded WAL fits the adapter PUT bound"),
+            )
             .await
-            .map_err(TypedStoreError::from_store)
+            .map_err(typed_store_error)
     }
 
     /// Newest surviving batch via one ascending list page with `keys_max = 1`.
@@ -204,12 +160,12 @@ impl WalStore {
                 keys_max: newest_keys_bound(),
             })
             .await
-            .map_err(TypedStoreError::from_store)?;
+            .map_err(typed_store_error)?;
         let Some(listed) = page.keys().first() else {
             return Ok(None);
         };
         let key = WalKey::from_str(listed.as_str()).map_err(|source| {
-            TypedStoreError::contradiction(format!(
+            typed_store_contradiction(format!(
                 "listed key {listed} under the WAL namespace is not a WAL key: {source}"
             ))
         })?;
@@ -233,23 +189,24 @@ impl WalStore {
             .adapter
             .read(&key, bound)
             .await
-            .map_err(TypedStoreError::from_store)?
+            .map_err(typed_store_error)?
         else {
             return Ok(None);
         };
         let object = decode_wal(partition, batch, observed.body()).map_err(|source| {
-            TypedStoreError::contradiction(format!(
+            typed_store_contradiction(format!(
                 "WAL body at {key} failed checked decode for {partition}/{batch:?}: {source}"
             ))
         })?;
-        let bytes = FrozenBytes::try_from(observed.body().to_vec()).map_err(|source| {
-            TypedStoreError::contradiction(format!(
+        let (body, validator) = observed.into_parts();
+        let bytes = PutBody::try_from(body).map_err(|source| {
+            typed_store_contradiction(format!(
                 "decoded WAL body at {key} cannot be retained for exact reconciliation: {source}"
             ))
         })?;
         Ok(Some(ObservedWal {
             object,
-            validator: observed.etag().clone(),
+            validator,
             bytes,
         }))
     }
@@ -281,7 +238,7 @@ impl WalStore {
         self.adapter
             .delete_idempotent(&key)
             .await
-            .map_err(TypedStoreError::from_store)
+            .map_err(typed_store_error)
     }
 }
 
@@ -359,7 +316,7 @@ mod tests {
         foreign_backend
             .put(
                 &Path::from(key.as_str()),
-                PutPayload::from(foreign.as_slice().to_vec()),
+                PutPayload::from(foreign.bytes().to_vec()),
             )
             .await?;
         let foreign_store = WalStore::new(ObjectStoreAdapter::new(foreign_backend));
@@ -446,7 +403,7 @@ mod tests {
         let batch = batch(1);
         let key = object_key(WalKey::from(batch));
         let garbage =
-            FrozenBytes::try_from(b"garbage-wal-body".to_vec()).expect("garbage body freezes");
+            PutBody::try_from(b"garbage-wal-body".to_vec()).expect("garbage body freezes");
         adapter
             .create_if_absent(&key, garbage)
             .await
@@ -492,7 +449,7 @@ mod tests {
         // `-` sorts before digits, so MaxKeys=1 surfaces this before any WAL key.
         let garbage_key = ObjectKey::try_from(format!("{WalNamespace}/-garbage"))
             .expect("garbage key is a legal ObjectKey");
-        let body = FrozenBytes::try_from(b"foreign".to_vec()).expect("body freezes");
+        let body = PutBody::try_from(b"foreign".to_vec()).expect("body freezes");
         adapter
             .create_if_absent(&garbage_key, body)
             .await
@@ -513,8 +470,8 @@ mod tests {
         let batch_a = batch(1);
         let batch_b = batch(2);
         let candidate_a = EncodedWal::new(&run_at(batch_a)).expect("wal a encodes");
-        let planted = FrozenBytes::try_from(candidate_a.as_slice().to_vec())
-            .expect("encoded wal body freezes");
+        let planted =
+            PutBody::try_from(candidate_a.bytes().clone()).expect("encoded wal body freezes");
         adapter
             .create_if_absent(&object_key(WalKey::from(batch_b)), planted)
             .await

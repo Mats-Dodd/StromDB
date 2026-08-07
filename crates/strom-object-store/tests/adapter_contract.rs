@@ -7,8 +7,8 @@ use strom_object_store::test_support::{
     BackendFailure, Fault, FaultStore, Operation, Selection, Target,
 };
 use strom_object_store::{
-    ByteBound, CreateEvidence, FrozenBytes, KeysBound, ListPageRequest, ObjectKey,
-    ObjectStoreAdapter, StoreContradiction, StoreError,
+    ByteBound, CreateEvidence, KeysBound, ListPageRequest, ObjectKey, ObjectStoreAdapter, PutBody,
+    StoreContradiction, StoreError,
 };
 
 fn page_request(
@@ -27,8 +27,8 @@ fn key(raw: &str) -> ObjectKey {
     raw.parse().expect("test keys are canonical")
 }
 
-fn body(raw: &[u8]) -> FrozenBytes {
-    FrozenBytes::try_from(raw.to_vec()).expect("test bodies are non-empty and bounded")
+fn body(raw: &[u8]) -> PutBody {
+    PutBody::try_from(raw.to_vec()).expect("test bodies are non-empty and bounded")
 }
 
 const READ_BYTES_MAX: u64 = 1024;

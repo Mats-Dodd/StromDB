@@ -1175,6 +1175,12 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
+version = "0.15.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
+
+[[package]]
+name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
@@ -1492,7 +1498,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
- "hashbrown",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -2620,7 +2626,7 @@ checksum = "d9776093b7ca170454ab1406954f7b7d97a57c51dc6c0642957fb2ef25c2d399"
 dependencies = [
  "bytecheck",
  "bytes",
- "hashbrown",
+ "hashbrown 0.17.1",
  "indexmap",
  "munge",
  "ptr_meta",
@@ -3211,6 +3217,7 @@ dependencies = [
 name = "strom-storage-domain"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "proptest",
  "rkyv",
  "strom-domain",
@@ -3221,6 +3228,7 @@ dependencies = [
 name = "strom-storage-engine"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures",
  "imbl",
  "object_store",
@@ -3229,6 +3237,20 @@ dependencies = [
  "strom-common",
  "strom-domain",
  "strom-object-store",
+ "strom-storage-domain",
+ "strom-storage-protocol",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "strom-storage-protocol"
+version = "0.1.0"
+dependencies = [
+ "imbl",
+ "proptest",
+ "strom-domain",
  "strom-storage-domain",
  "thiserror",
  "tokio",
@@ -3442,6 +3464,8 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
+ "hashbrown 0.15.5",
  "libc",
  "pin-project-lite",
  "tokio",

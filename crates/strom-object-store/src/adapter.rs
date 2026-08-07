@@ -11,7 +11,7 @@ use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::{GetOptions, ObjectStore, ObjectStoreExt as _, PutMode, PutOptions, PutPayload};
 
-use crate::bytes::{ByteBound, Etag, FrozenBytes};
+use crate::bytes::{ByteBound, Etag, PutBody};
 use crate::error::{StoreContradiction, StoreError};
 use crate::evidence::{CreateEvidence, ListPage, ListPageRequest, RawObject};
 use crate::key::ObjectKey;
@@ -57,7 +57,7 @@ impl ObjectStoreAdapter {
     pub async fn create_if_absent(
         &self,
         key: &ObjectKey,
-        candidate: FrozenBytes,
+        candidate: PutBody,
     ) -> Result<CreateEvidence, StoreError> {
         let location = key.to_store_path();
         let payload = PutPayload::from(candidate.clone_body());
@@ -180,7 +180,7 @@ impl ObjectStoreAdapter {
     }
 
     /// One bounded read plus byte compare against an occupied coordinate.
-    async fn compare_occupant(&self, location: &Path, candidate: &FrozenBytes) -> CreateEvidence {
+    async fn compare_occupant(&self, location: &Path, candidate: &PutBody) -> CreateEvidence {
         let candidate_size =
             u64::try_from(candidate.len()).expect("usize fits in u64 on supported platforms");
         match self.store.get_opts(location, GetOptions::default()).await {

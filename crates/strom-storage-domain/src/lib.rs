@@ -2,6 +2,7 @@
 
 mod archive;
 mod bounds;
+mod candidate;
 mod coordinate;
 mod directory;
 mod ledger;
@@ -25,6 +26,10 @@ pub use bounds::{
     SEAL_ENCODED_BYTES_MAX, SST_ARCHIVE_FIXED_BYTES_MAX, SST_OBJECT_BYTES_MAX,
     SST_TABLE_TARGET_BYTES, TREE_RUNS_MAX, WAL_ENCODED_BYTES_MAX, WAL_RUN_FACTS_MAX,
     WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WAL_SUFFIX_COORDINATES_MAX_V2, WRITER_INGRESS_COMMANDS_MAX,
+};
+pub use candidate::{
+    DecodedTable, EncodedAuthoritySeal, EncodedGenesisSeal, EncodedTable, EncodedWal,
+    SealCandidateError,
 };
 pub use coordinate::{BatchId, CoordinateExhausted, SealGeneration, StreamUid, ZeroCoordinate};
 pub use directory::{DirectoryEntry, DirectoryKey, DirectoryKeyError};

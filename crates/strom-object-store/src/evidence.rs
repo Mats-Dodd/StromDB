@@ -44,6 +44,11 @@ impl RawObject {
     pub const fn etag(&self) -> &Etag {
         &self.etag
     }
+
+    #[must_use]
+    pub fn into_parts(self) -> (bytes::Bytes, Etag) {
+        (self.body, self.etag)
+    }
 }
 
 /// One bounded request for one lexicographically ordered list page.

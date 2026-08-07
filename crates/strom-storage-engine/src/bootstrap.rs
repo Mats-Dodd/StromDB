@@ -5,20 +5,18 @@ use rand::RngCore as _;
 use strom_common::Entropy;
 use strom_object_store::ObjectStoreAdapter;
 use strom_storage_domain::{
-    BatchId, DIRECTORY_ROW_LOGICAL_BYTES_MAX, DirectoryKey, LEDGER_VALUE_ROW_LOGICAL_BYTES_MAX,
-    LedgerCell, OperationFact, OwnerToken, PARTITION_BOOTSTRAP_BYTES_MAX_V2,
-    PARTITION_BOOTSTRAP_OBJECTS_MAX_V2, PARTITION_RESIDENT_LOGICAL_BYTES_MAX_V2, PartitionId, Seal,
-    SealGeneration, StreamUid, TableRef, WAL_SUFFIX_COORDINATES_MAX_V2, WalBody, WalObject,
-    WalReplayPoint,
+    BatchId, DIRECTORY_ROW_LOGICAL_BYTES_MAX, DecodedTable, DirectoryKey, EncodedAuthoritySeal,
+    EncodedGenesisSeal, EncodedWal, LEDGER_VALUE_ROW_LOGICAL_BYTES_MAX, LedgerCell, OperationFact,
+    OwnerToken, PARTITION_BOOTSTRAP_BYTES_MAX_V2, PARTITION_BOOTSTRAP_OBJECTS_MAX_V2,
+    PARTITION_RESIDENT_LOGICAL_BYTES_MAX_V2, PartitionId, Seal, SealGeneration, StreamUid,
+    TableRef, WAL_SUFFIX_COORDINATES_MAX_V2, WalBody, WalObject, WalReplayPoint,
 };
+use strom_storage_protocol::{AuthoredClaim, Forest, ForestContradiction, WriterMachine};
 
-use crate::forest::Forest;
-use crate::forest::ForestContradiction;
 use crate::store::{
-    EncodedAuthoritySeal, EncodedGenesisSeal, EncodedWal, GenesisEstablishment, SealPublication,
-    SealStore, TableRows, TableStore, TypedStoreError, WalEstablishment, WalStore,
+    GenesisEstablishment, SealPublication, SealStore, TableStore, TypedStoreError,
+    WalEstablishment, WalStore,
 };
-use crate::writer::WriterState;
 
 /// Why a partition did not become Ready.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -33,43 +31,20 @@ pub(crate) enum BootstrapExit {
 
 #[derive(Debug)]
 pub(crate) struct Ready {
-    state: WriterState,
-}
-
-#[derive(Debug)]
-pub(crate) struct AuthoredClaim {
-    generation: SealGeneration,
-    owner: OwnerToken,
-}
-
-impl AuthoredClaim {
-    pub(crate) fn new(generation: SealGeneration) -> Self {
-        Self {
-            generation,
-            owner: OwnerToken::from(generation),
-        }
-    }
-
-    pub(crate) const fn generation(&self) -> SealGeneration {
-        self.generation
-    }
-
-    pub(crate) const fn owner(&self) -> OwnerToken {
-        self.owner
-    }
+    machine: WriterMachine,
 }
 
 impl Ready {
     pub(crate) const fn partition(&self) -> PartitionId {
-        self.state.partition()
+        self.machine.partition()
     }
 
     pub(crate) const fn forest(&self) -> &Forest {
-        self.state.durable_forest()
+        self.machine.durable_forest()
     }
 
-    pub(crate) fn into_state(self) -> WriterState {
-        self.state
+    pub(crate) fn into_machine(self) -> WriterMachine {
+        self.machine
     }
 }
 
@@ -204,7 +179,7 @@ pub(crate) async fn bootstrap(
                                 "newest Seal cannot form an exact claim successor: {source}"
                             ),
                         })?;
-                let encoded = EncodedAuthoritySeal::new(&candidate).map_err(|source| {
+                let encoded = EncodedAuthoritySeal::try_from(&candidate).map_err(|source| {
                     BootstrapExit::Contradiction {
                         detail: format!("claim Seal could not be encoded: {source}"),
                     }
@@ -280,7 +255,7 @@ pub(crate) async fn bootstrap(
                     partition,
                     replay.batch(),
                     listed_tail,
-                    claim.owner,
+                    claim.owner(),
                 )
                 .await?
                 {
@@ -289,7 +264,7 @@ pub(crate) async fn bootstrap(
                 }
 
                 let candidate = fence.batch;
-                let object = WalObject::new(partition, candidate, claim.owner, WalBody::Fence);
+                let object = WalObject::new(partition, candidate, claim.owner(), WalBody::Fence);
                 let encoded =
                     EncodedWal::new(&object).map_err(|source| BootstrapExit::Contradiction {
                         detail: format!("takeover FENCE could not be encoded: {source}"),
@@ -387,7 +362,7 @@ pub(crate) async fn bootstrap(
                 if let Some(detail) = anomaly {
                     BootstrapPhase::RefreshAnomaly { claim, detail }
                 } else if next == fence.batch {
-                    if owner == Some(claim.owner) {
+                    if owner == Some(claim.owner()) {
                         BootstrapPhase::FinalRefresh {
                             replayed: ReplayComplete {
                                 claim,
@@ -430,17 +405,17 @@ pub(crate) async fn bootstrap(
                     .await
                     .map_err(map_typed_store_error)?;
                 match newest {
-                    Some(observed) if observed > claim.generation => {
+                    Some(observed) if observed > claim.generation() => {
                         return Err(BootstrapExit::Fenced { observed });
                     }
-                    Some(observed) if observed == claim.generation => {
+                    Some(observed) if observed == claim.generation() => {
                         return Err(BootstrapExit::Contradiction { detail });
                     }
                     Some(observed) => {
                         return Err(BootstrapExit::Contradiction {
                             detail: format!(
                                 "Seal head regressed from authored claim {:?} to {observed:?} while classifying: {detail}",
-                                claim.generation
+                                claim.generation()
                             ),
                         });
                     }
@@ -459,7 +434,7 @@ pub(crate) async fn bootstrap(
                     .await
                     .map_err(map_typed_store_error)?;
                 match newest {
-                    Some(observed) if observed == replayed.claim.generation => {
+                    Some(observed) if observed == replayed.claim.generation() => {
                         let partition =
                             partition.expect("ReadHead discovers the partition identity");
                         assert_eq!(
@@ -468,7 +443,7 @@ pub(crate) async fn bootstrap(
                             "the discovered partition matches the selected Seal"
                         );
                         BootstrapPhase::Ready(Ready {
-                            state: WriterState::new(
+                            machine: WriterMachine::from_recovery(
                                 replayed.claim,
                                 replayed.seal,
                                 replayed.base,
@@ -478,14 +453,14 @@ pub(crate) async fn bootstrap(
                             ),
                         })
                     }
-                    Some(observed) if observed > replayed.claim.generation => {
+                    Some(observed) if observed > replayed.claim.generation() => {
                         return Err(BootstrapExit::Fenced { observed });
                     }
                     Some(observed) => {
                         return Err(BootstrapExit::Contradiction {
                             detail: format!(
                                 "final Seal refresh regressed from {:?} to {observed:?}",
-                                replayed.claim.generation
+                                replayed.claim.generation()
                             ),
                         });
                     }
@@ -554,8 +529,8 @@ async fn load_admission_base(
                 .await
                 .map_err(map_typed_store_error)?
             {
-                TableRows::Directory(rows) => rows,
-                TableRows::Ledger(_) => {
+                DecodedTable::Directory(rows) => rows,
+                DecodedTable::Ledger(_) => {
                     return Err(BootstrapExit::Contradiction {
                         detail: "Directory manifest selected a Ledger table".into(),
                     });
@@ -573,8 +548,8 @@ async fn load_admission_base(
                 .await
                 .map_err(map_typed_store_error)?
             {
-                TableRows::Ledger(rows) => rows,
-                TableRows::Directory(_) => {
+                DecodedTable::Ledger(rows) => rows,
+                DecodedTable::Directory(_) => {
                     return Err(BootstrapExit::Contradiction {
                         detail: "Ledger manifest selected a Directory table".into(),
                     });
@@ -584,7 +559,7 @@ async fn load_admission_base(
         }
     }
 
-    Forest::try_from_merged(merged.directory, merged.ledger).map_err(map_forest_error)
+    Forest::try_from((merged.directory, merged.ledger)).map_err(map_forest_error)
 }
 
 fn merge_directory_table(
@@ -759,7 +734,7 @@ async fn provision_genesis(
     )
     .expect("canonical empty genesis satisfies every Seal invariant");
     let encoded =
-        EncodedGenesisSeal::new(&genesis).map_err(|source| BootstrapExit::Contradiction {
+        EncodedGenesisSeal::try_from(&genesis).map_err(|source| BootstrapExit::Contradiction {
             detail: format!("canonical genesis could not be encoded: {source}"),
         })?;
     match store
@@ -858,7 +833,7 @@ mod tests {
     use std::num::NonZeroU64;
 
     use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
-    use strom_object_store::{CreateEvidence, FrozenBytes, ObjectKey};
+    use strom_object_store::{CreateEvidence, ObjectKey, PutBody};
     use strom_storage_domain::{
         AttemptId, FreshIdentity, LedgerCell, SortedRun, StoreKind, StreamRecord, TableObjectId,
         TreeVersion, WalKey, encode_wal,
@@ -913,7 +888,7 @@ mod tests {
             adapter
                 .create_if_absent(
                     &ObjectKey::try_from(WalKey::from(newer_fence.batch()).to_string())?,
-                    FrozenBytes::try_from(encode_wal(&newer_fence)?)?,
+                    PutBody::try_from(encode_wal(&newer_fence)?)?,
                 )
                 .await?
         );

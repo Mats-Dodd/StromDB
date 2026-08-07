@@ -13,6 +13,7 @@ workspace = true
 proptest = ["dep:proptest", "strom-domain/proptest"]
 
 [dependencies]
+bytes = { workspace = true }
 proptest = { workspace = true, optional = true }
 rkyv = { workspace = true }
 strom-domain = { path = "../strom-domain", version = "0.1.0" }

@@ -17,7 +17,7 @@ pub mod test_support;
 
 pub use adapter::ObjectStoreAdapter;
 pub use bounds::{KEY_BYTES_MAX, LIST_KEYS_MAX, PUT_BYTES_MAX};
-pub use bytes::{ByteBound, EmptyEtag, Etag, FrozenBytes, FrozenBytesError, ZeroByteBound};
+pub use bytes::{ByteBound, EmptyEtag, Etag, PutBody, PutBodyError, ZeroByteBound};
 pub use error::{StoreContradiction, StoreError};
 pub use evidence::{
     CreateEvidence, KeysBound, KeysBoundError, ListPage, ListPageRequest, RawObject,

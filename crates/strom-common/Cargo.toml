@@ -11,7 +11,7 @@ rand = { workspace = true }
 # ChaCha directly, not rand::rngs::StdRng: StdRng is documented as non-portable,
 # so a rand upgrade may silently change every stream a seed reproduces.
 rand_chacha = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

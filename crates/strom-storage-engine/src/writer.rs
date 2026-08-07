@@ -1,69 +1,33 @@
-//! Single-owner writer I/O orchestration and publication ordering.
+//! Thin async interpreter for the pure writer machine.
 
-mod state;
-
-use strom_storage_domain::BatchId;
+use strom_object_store::ObjectStoreAdapter;
+use strom_storage_protocol::{
+    Completion, EffectKey, WRITER_OUTPUTS_PER_STEP_MAX, WriterAction, WriterEffect, WriterEvent,
+    WriterExit, WriterMachine, WriterOutput, WriterStep,
+};
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
+use tokio_util::task::JoinMap;
 
 use crate::bootstrap::Ready;
-use crate::checkpoint::{
-    CheckpointCompletion, PublicationGate, collect_advance, execute_checkpoint,
-};
+use crate::checkpoint::{collect_advance, prepare_checkpoint_effect, publish_authority};
 use crate::engine::PublishedView;
-use crate::store::{TypedStoreError, WalEstablishment, WalStore};
+use crate::store::WalStore;
 
-use state::{AdmissionDecision, CheckpointPlan, CheckpointTicket, Completion, FlightDecision};
-pub(crate) use state::{AdmissionRefusal, CommandEnvelope, CreateStream, WriterState};
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum WriterExit {
-    #[error("partition writer shut down after draining ingress")]
-    Shutdown,
-    #[error("partition writer was fenced at WAL batch {batch:?}")]
-    Fenced { batch: BatchId },
-    #[error("partition writer was poisoned at WAL batch {batch:?}: {detail}")]
-    Poisoned { batch: BatchId, detail: String },
-    #[error("partition writer found a contradiction at WAL batch {batch:?}: {detail}")]
-    Contradiction { batch: BatchId, detail: String },
-}
+const WRITER_EFFECTS_MAX: usize = 3;
 
 struct Writer {
-    state: WriterState,
-    flight: Option<Flight>,
-    checkpoint: Option<CheckpointFlight>,
-    collector: Option<JoinHandle<()>>,
-    adapter: strom_object_store::ObjectStoreAdapter,
+    machine: WriterMachine,
+    adapter: ObjectStoreAdapter,
     wal_store: WalStore,
     view: watch::Sender<PublishedView>,
-}
-
-struct Flight {
-    batch: BatchId,
-    task: JoinHandle<Result<WalEstablishment, TypedStoreError>>,
-}
-
-struct CheckpointFlight {
-    ticket: CheckpointTicket,
-    publication: PublicationGate,
-    task: JoinHandle<CheckpointCompletion>,
-}
-
-enum WriterEvent {
-    Flight(Result<Result<WalEstablishment, TypedStoreError>, tokio::task::JoinError>),
-    Checkpoint(Result<CheckpointCompletion, tokio::task::JoinError>),
-    Command(Option<CommandEnvelope>),
-}
-
-enum FlightCompletion {
-    Continue,
-    Exit(WriterExit),
+    effects: JoinMap<EffectKey, WriterEvent>,
 }
 
 pub(crate) fn spawn_writer(
-    adapter: strom_object_store::ObjectStoreAdapter,
+    adapter: ObjectStoreAdapter,
     ready: Ready,
-    ingress: mpsc::Receiver<CommandEnvelope>,
+    ingress: mpsc::Receiver<strom_storage_protocol::CommandEnvelope>,
     view: watch::Sender<PublishedView>,
 ) -> JoinHandle<WriterExit> {
     let writer = Writer::new(adapter, ready, view);
@@ -71,330 +35,558 @@ pub(crate) fn spawn_writer(
 }
 
 impl Writer {
-    fn new(
-        adapter: strom_object_store::ObjectStoreAdapter,
-        ready: Ready,
-        view: watch::Sender<PublishedView>,
-    ) -> Self {
+    fn new(adapter: ObjectStoreAdapter, ready: Ready, view: watch::Sender<PublishedView>) -> Self {
         Self {
-            state: ready.into_state(),
-            flight: None,
-            checkpoint: None,
-            collector: None,
+            machine: ready.into_machine(),
             wal_store: WalStore::new(adapter.clone()),
             adapter,
             view,
+            effects: JoinMap::with_capacity(WRITER_EFFECTS_MAX),
         }
     }
 
-    async fn run(mut self, mut ingress: mpsc::Receiver<CommandEnvelope>) -> WriterExit {
+    async fn run(
+        mut self,
+        mut ingress: mpsc::Receiver<strom_storage_protocol::CommandEnvelope>,
+    ) -> WriterExit {
+        let startup = self.machine.handle(WriterEvent::Started);
+        if let Some(exit) = self.execute_step(startup) {
+            return exit;
+        }
         let mut ingress_open = true;
         loop {
-            self.assert_effect_records();
-            self.reap_collector();
-            self.take_flight();
-            if ingress_open {
-                self.start_checkpoint();
-            }
-            if self.flight.is_none() && self.checkpoint.is_none() && !ingress_open {
-                assert!(
-                    self.state.is_quiescent(),
-                    "shutdown exits only after every admitted command is settled"
-                );
-                return self.terminate(WriterExit::Shutdown).await;
-            }
-
-            let event = match (self.flight.as_mut(), self.checkpoint.as_mut(), ingress_open) {
-                (Some(flight), Some(checkpoint), true) => tokio::select! {
-                    biased;
-                    completion = &mut flight.task => WriterEvent::Flight(completion),
-                    completion = &mut checkpoint.task => WriterEvent::Checkpoint(completion),
-                    command = ingress.recv() => WriterEvent::Command(command),
-                },
-                (Some(flight), None, true) => tokio::select! {
-                    biased;
-                    completion = &mut flight.task => WriterEvent::Flight(completion),
-                    command = ingress.recv() => WriterEvent::Command(command),
-                },
-                (None, Some(checkpoint), true) => tokio::select! {
-                    biased;
-                    completion = &mut checkpoint.task => WriterEvent::Checkpoint(completion),
-                    command = ingress.recv() => WriterEvent::Command(command),
-                },
-                (None, None, true) => WriterEvent::Command(ingress.recv().await),
-                (Some(flight), Some(checkpoint), false) => tokio::select! {
-                    biased;
-                    completion = &mut flight.task => WriterEvent::Flight(completion),
-                    completion = &mut checkpoint.task => WriterEvent::Checkpoint(completion),
-                },
-                (Some(flight), None, false) => WriterEvent::Flight((&mut flight.task).await),
-                (None, Some(checkpoint), false) => {
-                    WriterEvent::Checkpoint((&mut checkpoint.task).await)
+            let event = tokio::select! {
+                biased;
+                joined = self.effects.join_next(), if !self.effects.is_empty() => {
+                    let joined = joined.expect("a nonempty JoinMap has a task");
+                    joined_event(joined)
                 }
-                (None, None, false) => return self.terminate(WriterExit::Shutdown).await,
-            };
-
-            match event {
-                WriterEvent::Flight(completion) => {
-                    let evidence = match completion {
-                        Ok(evidence) => evidence,
-                        Err(join_error) => {
-                            let flight = self
-                                .flight
-                                .take()
-                                .expect("a WAL completion retains its shell flight");
-                            let batch = flight.batch;
-                            self.state.discard_wal_flight(batch);
-                            let exit = WriterExit::Contradiction {
-                                batch,
-                                detail: format!("WAL create task failed: {join_error}"),
-                            };
-                            return self.terminate(exit).await;
-                        }
-                    };
-                    match self.complete_flight(evidence) {
-                        FlightCompletion::Continue => {}
-                        FlightCompletion::Exit(exit) => return self.terminate(exit).await,
-                    }
-                }
-                WriterEvent::Checkpoint(completion) => {
-                    let checkpoint = self
-                        .checkpoint
-                        .take()
-                        .expect("a checkpoint completion retains its shell flight");
-                    let outcome = match completion {
-                        Ok(outcome) => outcome,
-                        Err(join_error) => {
-                            self.state.abandon_checkpoint(checkpoint.ticket);
-                            let exit = WriterExit::Contradiction {
-                                batch: checkpoint.ticket.cut,
-                                detail: format!("checkpoint task failed: {join_error}"),
-                            };
-                            return self.terminate(exit).await;
-                        }
-                    };
-                    if let Err(exit) = self.complete_checkpoint(checkpoint.ticket, outcome) {
-                        return self.terminate(exit).await;
-                    }
-                }
-                WriterEvent::Command(Some(envelope)) => match self.state.admit(envelope) {
-                    AdmissionDecision::Settled(completion) => send_completion(completion),
-                    AdmissionDecision::Queued => {}
-                },
-                WriterEvent::Command(None) => {
+                command = ingress.recv(), if ingress_open => if let Some(command) = command {
+                    WriterEvent::Command(command)
+                } else {
                     ingress_open = false;
-                    if let Some(checkpoint) = &self.checkpoint {
-                        checkpoint.publication.cancel_before_publish();
-                    }
-                }
-            }
-        }
-    }
-
-    fn take_flight(&mut self) {
-        match self.state.take_flight() {
-            FlightDecision::Run(encoded) => {
-                assert!(
-                    self.flight.is_none(),
-                    "a state WAL run has no existing shell flight"
-                );
-                let store = self.wal_store.clone();
-                let batch = encoded.batch();
-                let task = tokio::spawn(async move { store.establish_wal(&encoded).await });
-                self.flight = Some(Flight { batch, task });
-            }
-            FlightDecision::Replies(replies) => send_replies(replies),
-            FlightDecision::Idle => {}
-        }
-        assert_eq!(
-            self.flight.is_some(),
-            self.state.has_flight(),
-            "the shell and state agree on the active WAL flight"
-        );
-    }
-
-    fn complete_flight(
-        &mut self,
-        establishment: Result<WalEstablishment, TypedStoreError>,
-    ) -> FlightCompletion {
-        let flight = self
-            .flight
-            .take()
-            .expect("only an active shell WAL flight can complete");
-        let batch = flight.batch;
-        let exit = match establishment {
-            Ok(WalEstablishment::Durable) => {
-                self.record_wal_durable(batch);
-                return FlightCompletion::Continue;
-            }
-            Ok(WalEstablishment::Occupied) => WriterExit::Fenced { batch },
-            Ok(WalEstablishment::UnresolvedAbsent) => WriterExit::Poisoned {
-                batch,
-                detail: "unresolved WAL create is absent on its one reconciliation read".into(),
-            },
-            Err(TypedStoreError::Retryable { detail } | TypedStoreError::Rejected { detail }) => {
-                WriterExit::Poisoned { batch, detail }
-            }
-            Err(TypedStoreError::Contradiction { detail }) => {
-                WriterExit::Contradiction { batch, detail }
-            }
-        };
-        self.state.discard_wal_flight(batch);
-        FlightCompletion::Exit(exit)
-    }
-
-    fn record_wal_durable(&mut self, batch: BatchId) {
-        let durable = self.state.record_wal_durable(batch);
-        self.view.send_replace(PublishedView::new(durable.forest));
-        assert_eq!(
-            self.view.borrow().forest(),
-            self.state.durable_forest(),
-            "the durable forest is published before its replies are released"
-        );
-        send_replies(durable.replies);
-        assert!(
-            !self.state.has_flight(),
-            "recording WAL durability clears the state flight"
-        );
-    }
-
-    fn start_checkpoint(&mut self) {
-        let Some(CheckpointPlan { input, ticket }) = self.state.take_checkpoint() else {
-            return;
-        };
-        assert!(
-            self.checkpoint.is_none(),
-            "a checkpoint plan has no existing shell flight"
-        );
-        let publication = PublicationGate::new();
-        let task = tokio::spawn(execute_checkpoint(
-            self.adapter.clone(),
-            input,
-            publication.clone(),
-        ));
-        self.checkpoint = Some(CheckpointFlight {
-            ticket,
-            publication,
-            task,
-        });
-        self.assert_effect_records();
-    }
-
-    fn complete_checkpoint(
-        &mut self,
-        ticket: CheckpointTicket,
-        outcome: CheckpointCompletion,
-    ) -> Result<(), WriterExit> {
-        let completion = match outcome {
-            CheckpointCompletion::Abandoned => {
-                self.state.abandon_checkpoint(ticket);
-                Ok(())
-            }
-            CheckpointCompletion::Installed(install) => {
-                let installed = self.state.install_checkpoint(ticket, install);
-                self.view.send_replace(PublishedView::new(installed.forest));
-                if self.collector.is_none() {
-                    let adapter = self.adapter.clone();
-                    self.collector = Some(tokio::spawn(collect_advance(
-                        adapter,
-                        installed.source,
-                        installed.successor,
-                    )));
-                }
-                Ok(())
-            }
-            CheckpointCompletion::Fenced => Err(WriterExit::Fenced { batch: ticket.cut }),
-            CheckpointCompletion::Poisoned { detail } => Err(WriterExit::Poisoned {
-                batch: ticket.cut,
-                detail,
-            }),
-            CheckpointCompletion::Contradiction { detail } => Err(WriterExit::Contradiction {
-                batch: ticket.cut,
-                detail,
-            }),
-        };
-        match completion {
-            Ok(()) => Ok(()),
-            Err(exit) => {
-                self.state.abandon_checkpoint(ticket);
-                Err(exit)
-            }
-        }
-    }
-
-    async fn terminate(&mut self, exit: WriterExit) -> WriterExit {
-        if let Some(collector) = self.collector.take() {
-            collector.abort();
-        }
-
-        if let Some(checkpoint) = self.checkpoint.take() {
-            checkpoint.publication.cancel_before_publish();
-            let _resolved_publication = checkpoint.task.await;
-            self.state.abandon_checkpoint(checkpoint.ticket);
-        }
-
-        if self.flight.is_some() {
-            let completion = {
-                let flight = self
-                    .flight
-                    .as_mut()
-                    .expect("terminal draining observes the active WAL flight");
-                (&mut flight.task).await
-            };
-            match completion {
-                Ok(evidence) => match self.complete_flight(evidence) {
-                    FlightCompletion::Continue => {}
-                    FlightCompletion::Exit(_terminal_exit) => {}
+                    WriterEvent::IngressClosed
                 },
-                Err(_join_error) => {
-                    let flight = self
-                        .flight
-                        .take()
-                        .expect("terminal WAL join failure retains its shell flight");
-                    self.state.discard_wal_flight(flight.batch);
-                }
+                else => panic!("a live writer has ingress or an outstanding effect"),
+            };
+            let step = self.machine.handle(event);
+            if let Some(exit) = self.execute_step(step) {
+                return exit;
             }
         }
+    }
 
+    fn execute_step(&mut self, step: WriterStep) -> Option<WriterExit> {
+        let (outputs, exit) = step.into_parts();
+        assert!(
+            outputs.len() <= WRITER_OUTPUTS_PER_STEP_MAX,
+            "the interpreter receives a step inside the named output bound"
+        );
+        if exit.is_some() {
+            assert!(
+                outputs
+                    .iter()
+                    .all(|output| matches!(output, WriterOutput::Action(_))),
+                "a terminal step never starts completion-producing work"
+            );
+        }
+        for output in outputs {
+            match output {
+                WriterOutput::Effect(effect) => self.spawn_effect(effect),
+                WriterOutput::Action(action) => self.execute_action(action),
+            }
+        }
         exit
     }
 
-    fn reap_collector(&mut self) {
-        if self.collector.as_ref().is_some_and(JoinHandle::is_finished) {
-            drop(self.collector.take());
+    fn spawn_effect(&mut self, effect: WriterEffect) {
+        let key = effect.key();
+        assert!(
+            !self.effects.contains_key(&key),
+            "an effect key is absent before the machine issues it"
+        );
+        match effect {
+            WriterEffect::EstablishWal(candidate) => {
+                let store = self.wal_store.clone();
+                let batch = candidate.batch();
+                self.effects.spawn(key, async move {
+                    WriterEvent::WalEstablished {
+                        batch,
+                        result: store.establish_wal(&candidate).await,
+                    }
+                });
+            }
+            WriterEffect::PrepareCheckpoint(input) => {
+                let adapter = self.adapter.clone();
+                let ticket = input.ticket();
+                self.effects.spawn(key, async move {
+                    WriterEvent::CheckpointPrepared {
+                        ticket,
+                        outcome: prepare_checkpoint_effect(adapter, input).await,
+                    }
+                });
+            }
+            WriterEffect::PublishAuthority { ticket, candidate } => {
+                let adapter = self.adapter.clone();
+                self.effects.spawn(key, async move {
+                    WriterEvent::SealPublished {
+                        ticket,
+                        result: publish_authority(adapter, candidate).await,
+                    }
+                });
+            }
+            WriterEffect::Collect(input) => {
+                let (cut, source, successor) = input.into_parts();
+                let adapter = self.adapter.clone();
+                self.effects.spawn(key, async move {
+                    collect_advance(adapter, source, successor).await;
+                    WriterEvent::CollectFinished { cut }
+                });
+            }
         }
+        assert!(
+            self.effects.len() <= WRITER_EFFECTS_MAX,
+            "one WAL, checkpoint, and collector fit the effect budget"
+        );
     }
 
-    fn assert_effect_records(&self) {
-        assert_eq!(
-            self.flight.is_some(),
-            self.state.has_flight(),
-            "the shell and state agree on the active WAL flight"
-        );
-        assert_eq!(
-            self.checkpoint.as_ref().map(|flight| flight.ticket),
-            self.state.active_checkpoint(),
-            "the shell and state agree on the active checkpoint ticket"
-        );
+    fn execute_action(&mut self, action: WriterAction) {
+        match action {
+            WriterAction::PublishView(forest) => {
+                self.view.send_replace(PublishedView::new(forest));
+            }
+            WriterAction::SendReplies(replies) => send_replies(replies),
+            WriterAction::CancelCheckpointPreparation { ticket } => {
+                let key = EffectKey::CheckpointPreparation { ticket };
+                assert!(
+                    self.effects.abort(&key),
+                    "checkpoint cancellation targets its exact present preparation"
+                );
+            }
+        }
+    }
+}
+
+#[expect(
+    clippy::panic,
+    reason = "task panic and unexpected cancellation are interpreter invariant failures"
+)]
+fn joined_event((key, joined): (EffectKey, Result<WriterEvent, JoinError>)) -> WriterEvent {
+    match (key, joined) {
+        (_, Ok(event)) => event,
+        (EffectKey::CheckpointPreparation { ticket }, Err(error)) if error.is_cancelled() => {
+            WriterEvent::CheckpointPreparationCancelled { ticket }
+        }
+        (
+            failed @ (EffectKey::Wal { .. }
+            | EffectKey::CheckpointPreparation { .. }
+            | EffectKey::SealPublication { .. }
+            | EffectKey::Collection { .. }),
+            Err(error),
+        ) => panic!("writer effect {failed:?} failed: {error}"),
     }
 }
 
 fn send_replies(replies: Vec<Completion>) {
     for reply in replies {
-        send_completion(reply);
+        match reply {
+            Completion::Create { outcome, reply } => {
+                let _receiver_may_be_gone = reply.send(outcome);
+            }
+            Completion::Close { outcome, reply } => {
+                let _receiver_may_be_gone = reply.send(outcome);
+            }
+            Completion::Delete { outcome, reply } => {
+                let _receiver_may_be_gone = reply.send(outcome);
+            }
+        }
     }
 }
 
-fn send_completion(completion: Completion) {
-    match completion {
-        Completion::Create { outcome, reply } => {
-            let _receiver_may_be_gone = reply.send(outcome);
+#[cfg(test)]
+mod tests {
+    use std::future::pending;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use strom_domain::{CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle};
+    use strom_storage_domain::{
+        BatchId, DirectoryKey, Seal, SealGeneration, TreeVersion, WalReplayPoint,
+    };
+    use strom_storage_protocol::{AuthoredClaim, CommandEnvelope, CreateStream, Forest};
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    mod scripts {
+        use super::*;
+
+        #[tokio::test]
+        async fn interpreter_wires_one_wal_completion_into_ordered_publication_and_reply()
+        -> TestResult {
+            let machine = machine()?;
+            let initial = machine.durable_forest().clone();
+            let (view, published) = watch::channel(PublishedView::new(initial));
+            let adapter = ObjectStoreAdapter::in_memory();
+            let mut writer = Writer {
+                machine,
+                wal_store: WalStore::new(adapter.clone()),
+                adapter,
+                view,
+                effects: JoinMap::with_capacity(WRITER_EFFECTS_MAX),
+            };
+
+            let (reply, mut outcome) = oneshot::channel();
+            let step = writer
+                .machine
+                .handle(WriterEvent::Command(CommandEnvelope::Create {
+                    command: CreateStream {
+                        path: path("events/interpreter")?,
+                        content_type: StreamContentType::octet_stream(),
+                        expiry: ExpiryPolicy::None,
+                        lifecycle: StreamLifecycle::Open,
+                    },
+                    reply,
+                }));
+            assert_eq!(None, writer.execute_step(step));
+            assert!(matches!(
+                outcome.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+
+            let joined = writer
+                .effects
+                .join_next()
+                .await
+                .expect("the WAL effect is present");
+            let step = writer.machine.handle(joined_event(joined));
+            assert_eq!(None, writer.execute_step(step));
+            assert_eq!(Ok(CreateOutcome::Created), outcome.try_recv()?);
+            assert!(
+                published.has_changed()?,
+                "the inline publication action runs in the reply-producing step"
+            );
+            assert!(writer.effects.is_empty());
+            Ok(())
         }
-        Completion::Close { outcome, reply } => {
-            let _receiver_may_be_gone = reply.send(outcome);
+
+        #[tokio::test]
+        async fn cancelled_preparation_join_retains_its_exact_key() -> TestResult {
+            let ticket = preparation_ticket()?;
+            let key = EffectKey::CheckpointPreparation { ticket };
+            let mut effects = JoinMap::new();
+            effects.spawn(key, pending::<WriterEvent>());
+            assert!(effects.abort(&key));
+            let joined = effects
+                .join_next()
+                .await
+                .expect("the cancelled preparation remains joinable");
+            assert!(matches!(
+                joined_event(joined),
+                WriterEvent::CheckpointPreparationCancelled { ticket: observed }
+                    if observed == ticket
+            ));
+            assert!(effects.is_empty());
+            Ok(())
         }
-        Completion::Delete { outcome, reply } => {
-            let _receiver_may_be_gone = reply.send(outcome);
+
+        #[tokio::test]
+        #[should_panic(expected = "writer effect Wal")]
+        async fn cancellation_of_a_non_preparation_effect_panics_with_its_key() {
+            let key = EffectKey::Wal {
+                batch: BatchId::try_from(7).expect("seven is nonzero"),
+            };
+            let mut effects = JoinMap::new();
+            effects.spawn(key, pending::<WriterEvent>());
+            assert!(effects.abort(&key));
+            let joined = effects
+                .join_next()
+                .await
+                .expect("the cancelled WAL remains joinable");
+            drop(joined_event(joined));
         }
+
+        #[tokio::test]
+        async fn exact_preparation_cancellation_preserves_unrelated_effects() -> TestResult {
+            let ticket = preparation_ticket()?;
+            let target = EffectKey::CheckpointPreparation { ticket };
+            let unrelated = EffectKey::Wal {
+                batch: BatchId::try_from(77)?,
+            };
+            let mut writer = writer_with_machine(machine()?);
+            writer.effects.spawn(target, pending::<WriterEvent>());
+            writer.effects.spawn(unrelated, pending::<WriterEvent>());
+            writer.execute_action(WriterAction::CancelCheckpointPreparation { ticket });
+            let joined = writer
+                .effects
+                .join_next()
+                .await
+                .expect("the cancelled preparation remains joinable");
+            assert!(matches!(
+                joined_event(joined),
+                WriterEvent::CheckpointPreparationCancelled { ticket: observed }
+                    if observed == ticket
+            ));
+            assert!(writer.effects.contains_key(&unrelated));
+            assert_eq!(1, writer.effects.len());
+            Ok(())
+        }
+
+        #[test]
+        fn successful_preparation_completion_survives_an_abort_lost_race() -> TestResult {
+            let ticket = preparation_ticket()?;
+            let key = EffectKey::CheckpointPreparation { ticket };
+            let event = joined_event((
+                key,
+                Ok(WriterEvent::CheckpointPrepared {
+                    ticket,
+                    outcome: strom_storage_protocol::PreparationOutcome::Abandoned,
+                }),
+            ));
+            assert!(matches!(
+                event,
+                WriterEvent::CheckpointPrepared {
+                    ticket: observed,
+                    outcome: strom_storage_protocol::PreparationOutcome::Abandoned,
+                } if observed == ticket
+            ));
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[should_panic(expected = "SealPublication")]
+        #[expect(
+            clippy::panic,
+            reason = "the interpreter test injects one panicked task"
+        )]
+        async fn task_panic_reports_its_exact_effect_key() {
+            let ticket = preparation_ticket().expect("the fixture reaches a checkpoint");
+            let key = EffectKey::SealPublication { ticket };
+            let mut effects = JoinMap::new();
+            effects.spawn(key, async move {
+                panic!("scripted effect panic");
+            });
+            let joined = effects
+                .join_next()
+                .await
+                .expect("the panicked task remains joinable");
+            drop(joined_event(joined));
+        }
+
+        #[tokio::test]
+        async fn duplicate_effect_key_panics_before_join_map_replacement() -> TestResult {
+            let mut writer = writer_with_machine(machine()?);
+            let (reply, _outcome) = oneshot::channel();
+            let step = writer
+                .machine
+                .handle(WriterEvent::Command(CommandEnvelope::Create {
+                    command: CreateStream {
+                        path: path("events/duplicate-key")?,
+                        content_type: StreamContentType::octet_stream(),
+                        expiry: ExpiryPolicy::None,
+                        lifecycle: StreamLifecycle::Open,
+                    },
+                    reply,
+                }));
+            let effect = wal_effect(step).ok_or("the command emits one WAL")?;
+            let key = effect.key();
+            writer.effects.spawn(key, pending::<WriterEvent>());
+            assert!(catch_unwind(AssertUnwindSafe(|| writer.spawn_effect(effect))).is_err());
+            assert_eq!(1, writer.effects.len());
+            assert!(writer.effects.contains_key(&key));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn empty_effect_map_blocks_on_ingress_until_it_closes() -> TestResult {
+            let writer = writer_with_machine(recovered_machine()?);
+            let (ingress, receiver) = mpsc::channel(1);
+            let task = tokio::spawn(writer.run(receiver));
+            tokio::task::yield_now().await;
+            assert!(
+                !task.is_finished(),
+                "idle writer blocks instead of busy-looping"
+            );
+            drop(ingress);
+            assert_eq!(WriterExit::Shutdown, task.await?);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn terminal_actions_run_before_outstanding_effects_are_dropped() -> TestResult {
+            let mut machine = machine()?;
+            let initial = machine.durable_forest().clone();
+            let (reply, mut outcome) = oneshot::channel();
+            let batch = wal_batch(
+                machine.handle(WriterEvent::Command(CommandEnvelope::Create {
+                    command: CreateStream {
+                        path: path("events/terminal")?,
+                        content_type: StreamContentType::octet_stream(),
+                        expiry: ExpiryPolicy::None,
+                        lifecycle: StreamLifecycle::Open,
+                    },
+                    reply,
+                })),
+            )
+            .ok_or("the terminal fixture issues one WAL")?;
+            let (outputs, exit) = machine.handle(WriterEvent::IngressClosed).into_parts();
+            assert!(outputs.is_empty());
+            assert_eq!(None, exit);
+            let terminal = machine.handle(WriterEvent::WalEstablished {
+                batch,
+                result: Ok(strom_storage_protocol::WalEstablishment::Durable),
+            });
+
+            let (view, published) = watch::channel(PublishedView::new(initial));
+            let adapter = ObjectStoreAdapter::in_memory();
+            let mut writer = Writer {
+                machine,
+                wal_store: WalStore::new(adapter.clone()),
+                adapter,
+                view,
+                effects: JoinMap::new(),
+            };
+            let (dropped, dropped_receiver) = oneshot::channel();
+            let guard = DropSignal(Some(dropped));
+            writer.effects.spawn(
+                EffectKey::Collection {
+                    cut: BatchId::try_from(1)?,
+                },
+                async move {
+                    let _guard = guard;
+                    pending::<WriterEvent>().await
+                },
+            );
+            assert_eq!(Some(WriterExit::Shutdown), writer.execute_step(terminal));
+            assert_eq!(Ok(CreateOutcome::Created), outcome.try_recv()?);
+            assert!(published.has_changed()?);
+            drop(writer);
+            dropped_receiver.await?;
+            Ok(())
+        }
+    }
+
+    struct DropSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _receiver_may_be_gone = sender.send(());
+            }
+        }
+    }
+
+    fn preparation_ticket()
+    -> Result<strom_storage_protocol::CheckpointTicket, Box<dyn std::error::Error>> {
+        let mut machine = machine()?;
+        for ordinal in 0..strom_storage_domain::WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER {
+            let (reply, _outcome) = oneshot::channel();
+            let step = machine.handle(WriterEvent::Command(CommandEnvelope::Create {
+                command: CreateStream {
+                    path: path(&format!("events/ticket-{ordinal}"))?,
+                    content_type: StreamContentType::octet_stream(),
+                    expiry: ExpiryPolicy::None,
+                    lifecycle: StreamLifecycle::Open,
+                },
+                reply,
+            }));
+            let batch = wal_batch(step).ok_or("each create issues one WAL")?;
+            let step = machine.handle(WriterEvent::WalEstablished {
+                batch,
+                result: Ok(strom_storage_protocol::WalEstablishment::Durable),
+            });
+            if let Some(ticket) = preparation_key(step) {
+                return Ok(ticket);
+            }
+        }
+        Err("the checkpoint threshold issues a preparation".into())
+    }
+
+    fn machine() -> Result<WriterMachine, Box<dyn std::error::Error>> {
+        let mut machine = recovered_machine()?;
+        let (outputs, exit) = machine.handle(WriterEvent::Started).into_parts();
+        assert!(outputs.is_empty());
+        assert_eq!(None, exit);
+        Ok(machine)
+    }
+
+    fn recovered_machine() -> Result<WriterMachine, Box<dyn std::error::Error>> {
+        let partition = "00112233-4455-6677-8899-aabbccddeeff".parse()?;
+        let generation = SealGeneration::genesis().successor()?;
+        let durable = BatchId::try_from(1)?;
+        Ok(WriterMachine::from_recovery(
+            AuthoredClaim::new(generation),
+            Seal::new(
+                partition,
+                generation,
+                WalReplayPoint::Genesis,
+                TreeVersion::empty(),
+                TreeVersion::empty(),
+            )?,
+            Forest::empty(),
+            Forest::empty(),
+            durable,
+            durable.successor()?,
+        ))
+    }
+
+    fn writer_with_machine(machine: WriterMachine) -> Writer {
+        let initial = machine.durable_forest().clone();
+        let (view, _published) = watch::channel(PublishedView::new(initial));
+        let adapter = ObjectStoreAdapter::in_memory();
+        Writer {
+            machine,
+            wal_store: WalStore::new(adapter.clone()),
+            adapter,
+            view,
+            effects: JoinMap::new(),
+        }
+    }
+
+    fn path(raw: &str) -> Result<DirectoryKey, Box<dyn std::error::Error>> {
+        Ok(DirectoryKey::try_from(Box::<[u8]>::from(raw.as_bytes()))?)
+    }
+
+    fn wal_batch(step: WriterStep) -> Option<BatchId> {
+        let (outputs, exit) = step.into_parts();
+        assert_eq!(None, exit);
+        outputs.into_iter().find_map(|output| match output {
+            WriterOutput::Effect(WriterEffect::EstablishWal(candidate)) => Some(candidate.batch()),
+            WriterOutput::Effect(
+                WriterEffect::PrepareCheckpoint(_)
+                | WriterEffect::PublishAuthority { .. }
+                | WriterEffect::Collect(_),
+            )
+            | WriterOutput::Action(_) => None,
+        })
+    }
+
+    fn wal_effect(step: WriterStep) -> Option<WriterEffect> {
+        let (outputs, exit) = step.into_parts();
+        assert_eq!(None, exit);
+        outputs.into_iter().find_map(|output| match output {
+            WriterOutput::Effect(effect @ WriterEffect::EstablishWal(_)) => Some(effect),
+            WriterOutput::Effect(
+                WriterEffect::PrepareCheckpoint(_)
+                | WriterEffect::PublishAuthority { .. }
+                | WriterEffect::Collect(_),
+            )
+            | WriterOutput::Action(_) => None,
+        })
+    }
+
+    fn preparation_key(step: WriterStep) -> Option<strom_storage_protocol::CheckpointTicket> {
+        let (outputs, exit) = step.into_parts();
+        assert_eq!(None, exit);
+        outputs.into_iter().find_map(|output| match output {
+            WriterOutput::Effect(WriterEffect::PrepareCheckpoint(input)) => Some(input.ticket()),
+            WriterOutput::Effect(
+                WriterEffect::EstablishWal(_)
+                | WriterEffect::PublishAuthority { .. }
+                | WriterEffect::Collect(_),
+            )
+            | WriterOutput::Action(_) => None,
+        })
     }
 }

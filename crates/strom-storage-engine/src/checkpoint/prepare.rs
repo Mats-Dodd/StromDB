@@ -6,13 +6,10 @@ use strom_storage_domain::{
     LedgerCell, OwnerToken, PARTITION_BOOTSTRAP_BYTES_MAX_V2, PARTITION_BOOTSTRAP_OBJECTS_MAX_V2,
     PartitionId, SST_ARCHIVE_FIXED_BYTES_MAX, SST_TABLE_TARGET_BYTES, Seal, SealGeneration,
     SortedRun, StoreKind, StreamUid, TREE_RUNS_MAX, TableKey, TableObjectId, TableRef, TreeVersion,
-    WalReplayPoint, encode_directory_sst, encode_ledger_sst,
+    WalReplayPoint,
 };
-
-use crate::forest::{Forest, ForestDelta};
-use crate::store::{EncodedAuthoritySeal, EncodedTable};
-
-use super::{CheckpointInput, PreparedCheckpoint};
+use strom_storage_domain::{EncodedAuthoritySeal, EncodedTable};
+use strom_storage_protocol::{CheckpointInput, Forest, ForestDelta, PreparedCheckpoint};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{detail}")]
@@ -42,13 +39,9 @@ pub(super) fn prepare_checkpoint(
     input: CheckpointInput,
     emit: &mut impl FnMut(EncodedTable) -> bool,
 ) -> Result<Option<Box<PreparedCheckpoint>>, CheckpointContradiction> {
-    let CheckpointInput {
-        source,
-        base,
-        snapshot,
-        cut,
-        attempt,
-    } = input;
+    let (ticket, source, base, snapshot) = input.into_parts();
+    let cut = ticket.cut();
+    let attempt = ticket.attempt();
     let partition = source.partition();
     let owner_claim = attempt.owner_claim();
     let previous_cut = source.replay().batch();
@@ -137,12 +130,13 @@ pub(super) fn prepare_checkpoint(
         directory,
         ledger,
     );
-    Ok(Some(Box::new(PreparedCheckpoint {
+    Ok(Some(Box::new(PreparedCheckpoint::new(
+        ticket,
         source,
         successor,
         snapshot,
         encoded_seal,
-    })))
+    ))))
 }
 
 fn plan_checkpoint(source: &Seal, snapshot: &Forest, delta: &ForestDelta) -> PlanShape {
@@ -303,11 +297,8 @@ fn build_directory_tree(
         |_row| DIRECTORY_ROW_ENCODED_BYTES_MAX,
         |rows, estimate| {
             let key = next_table_key(generation, attempt, ordinal, StoreKind::Directory);
-            let encoded = EncodedTable::new(
-                key,
-                encode_directory_sst(partition, &key, &rows)
-                    .expect("planned Directory rows fit the durable table encoding"),
-            );
+            let encoded = EncodedTable::encode_directory(partition, key, &rows)
+                .expect("planned Directory rows fit the durable table encoding");
             assert!(
                 encoded.table().object_bytes().get() <= estimate,
                 "Directory encoded accounting dominates the exact frozen table length"
@@ -334,11 +325,8 @@ fn build_ledger_tree(
         |(_uid, cell)| ledger_row_bytes(cell),
         |rows, estimate| {
             let key = next_table_key(generation, attempt, ordinal, StoreKind::Ledger);
-            let encoded = EncodedTable::new(
-                key,
-                encode_ledger_sst(partition, &key, &rows)
-                    .expect("planned Ledger rows fit the durable table encoding"),
-            );
+            let encoded = EncodedTable::encode_ledger(partition, key, &rows)
+                .expect("planned Ledger rows fit the durable table encoding");
             assert!(
                 encoded.table().object_bytes().get() <= estimate,
                 "Ledger encoded accounting dominates the exact frozen table length"
@@ -448,7 +436,7 @@ fn assemble_checkpoint_seal(
         ledger,
     )
     .expect("checkpoint planning constructs a valid exact-successor Seal");
-    let encoded = EncodedAuthoritySeal::new(&successor)
+    let encoded = EncodedAuthoritySeal::try_from(&successor)
         .expect("a planned checkpoint Seal fits the durable encoding bound");
     (successor, encoded)
 }
@@ -558,13 +546,17 @@ mod tests {
             TreeVersion::empty(),
             TreeVersion::empty(),
         )?;
-        let result = prepare_checkpoint_for_test(CheckpointInput {
-            source,
-            base: Forest::empty(),
-            snapshot: Forest::empty(),
+        let ticket = strom_storage_protocol::CheckpointTicket::new(
+            source.generation(),
             cut,
-            attempt: AttemptId::new(owner_claim, 0),
-        });
+            AttemptId::new(owner_claim, 0),
+        );
+        let result = prepare_checkpoint_for_test(CheckpointInput::new(
+            ticket,
+            source,
+            Forest::empty(),
+            Forest::empty(),
+        ));
         assert!(result.is_err(), "a same-cut advance has no candidate");
         Ok(())
     }
@@ -611,14 +603,18 @@ mod tests {
             },
         )?;
 
-        let (prepared, _tables) = prepare_checkpoint_for_test(CheckpointInput {
+        let ticket = strom_storage_protocol::CheckpointTicket::new(
+            source.generation(),
+            BatchId::try_from(2)?,
+            AttemptId::new(owner_claim, 8),
+        );
+        let (prepared, _tables) = prepare_checkpoint_for_test(CheckpointInput::new(
+            ticket,
             source,
-            base: Forest::empty(),
+            Forest::empty(),
             snapshot,
-            cut: BatchId::try_from(2)?,
-            attempt: AttemptId::new(owner_claim, 8),
-        })?;
-        let successor = prepared.into_install().successor;
+        ))?;
+        let successor = prepared.successor().clone();
         assert_eq!(1, successor.directory().runs().len());
         assert_eq!(1, successor.ledger().runs().len());
         assert!(
@@ -726,8 +722,8 @@ mod tests {
     fn create_for_index(forest: &Forest, index: usize, batch: u64) -> OperationFact {
         let path = directory_key(&format!("events/generated-{batch}-{index}"))
             .expect("generated path is canonical");
-        let uid = forest
-            .path_count()
+        let uid = u64::try_from(forest.directory_rows().len())
+            .expect("the generated forest row count fits in u64")
             .checked_add(1)
             .and_then(|uid| StreamUid::try_from(uid).ok())
             .expect("generated history remains below capacity");
