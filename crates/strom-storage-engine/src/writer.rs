@@ -3,8 +3,8 @@
 use strom_domain::{CloseStreamOutcome, CreateOutcome};
 use strom_object_store::CreateEvidence;
 use strom_storage_domain::{
-    AttemptId, BatchId, DirectoryKey, OperationFact, PartitionId, Seal, WAL_RUN_FACTS_MAX, WalBody,
-    WalFacts, WalObject, WalReplayPoint,
+    AttemptId, BatchId, DirectoryKey, OperationFact, PartitionId, Seal, WAL_RUN_FACTS_MAX,
+    WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WalBody, WalFacts, WalObject, WalReplayPoint,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -15,15 +15,11 @@ use crate::admission::{
 };
 use crate::bootstrap::{AuthoredClaim, Ready, WriterSeed};
 use crate::checkpoint::{
-    CheckpointInput, CheckpointOutcome, PublicationGate, WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER,
-    collect_advance, execute_checkpoint,
+    CheckpointInput, CheckpointOutcome, PublicationGate, collect_advance, execute_checkpoint,
 };
 use crate::engine::PublishedView;
 use crate::store::{EncodedWal, WalStore, WalStoreError};
 use crate::{Applied, Forest};
-
-/// Commands waiting to be considered by the single writer.
-pub(crate) const WRITER_INGRESS_COMMANDS_MAX: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum WriterExit {
@@ -680,6 +676,7 @@ mod tests {
     use strom_object_store::ObjectStoreAdapter;
     use strom_storage_domain::{
         DirectoryEntry, DirectoryKey, StreamUid, WAL_SUFFIX_COORDINATES_MAX_V2,
+        WRITER_INGRESS_COMMANDS_MAX,
     };
 
     use super::*;

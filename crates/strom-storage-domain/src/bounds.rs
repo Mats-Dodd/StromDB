@@ -72,6 +72,17 @@ pub const PARTITION_BOOTSTRAP_BYTES_MAX_V2: u64 = 32 * 1024 * 1024 * 1024;
 /// Largest inclusive replay-coordinate span from a V2 Seal through its FENCE.
 pub const WAL_SUFFIX_COORDINATES_MAX_V2: u64 = 1024;
 
+/// Suffix span that starts a checkpoint while one is not already in flight.
+pub const WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER: u64 = 512;
+
+/// Most commands waiting to be considered by the single writer.
+pub const WRITER_INGRESS_COMMANDS_MAX: usize = 1024;
+
+const _: () = assert!(
+    WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER * 2 == WAL_SUFFIX_COORDINATES_MAX_V2,
+    "the checkpoint trigger is half the V2 suffix coordinate budget"
+);
+
 /// Worst-case resident logical bytes charged for one Directory row.
 pub const DIRECTORY_ROW_LOGICAL_BYTES_MAX: u64 = 525;
 

@@ -9,14 +9,16 @@ use strom_domain::{
     StreamStatus,
 };
 use strom_object_store::ObjectStoreAdapter;
-use strom_storage_domain::{DirectoryEntry, DirectoryKey, PartitionId};
+use strom_storage_domain::{
+    DirectoryEntry, DirectoryKey, PartitionId, WRITER_INGRESS_COMMANDS_MAX,
+};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::Forest;
 use crate::admission::{AdmissionRefusal, CreateStream};
 use crate::bootstrap::{BootstrapExit, bootstrap};
-use crate::writer::{CommandEnvelope, WRITER_INGRESS_COMMANDS_MAX, WriterExit, spawn_writer};
+use crate::writer::{CommandEnvelope, WriterExit, spawn_writer};
 
 #[derive(Debug, Clone)]
 pub(crate) struct PublishedView {

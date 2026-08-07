@@ -27,7 +27,6 @@ use crate::store::{
     TableStoreError, WalStore, targeted_table_deletes,
 };
 
-pub(crate) const WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER: u64 = 512;
 const CHECKPOINT_CHILD_CREATES_MAX: usize = 16;
 const CHECKPOINT_PREPARATIONS_MAX: usize = 2;
 // Keep preparation behind the fixed-width child-create pipeline instead of
