@@ -4,601 +4,415 @@ This document defines the test architecture for StromDB.
 
 The main rule is:
 
-> Test protocol decisions as data, test storage failures through the real
-> adapter seam, and test durable claims across reopen.
+> Keep protocol tests pure, inject storage failures at the real adapter seam,
+> and prove durable claims across reopen.
 
-[`stromstyle.md`](stromstyle.md) defines the general code and test style. This
-document defines the concrete test structure for the storage system.
+[`stromstyle.md`](stromstyle.md) defines the general test style. This document
+defines the storage test seam and the work that belongs at each test layer.
 
 ## Purpose
 
-StromDB uses immutable object storage as its only durable authority. Correctness
-depends on more than successful reads and writes. The engine must also behave
-correctly when:
+Object storage is StromDB's only durable authority. Correctness depends on
+behavior that a normal in-memory store cannot produce:
 
-- a create succeeds but its response is lost;
-- a create fails before it reaches storage;
-- an occupant already owns an immutable coordinate;
-- a reconciliation read fails or sees absence;
-- one child of a checkpoint fails;
-- Seal publication has an ambiguous result;
-- collection stops after some deletes;
-- a writer loses authority during an operation;
-- the process stops at a durable boundary; and
-- recovery observes partial work that was never published.
+- a create can take effect before its response is lost;
+- a request can fail before it reaches storage;
+- reconciliation can see matching bytes, foreign bytes, absence, or failure;
+- checkpoint work can stop before Seal publication;
+- collection can stop after some deletes; and
+- a writer can lose authority while an operation is in flight.
 
-An in-memory object store proves normal storage behavior. It cannot produce all
-of these cases by itself. Tests need one deterministic, scripted object store at
-the existing storage seam.
+Tests need deterministic control of these failures. They do not need a general
+mock framework or a second description of the engine's I/O program.
 
-## Current assessment
+## Principles
 
-The existing suite has strong tests for:
+### Test stable behavior
 
-- pure forest transitions;
-- admission rules;
-- checkpoint planning;
-- durable codecs and golden fixtures;
-- normal adapter behavior;
-- normal writer durability;
-- public engine reopen; and
-- writer succession and fencing.
+Prefer the hardest stable semantic boundary that can prove the claim.
 
-The existing suite has weak coverage for:
+- Test forest, admission, and planning as pure logic.
+- Test raw result translation through `ObjectStoreAdapter`.
+- Test key spelling and checked decode through typed stores.
+- Test durability, authority, and recovery through `Engine`.
 
-- adapter error classification;
-- ambiguous creates through the adapter;
-- bootstrap storage failures;
-- WAL reconciliation failures;
-- checkpoint table reconciliation;
-- Seal publication failures;
-- partial collection failures;
-- exact shutdown and publication boundaries; and
-- recovery after each failure point.
+Do not mock StromDB modules to reduce test extent. Replace only the external
+effect.
 
-Some writer tests install a completed flight with a chosen `CreateEvidence`.
-This is valid for a pure writer transition test. It does not prove that the
-adapter derives that evidence from backend behavior. Such a test must not claim
-storage or resend behavior.
+### Keep normal behavior implicit
 
-Repeated calls to `ObjectStoreAdapter::in_memory()` are not separate mocks.
-They use one central implementation. The problem is that this implementation
-has no script, no fault control, no operation gate, and no strict trace.
+The test store delegates normal operations to `InMemory`. A test names only the
+fault, gate, or malformed response that matters to its claim.
 
-## Design goals
+Do not require tests to script successful bootstrap reads, normal reopen reads,
+or unrelated object operations.
 
-The test system must:
+### Keep control flow in the test
 
-1. Use the production `ObjectStoreAdapter`.
-2. Inject faults below the adapter.
-3. Use the existing `object_store::ObjectStore` trait.
-4. Keep scripts fixed, deterministic, and directly reviewable.
-5. Model failure before and after a durable effect.
-6. Support concurrent checkpoint operations without assuming one global order.
-7. Expose exact events instead of using sleeps or scheduler polling.
-8. Record enough detail to diagnose a failure from test output.
-9. Check durable state across shutdown, process loss, and reopen.
-10. Remove duplicate setup and duplicate contract tests.
+Use normal Rust control flow for open, command, shutdown, process loss, and
+reopen. Do not add an engine scenario language or generic step interpreter.
 
-## Non-goals
+Small fixture builders and assertion helpers are useful. They must not hide
+operation order, fault placement, publication, authority, or reopen.
 
-The test system is not:
+### Make invalid faults difficult to express
 
-- a general mock framework;
-- a simulator for every S3 feature;
-- a second storage abstraction;
-- a replacement for pure protocol tests;
-- a replacement for codec fixtures;
-- a replacement for a small real-S3 contract suite; or
-- a probabilistic fault system.
+The fault vocabulary must follow the storage model.
 
-Do not add traits for `SealStore`, `WalStore`, or `TableStore` to support tests.
-Do not add a second raw-store trait. The external `ObjectStore` trait is already
-the correct injection seam.
+- Only an ambiguous transport failure can occur after a create takes effect.
+- Permission and authentication failures occur before an effect.
+- An occupied result requires an occupant or an explicit race.
+- A body failure requires a body.
+- A malformed list requires enough entries to make the fault real.
+
+The test store must reject a configured fault that cannot occur.
+
+### Treat test friction as design feedback
+
+If a focused test needs large setup or internal stubs, first check the
+production boundary. A cleaner pure function or effect seam can improve both
+the implementation and its tests.
+
+Do not solve every difficult test with a more powerful helper.
 
 ## Test layers
 
-The suite has four layers. Each layer has one job.
-
-Test friction is design feedback. If a focused claim needs large setup or many
-internal stubs, first check whether production code mixes a pure decision with
-an external effect. Prefer a cleaner production seam or a smaller pure function
-when that change makes both the implementation and its test simpler.
-
-Do not answer every difficult test with a more powerful test helper. A helper
-cannot repair the wrong production boundary.
-
 ### Pure protocol tests
 
-Pure tests feed domain inputs and effect completions into protocol logic. They
-observe state, plans, and requested effects as data.
+Pure tests feed commands, observations, and effect completions into protocol
+logic. They observe state, plans, and requested effects as data.
 
-Use this layer for:
+Use pure tests for:
 
 - forest transitions;
-- admission;
-- fold rules;
+- admission and refusal;
 - checkpoint planning;
-- evidence-to-writer transitions; and
-- closed finite error matrices.
+- evidence-to-writer transitions;
+- bounds; and
+- closed finite matrices.
 
-These tests must not use object storage, sleeps, or task scheduling.
+These tests must not use storage, sleeps, or task scheduling.
 
-### Raw adapter contract tests
+### Adapter contract tests
 
-Adapter tests prove the translation between `object_store` behavior and StromDB
+Adapter tests prove the translation from `object_store` behavior to StromDB
 behavior.
 
-Use this layer for:
+Use adapter tests for:
 
-- `CreateEvidence` classification;
-- `StoreError` classification;
-- create-if-absent rules;
-- bounded reads;
+- `CreateEvidence`;
+- `StoreError`;
+- create-if-absent mode;
+- bounded body reads;
 - list order and continuation;
-- canonical key checks;
-- delete idempotence; and
-- backend-specific contract checks.
+- foreign list keys; and
+- idempotent delete.
 
-Run normal contract claims against `InMemory`. Use the scripted store for
-adversarial backend results. A real-S3 job can run the portable normal contract
-claims.
+Run normal claims against `InMemory`. Use the fault store for adversarial
+results. Portable normal claims can also run against real S3.
 
 ### Typed-store tests
 
-Typed-store tests prove only the rules added by Seal, WAL, and table stores.
+Typed-store tests prove only behavior added by Seal, WAL, and table stores:
 
-Use this layer for:
-
-- durable key spelling;
-- reverse generation order;
-- identity checks;
+- key spelling;
+- reverse ordinal order;
+- body identity;
 - checked decode;
 - typed bounds;
-- typed reconciliation; and
-- authorized delete coordinates.
+- reconciliation; and
+- authorized deletes.
 
-Do not repeat raw adapter claims in every typed store.
+Do not repeat raw adapter contracts in every typed store.
 
 ### Durable engine tests
 
-Durable engine tests prove complete behavior across the public engine boundary
-and durable recovery boundaries.
+Durable tests use the public engine boundary. They prove:
 
-Use this layer for:
+- durability before reply;
+- visibility at the commit point;
+- ambiguous write reconciliation;
+- writer fencing;
+- checkpoint publication;
+- partial collection safety;
+- shutdown boundaries; and
+- recovery after process loss.
 
-- write, publish, and reply order;
-- ambiguous WAL creates;
-- fencing;
-- checkpoint materialization;
-- Seal publication;
-- partial collection;
-- shutdown;
-- process loss; and
-- reopen.
+Cross reopen whenever durable state can differ from memory state.
 
-Write these as direct narrative tests. Each test keeps its control flow visible
-and checks invariants after every meaningful transition.
+## Minimal fault store
 
-Do not start with a general scenario language or a generic step runner. Extract
-a shared `check` function only when a closed matrix repeats the same test shape.
-
-## Scripted object store
-
-Add one `ScriptedObjectStore` to `strom-object-store` behind a `test-support`
-feature. It wraps `object_store::memory::InMemory` and implements
+Add one test-only object store in `strom-object-store`. It wraps
+`object_store::memory::InMemory` and implements
 `object_store::ObjectStore`.
 
-The wrapper has four responsibilities:
+The name can be `FaultStore` or `ScriptedObjectStore`. Its behavior matters more
+than its name.
 
-1. Match selected operations.
-2. Apply a deterministic action.
-3. Gate an operation when a test needs an exact boundary.
-4. Record a complete trace.
+It has four jobs:
 
-All operations outside a selected strict scope delegate to `InMemory`.
+1. Delegate normal operations to `InMemory`.
+2. Apply selected one-shot faults.
+3. Expose exact operation gates.
+4. Record targeted call counts and useful failure diagnostics.
 
-The engine continues to receive:
+It must not implement phases, strict scopes, a general expectation engine, or a
+second protocol language.
 
-```rust
-ObjectStoreAdapter::new(scripted.backend())
-```
-
-No production engine type knows that the backend is scripted.
-
-### Location
+### Test-only location
 
 The intended structure is:
 
 ```text
 crates/strom-object-store/src/
+    test_support.rs
     test_support/
-        mod.rs
-        scripted.rs
+        fault_store.rs
         gate.rs
-        trace.rs
 ```
 
-`strom-object-store` exposes this module only for its own tests and for
-dependents that enable `test-support`.
-
-`strom-storage-engine` enables that feature only for development and test
-builds.
-
-Do not create a workspace test crate until more than one independent subsystem
-needs the same higher-level test vocabulary.
-
-## Script vocabulary
-
-The script API uses StromDB key types and the small operation set that the
-adapter uses. It does not expose arbitrary callbacks.
-
-The initial operation vocabulary is:
+Expose it behind a `test-support` feature for dependent crate tests. Production
+engine types continue to receive:
 
 ```rust
+ObjectStoreAdapter::new(store.backend())
+```
+
+No production engine type knows that the backend can inject faults.
+
+## Fault rules
+
+A fault rule selects one operation and one target:
+
+```rust
+struct Rule {
+    operation: Operation,
+    target: Target,
+    effect: Effect,
+}
+
 enum Operation {
     Create,
     Read,
     List,
     Delete,
 }
-```
 
-An expectation contains:
-
-```rust
-struct Expectation {
-    operation: Operation,
-    target: Target,
-    action: Action,
-    count: Count,
-}
-```
-
-`Target` supports:
-
-```rust
 enum Target {
     Key(ObjectKey),
     Prefix(ObjectKey),
 }
 ```
 
-Exact keys are preferred. Prefix matching is for list operations and bounded
-families of concurrent checkpoint objects.
+Rules are one-shot by default. After a rule runs, later matching calls pass
+through normally.
 
-### Backend failures
+Exact keys are preferred. Prefix rules are for list operations or a bounded
+family of checkpoint objects.
 
-Scripts produce external backend failures, not `StoreError` or
-`CreateEvidence`.
+### Effects
 
-The minimum failure vocabulary is:
-
-```rust
-enum BackendFailure {
-    Transport,
-    PermissionDenied,
-    Unauthenticated,
-    NotFound,
-    AlreadyExists,
-    Precondition,
-}
-```
-
-The scripted backend converts these values into the corresponding
-`object_store::Error`. The production adapter then derives the StromDB result.
-
-This rule is important. A script that returns `CreateEvidence::Unresolved`
-would bypass the behavior that the test must prove.
-
-### Create actions
-
-Create actions are:
+Keep the effect vocabulary small:
 
 ```rust
-enum CreateAction {
-    Pass,
+enum Effect {
     FailBefore(BackendFailure),
-    ApplyThenFail(BackendFailure),
-}
-```
-
-`Pass` delegates to `InMemory` and returns its result.
-
-`FailBefore` returns the selected error without calling `InMemory`. No durable
-effect occurs.
-
-`ApplyThenFail` first delegates to `InMemory`. If the inner create succeeds,
-the wrapper replaces the successful response with the selected error. The bytes
-are durable, but the caller does not receive proof.
-
-`ApplyThenFail` models the central ambiguous-create case:
-
-```text
-request reaches storage
-    -> immutable object is created
-    -> response is lost
-    -> adapter returns Unresolved
-    -> engine owns reconciliation
-```
-
-The script must also support a failed create with no durable effect. The engine
-must distinguish these cases only by later evidence.
-
-### Read actions
-
-Read actions are:
-
-```rust
-enum ReadAction {
-    Pass,
-    Fail(BackendFailure),
+    CreateThenLoseResponse,
+    DeleteThenLoseResponse,
     FailBody(BackendFailure),
-}
-```
-
-`Fail` returns an error before a result is available.
-
-`FailBody` returns valid metadata but fails while the body is consumed. This
-proves that bounded-read and occupant-comparison code handles streamed body
-failure.
-
-Do not add arbitrary body replacement to normal engine tests. Plant exact
-bytes in `InMemory` when a test needs foreign or malformed durable state.
-
-### List actions
-
-List actions are:
-
-```rust
-enum ListAction {
-    Pass,
-    Fail(BackendFailure),
+    UnderreportMetadata,
     ReturnOutOfOrder,
     ReturnForeignKey,
 }
 ```
 
-The invalid actions exist to prove adapter contradiction checks. Engine tests
-normally use `Pass` or `Fail`.
+`CreateThenLoseResponse` performs the create in `InMemory`, requires it to
+succeed, and then returns an ambiguous transport error.
 
-### Delete actions
+`DeleteThenLoseResponse` performs the delete, requires the request to succeed,
+and then returns an ambiguous transport error.
 
-Delete actions are:
+If a required effect cannot occur, the store records a fault mismatch. It must
+not silently consume the rule.
 
-```rust
-enum DeleteAction {
-    Pass,
-    Fail(BackendFailure),
-    ApplyThenFail(BackendFailure),
-}
-```
+Use operation-specific effects instead of accepting every combination of action
+and backend failure. This prevents impossible cases such as bytes becoming
+durable before a permission refusal.
 
-`ApplyThenFail` proves that collection remains safe when a delete takes effect
-but its response is lost. Collection may leak, but it must not delete outside
-its authority or make unpublished state authoritative.
+### Matching
 
-## Matching and order
+Unmatched operations always pass through.
 
-A single global FIFO queue is not correct for StromDB. Checkpoint child creates
-run concurrently with `buffer_unordered`. Valid completion order can differ
-between runs.
+If more than one rule can match the same call, configuration must fail before
+the test runs. Do not choose one rule by declaration order.
 
-The script uses strict scopes and phases.
-
-### Strict scopes
-
-A strict scope selects one exact key or one prefix.
-
-Inside the scope:
-
-- every matching operation must have an expectation;
-- an extra call is a failure;
-- a missing call is a failure; and
-- the configured count is exact.
-
-Outside the scope, operations delegate to `InMemory`.
-
-This lets a WAL test describe one WAL coordinate without listing every
-bootstrap read.
-
-### Phases
-
-A script is a sequence of phases. Expectations in one phase can match in any
-order. The next phase does not begin until all expectations in the current
-phase are complete.
-
-For example:
-
-```text
-phase 1:
-    create table A
-    create table B
-    create table C
-
-phase 2:
-    create Seal
-
-phase 3:
-    delete old WAL run
-    delete retired table
-```
-
-This proves publication order without imposing an order between independent
-table creates.
-
-For a single coordinate, separate phases give a strict sequence:
-
-```text
-phase 1: create WAL and fail after apply
-phase 2: read the same WAL
-```
-
-If a call matches a later phase before the current phase is complete, the
-scripted store reports an order failure.
-
-Do not add a general dependency graph until a real test cannot use phases.
+The store must validate operation options that are part of the claim. In
+particular, `Operation::Create` requires `PutMode::Create`. An overwrite PUT is
+not a create.
 
 ## Gates
 
-A gate exposes an exact operation boundary to a test.
-
-A gate has these operations:
+A gate exposes an operation arrival to the test:
 
 ```rust
+let gate = Gate::new();
+let store = FaultStore::new().gate(create(seal_key), gate.clone());
+
+let checkpoint = tokio::spawn(run_checkpoint(store.backend()));
+
 gate.wait_until_blocked().await;
+assert_children_are_durable(&store, &children).await?;
 gate.release();
+checkpoint.await??;
 ```
 
-The scripted store reports arrival before it waits. The test can then inspect
-the engine while the operation is blocked.
+The gate reports arrival before it waits. Release is idempotent.
 
-Use gates to prove:
+Gates and faults are independent. A test can gate a normal operation or gate an
+operation that will receive a fault after release.
 
-- a reply is not released before durable completion;
-- a view is not published before the commit point;
-- shutdown waits for or abandons the correct work;
-- writer succession revokes old work;
-- child tables exist before Seal publication; and
-- collection starts only after publication.
+A cancelled gated operation is not a completed injected effect. The internal
+operation log must show the cancellation in failure diagnostics. Fault
+verification must fail if cancellation prevented a configured fault from
+running.
 
-Do not use sleeps, timing margins, repeated `yield_now()`, or scheduler polling
-to establish these facts.
+Use gates instead of sleeps, timing margins, `yield_now()` loops, or repeated
+polling.
 
-Fault selection and scheduling are separate concepts. A gate controls when an
-operation continues. An action controls what happens when it continues.
+## Targeted observations and diagnostics
 
-## Trace and verification
+Do not expose a complete public operation trace. Most tests should inspect
+durable state and engine results, not private call order.
 
-The scripted store records every operation:
+Expose one targeted call-count query for protocol claims such as no-resend and
+bounded work:
 
 ```rust
-struct TraceEntry {
-    sequence: u64,
-    operation: Operation,
-    key: ObjectKey,
-    phase: usize,
-    action: Action,
-    effect_applied: bool,
-    result: RecordedResult,
-}
+store.assert_called_once(Operation::Create, &wal_key)?;
 ```
 
-The exact implementation can use a more compact internal form, but diagnostics
-must show:
+Use call counts only when the number of external effects is part of the
+contract.
 
-- expected operation;
-- actual operation;
-- key or prefix;
-- active phase;
-- remaining expectations;
-- whether a durable effect occurred; and
-- the complete relevant trace.
+Use durable object observations for other claims:
 
-Tests finish with an explicit check:
+- gate Seal creation, then check that every child table is present;
+- after collection failure, check which authorized objects remain;
+- after ambiguous create, reopen and check the recovered state; and
+- after cancellation, check that no unpublished object became authoritative.
 
-```rust
-script.verify();
-```
+The store can keep an internal operation log for diagnostics. It is not part of
+the normal test API. When verification fails, include the relevant observed
+operations so the failure can be understood without a debugger.
 
-Do not assert in `Drop`. A second panic during failure hides useful evidence.
+## Verification
 
-An unexpected operation must be recorded immediately. The operation can return
-a synthetic backend error so the engine task can stop. `verify()` reports the
-script mismatch in domain language.
-
-## Durable engine test shape
-
-Use direct test functions. The test body must show the protocol sequence without
-an interpreter or fluent language between the reader and the engine.
-
-A durable test usually has this shape:
+Verification is narrow:
 
 ```rust
-let store = ScriptedObjectStore::builder()
-    .strict(wal_key.clone())
-    .expect_create(wal_key.clone(), CreateAction::ApplyThenFail(Transport))
-    .expect_read(wal_key, ReadAction::Pass)
-    .build();
-
-let engine = open_engine(&store).await?;
-let reply = engine.command(command).await?;
-assert_created(reply);
-assert_live(&engine, &path)?;
-
-drop(engine);
-
-let reopened = open_engine(&store).await?;
-assert_live(&reopened, &path)?;
 store.verify()?;
 ```
 
-The exact API can differ. The important part is that the storage script is data
-and the engine sequence remains normal Rust control flow.
+It checks:
 
-Small helpers can own:
+- every configured fault ran;
+- every configured gate observed its selected call;
+- no fault configuration was ambiguous;
+- every required after-effect took effect; and
+- no injected fault became ineffective.
+
+It does not check every normal call. It does not require a full expected trace.
+
+Do not assert in `Drop`. Return one diagnostic that includes:
+
+- unused or ineffective rules;
+- cancelled selected operations;
+- operation and target;
+- expected effect;
+- observed result; and
+- the relevant internal operation log.
+
+## Example tests
+
+### Ambiguous WAL create
+
+```rust
+let store = FaultStore::new().inject(
+    create(wal_key.clone()),
+    Effect::CreateThenLoseResponse,
+);
+
+let engine = Engine::open(store.backend(), entropy()).await?;
+assert_eq!(CreateOutcome::Created, create_stream(&engine, &id).await?);
+assert_live(&engine, &id)?;
+assert_eq!(CloseOutcome::Shutdown, engine.shutdown().await);
+
+let reopened = Engine::open(store.backend(), entropy()).await?;
+assert_live(&reopened, &id)?;
+assert_eq!(CloseOutcome::Shutdown, reopened.shutdown().await);
+
+store.assert_called_once(Operation::Create, &wal_key)?;
+store.verify()?;
+```
+
+The test names one exceptional event. Reconciliation and reopen use normal
+pass-through storage.
+
+### Checkpoint publication order
+
+```rust
+let gate = Gate::new();
+let store = FaultStore::new().gate(create(seal_key.clone()), gate.clone());
+
+let checkpoint = tokio::spawn(run_checkpoint(store.backend()));
+gate.wait_until_blocked().await;
+
+assert_children_are_durable(&store, &children).await?;
+
+gate.release();
+checkpoint.await??;
+store.verify()?;
+```
+
+No phase script repeats the checkpoint implementation.
+
+### Bootstrap read failure
+
+```rust
+let store = FaultStore::new().inject(
+    read(genesis_key),
+    Effect::FailBefore(BackendFailure::Transport),
+);
+
+assert!(matches!(
+    Engine::open(store.backend(), entropy()).await,
+    Err(OpenError::Retryable { .. })
+));
+
+let recovered = Engine::open(store.backend(), entropy()).await?;
+assert_eq!(CloseOutcome::Shutdown, recovered.shutdown().await);
+store.verify()?;
+```
+
+The first matching read fails. Reopen passes through without another script
+phase.
+
+## Fixtures and assertions
+
+Central test support can own:
 
 - deterministic entropy;
-- engine open and reopen;
-- command construction;
-- published-view observations;
-- durable object planting; and
-- repeated domain assertions.
-
-Helpers must not hide operation order, failure placement, publication, process
-loss, or reopen.
-
-Each durable test checks the applicable invariants after every meaningful
-transition:
-
-- the published view contains only acknowledged or correctly committed facts;
-- a refused command does not change the view;
-- partition identity remains stable across reopen;
-- observed generations and batch positions do not move backward;
-- only a published Seal selects checkpoint tables;
-- writer loss makes the old engine unavailable; and
-- every operation remains within named bounds.
-
-Use a data table and one narrow `check_case` function when many cases have the
-same shape. Examples include every backend error class and every reconciliation
-result. The case data names inputs and expected observations. The check function
-owns repeated setup and diagnostics.
-
-Do not add a generic `Step` enum, scenario interpreter, or fluent engine DSL.
-Those forms duplicate Rust control flow and make simple tests harder to read.
-Reconsider this rule only when direct tests contain proven repetition that a
-narrow case checker cannot remove.
-
-## Fixtures
-
-Central test support owns:
-
-- deterministic entropy construction;
-- common partition and owner values for planted durable objects;
-- `DirectoryKey` construction;
-- stream command construction;
-- encoded Seal, WAL, and table builders;
+- common partition and owner values;
+- stream command builders;
+- Seal, WAL, and table builders;
 - durable object planting;
-- published-view observations; and
-- trace formatting.
+- published-view projections; and
+- targeted call-count and object-presence helpers.
 
-A fixture must contain only facts that matter to the claim.
+A fixture contains only facts that matter to the claim. Avoid one large default
+world.
 
-Do not create one large default world. Prefer small builders that require the
-test to name authority, generation, batch, key, and body when those facts
-matter.
-
-Use golden byte fixtures only when exact encoding is the claim. Durable engine
-fixtures should use checked production encoders.
-
-## Test readability
-
-Test code is maintained code. It must meet the same standard for names, types,
-diagnostics, and deletion as production code.
-
-### Value builders
-
-A small domain value builder can remove facts that do not affect the claim:
+Small domain value builders are useful:
 
 ```rust
 let wal = WalFixture::run()
@@ -606,252 +420,137 @@ let wal = WalFixture::run()
     .with_create(path);
 ```
 
-A value builder constructs data. It does not run the engine or hide control
-flow. Its defaults must be valid, deterministic, and irrelevant to the claim.
-Require the test to name every fact that changes authority, ordering,
-durability, identity, or a bound.
+A value builder constructs data. It does not run the engine.
 
-Do not confuse a value builder with an engine DSL. Value builders are useful.
-A fluent language for open, command, failure, shutdown, and reopen hides the
-protocol sequence and is not part of this design.
+Prefer one complete semantic comparison over fragmented assertions. Failure
+output must show expected and observed domain facts.
 
-### Case matrices
+## Case matrices
 
-Use a parameterized case matrix when setup, execution, and invariant checks are
-the same for every case.
+Use one narrow `check_case` function when setup, execution, and invariant checks
+are identical for a closed set of cases.
 
 Each case must:
 
 - have a semantic name;
-- contain only facts that differ between cases;
-- state the expected domain result directly; and
+- contain only facts that differ;
+- state its expected domain result; and
 - print its name, input, expected result, and actual result on failure.
 
-Split the matrix when a case needs different control flow. Do not add flags and
-optional fields until the case type becomes an interpreter.
-
-Closed small domains should be exhaustive. Examples include every backend error
-class, every `CreateEvidence` variant, and every reconciliation result.
-
-### Semantic assertions
-
-Prefer one complete comparison of a relevant domain projection over many
-fragmented assertions.
-
-For example:
-
-```rust
-assert_eq!(
-    expected_view,
-    observe(&engine),
-    "published view after ambiguous WAL reconciliation"
-);
-```
-
-Avoid checking a length, then selected members, then selected fields when one
-comparison can show the complete mismatch. Assertion helpers must report domain
-facts, not private fields, call stacks, or incidental debug structure.
-
-### Relevant detail
-
-A test body should make the claim visible at a glance. Hide repetitive
-construction that cannot affect the result. Keep operation order, fault
-placement, authority, publication, process loss, and reopen explicit.
-
-When a fixture change causes unrelated tests to change, the fixture contains too
-much policy. Split it or move the changing fact back into each affected test.
+Split the matrix when cases need different control flow. Do not add optional
+fields until the case type becomes an interpreter.
 
 ## Required coverage
 
 ### Adapter
 
-The adapter suite must cover:
+Cover:
 
-- first create returns `Direct`;
-- equal occupant returns `DurableMatch`;
-- foreign occupant returns `NotOurs`;
-- create transport failure before apply returns `Unresolved`;
-- create transport failure after apply returns `Unresolved`;
-- failed occupant metadata read returns `Unresolved`;
-- failed occupant body read returns `Unresolved`;
-- permission and authentication failures return `Rejected`;
-- ordinary read and list transport failures return `Retryable`;
-- absence returns `None`;
-- oversized metadata returns `Contradiction`;
-- body growth past the bound returns `Contradiction`;
-- out-of-order list results return `Contradiction`;
-- foreign list keys return `Contradiction`; and
-- delete is idempotent.
+- direct create;
+- equal and foreign occupants;
+- failure before create;
+- create followed by response loss;
+- failed occupant metadata and body reads;
+- definitive refusal;
+- retryable read and list errors;
+- oversized metadata and body growth;
+- unordered and foreign list results; and
+- idempotent delete.
 
 ### Bootstrap
 
-Bootstrap tests must cover:
+Cover:
 
-- genesis create wins directly;
-- genesis race finds matching durable bytes;
-- genesis create is unresolved with matching bytes;
-- genesis create is unresolved with absence;
-- claim create is unresolved;
-- claim is occupied by another owner;
-- newest Seal list fails;
-- selected Seal read fails;
-- WAL suffix list fails;
-- WAL read fails;
-- replay finds a gap or contradictory identity; and
-- every accepted durable prefix reopens to the same state.
+- genesis creation and races;
+- unresolved genesis with match and absence;
+- unresolved writer claim;
+- Seal list and read failure;
+- WAL list and read failure;
+- replay gaps and contradictions; and
+- reopen from every accepted durable prefix.
 
 ### Writer
 
-Writer tests must cover:
+Cover:
 
-- direct WAL completion;
-- ambiguous WAL create with matching bytes;
-- ambiguous WAL create with foreign bytes;
-- ambiguous WAL create with absence;
-- reconciliation read is retryable;
-- reconciliation read is rejected;
-- create returns `NotOurs`;
-- no authority create is resent;
-- success becomes visible before reply;
-- refusal does not change the view;
-- writer succession fences old work;
-- shutdown with an active WAL flight;
-- shutdown with an active checkpoint; and
-- suffix exhaustion has a bounded outcome.
+- direct and ambiguous WAL completion;
+- matching, foreign, absent, and failed reconciliation;
+- no resend of authority creates;
+- visibility before reply;
+- writer succession;
+- active-flight shutdown; and
+- bounded suffix exhaustion.
 
 ### Checkpoint
 
-Checkpoint tests must cover:
+Cover:
 
-- all child tables are durable before Seal create;
-- one child create fails before apply;
-- one child create fails after apply;
-- table reconciliation finds matching bytes;
-- table reconciliation finds foreign bytes;
-- table reconciliation finds absence;
-- table reconciliation read fails;
-- publication claim abandons child work;
-- Seal create succeeds directly;
-- Seal create is ambiguous with matching bytes;
-- Seal create is ambiguous with foreign bytes;
-- Seal create is ambiguous with absence;
-- Seal create is retryable or rejected;
-- contradiction fails closed; and
-- reopen ignores complete but unpublished child tables.
+- child durability before Seal publication;
+- child failure before and after apply;
+- table reconciliation outcomes;
+- cancellation before publication;
+- Seal failure before and after apply;
+- Seal reconciliation outcomes;
+- unpublished child garbage; and
+- reopen after each result.
 
 ### Collection
 
-Collection tests must cover:
+Cover:
 
-- all authorized deletes succeed;
-- one WAL delete fails before apply;
-- one WAL delete fails after apply;
-- one table delete fails before apply;
-- one table delete fails after apply;
-- failure after earlier deletes leaks only;
-- collection never deletes tables selected by the successor Seal;
-- repeated collection is safe; and
-- reopen remains correct after every partial collection prefix.
+- complete collection;
+- failure before and after each delete;
+- leak-only partial progress;
+- repeated collection;
+- protection of successor tables; and
+- reopen after every partial delete prefix.
 
-## Migration plan
+## Implementation order
 
-The change is one complete test-architecture project.
+1. Add the minimal fault store, gates, targeted call counts, diagnostics, and
+   self-tests.
+2. Add adversarial adapter contract tests.
+3. Add narrow shared fixtures.
+4. Add durable bootstrap, writer, checkpoint, and collection tests.
+5. Replace scheduler polling with gates.
+6. Remove duplicate adapter claims from typed-store tests.
+7. Remove copied fixtures and helpers.
+8. Delete any test that a stronger stable-boundary test supersedes.
 
-### Build the scripted store
-
-Implement all four operations, strict scopes, phases, gates, traces, and
-verification.
-
-Test the scripted store before engine tests depend on it. Its tests must
-prove:
-
-- pass-through;
-- failure before apply;
-- failure after apply;
-- exact counts;
-- missing calls;
-- extra calls;
-- wrong operations;
-- wrong keys;
-- early later-phase calls;
-- unordered calls within one phase;
-- gate arrival and release; and
-- useful mismatch diagnostics.
-
-### Expand adapter contracts
-
-Add all adversarial adapter cases. Keep the existing normal contract cases.
-Separate portable backend claims from scripted-backend self-tests.
-
-### Add durable engine test support
-
-Add narrow fixtures and assertion helpers. Keep test control flow in each test
-body. First use the helpers in existing public engine tests. This proves that
-the support code does not weaken normal claims.
-
-### Add the failure matrix
-
-Add bootstrap, writer, checkpoint, and collection failure tests. Use direct
-tests for distinct protocol sequences. Use a data table with one `check_case`
-function for a closed matrix. Every test must include reopen when durable state
-can differ from memory state.
-
-### Reduce private mocks
-
-Keep direct flight installation only for pure writer transition tests. Rename
-such tests so they claim evidence handling, not backend behavior.
-
-Storage claims must use `ScriptedObjectStore`.
-
-### Delete duplication
-
-After coverage moves to the correct layer:
-
-- remove repeated raw adapter claims from Seal and WAL tests;
-- remove repeated in-memory setup from durable test bodies;
-- remove copied partition, key, and entropy helpers;
-- replace polling loops with gates;
-- remove helpers that only supported deleted tests; and
-- keep typed-store tests focused on typed behavior.
-
-The migration is not complete while both the old and new forms prove the same
-claim.
+Do not keep a complex temporary expectation framework. Build the minimal shape
+directly.
 
 ## Review rules
 
-A test change must answer:
+Before accepting a test, answer:
 
-1. What semantic claim does this test prove?
+1. What semantic claim does it protect?
 2. What plausible incorrect implementation does it reject?
 3. Would it survive a structurally different correct implementation?
-4. Which test layer owns the claim?
-5. Is this the purest faithful level for the claim?
-6. What is the commit or authority boundary?
-7. Does the test check the state immediately before and after that boundary?
-8. Does each helper hide only irrelevant construction?
-9. Can a property, exhaustive matrix, or fixed script replace repeated cases?
-10. Does a storage claim pass through `ObjectStoreAdapter`?
-11. Does a durable claim cross reopen?
-12. Does failure output show the expected and observed domain facts?
-13. Did the change add a duplicate source of truth?
-14. Can a superseded private test or helper now be deleted?
+4. Is it at the purest faithful layer?
+5. Does it name only relevant faults and data?
+6. Does a storage claim pass through `ObjectStoreAdapter`?
+7. Does a durable claim cross reopen?
+8. Is call count or order truly part of the contract?
+9. Does failure output show the semantic mismatch?
+10. Can old test code now be deleted?
 
 ## Completion criteria
 
-The test-architecture work is complete when:
+The work is complete when:
 
-- one scripted object store controls all injected storage failures;
-- the adapter contract covers every evidence and error class;
-- no storage-engine test uses scheduler polling for causality;
-- checkpoint table and Seal failure matrices are complete;
-- collection is tested after every partial delete prefix;
-- ambiguous WAL and Seal creates are tested through the adapter;
-- durable tests reopen after each meaningful failure point;
-- typed stores no longer repeat raw adapter contracts;
-- common fixtures have one source;
-- script mismatches produce a useful trace; and
+- one minimal fault store owns injected storage failures;
+- normal operations need no script;
+- all configured faults are one-shot and verified;
+- impossible fault combinations cannot be built;
+- no test uses scheduler polling for causality;
+- authority creates have explicit no-resend checks;
+- checkpoint and collection failure matrices are complete;
+- durable tests reopen after meaningful failure points;
+- typed stores do not repeat raw adapter contracts;
+- common fixtures have one source; and
 - `just ci` passes.
 
-The desired result is not more test code. It is one clear test language for
-durable effects, fewer repeated examples, and stronger proof of the storage
-protocol.
+The desired result is a small test effect seam, direct Rust tests, and strong
+proof of durable behavior. The test store must remove complexity from tests,
+not move that complexity into a new framework.
