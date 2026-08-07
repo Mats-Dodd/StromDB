@@ -15,7 +15,7 @@ use strom_object_store::{CreateEvidence, ObjectStoreAdapter};
 use strom_storage_domain::{AttemptId, BatchId, Seal};
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
-use crate::Forest;
+use crate::forest::Forest;
 use crate::store::{
     CandidateTableEvidence, EncodedSeal, EncodedTable, SealStore, SealStoreError, TableStore,
     TableStoreError,

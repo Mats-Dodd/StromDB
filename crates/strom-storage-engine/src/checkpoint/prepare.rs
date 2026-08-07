@@ -10,7 +10,7 @@ use strom_storage_domain::{
     WalReplayPoint, encode_directory_sst, encode_ledger_sst,
 };
 
-use crate::Forest;
+use crate::forest::Forest;
 use crate::store::{EncodedSeal, EncodedTable};
 
 use super::{CheckpointInput, PreparedCheckpoint};

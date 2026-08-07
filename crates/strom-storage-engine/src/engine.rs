@@ -15,8 +15,8 @@ use strom_storage_domain::{
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::Forest;
 use crate::bootstrap::{BootstrapExit, bootstrap};
+use crate::forest::Forest;
 use crate::writer::{AdmissionRefusal, CommandEnvelope, CreateStream, WriterExit, spawn_writer};
 
 #[derive(Debug, Clone)]

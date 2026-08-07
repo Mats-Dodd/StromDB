@@ -11,5 +11,3 @@ mod writer;
 
 pub use engine::{CloseOutcome, Engine, OpenError, StreamError};
 pub use strom_storage_domain::PartitionId;
-
-pub(crate) use forest::{Applied, FoldContradiction, Forest};

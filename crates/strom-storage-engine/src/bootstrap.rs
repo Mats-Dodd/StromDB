@@ -12,7 +12,7 @@ use strom_storage_domain::{
     WalReplayPoint,
 };
 
-use crate::Forest;
+use crate::forest::Forest;
 use crate::forest::ForestContradiction;
 use crate::store::{
     EncodedSeal, EncodedWal, SealStore, SealStoreError, TableRows, TableStore, TableStoreError,

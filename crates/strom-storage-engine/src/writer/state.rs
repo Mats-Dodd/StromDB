@@ -12,8 +12,8 @@ use tokio::sync::oneshot;
 
 use crate::bootstrap::AuthoredClaim;
 use crate::checkpoint::{CheckpointInput, CheckpointInstall};
+use crate::forest::{Applied, FoldContradiction, Forest};
 use crate::store::EncodedWal;
-use crate::{Applied, FoldContradiction, Forest};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreateStream {
