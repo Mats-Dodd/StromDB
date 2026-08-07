@@ -62,7 +62,8 @@ struct Writer {
     checkpoint: Option<CheckpointFlight>,
     collector: Option<JoinHandle<()>>,
     checkpoint_attempt: u64,
-    checkpoint_requested: bool,
+    last_checkpoint_attempted_cut: Option<BatchId>,
+    retry_checkpoint_at: Option<BatchId>,
     next_batch: BatchId,
     adapter: strom_object_store::ObjectStoreAdapter,
     wal_store: WalStore,
@@ -132,8 +133,6 @@ impl Writer {
             durable_batch,
             next_batch,
         } = ready.into_writer_seed();
-        let checkpoint_requested =
-            suffix_span(seal.replay(), durable_batch) >= WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER;
         Self {
             partition,
             claim,
@@ -148,7 +147,8 @@ impl Writer {
             checkpoint: None,
             collector: None,
             checkpoint_attempt: 0,
-            checkpoint_requested,
+            last_checkpoint_attempted_cut: None,
+            retry_checkpoint_at: None,
             next_batch,
             wal_store: WalStore::new(adapter.clone()),
             adapter,
@@ -164,8 +164,7 @@ impl Writer {
                 self.promote_pending();
             }
             if ingress_open
-                && self.checkpoint.is_none()
-                && self.checkpoint_requested
+                && self.should_checkpoint()
                 && let Err(exit) = self.start_checkpoint()
             {
                 return self.terminate(exit).await;
@@ -326,9 +325,7 @@ impl Writer {
         // Only a fact consumes a WAL coordinate, so the suffix gate
         // sheds new mutations while idempotent replies stay answerable.
         if !decide_suffix_room(replay_batch(self.seal.replay()), self.next_batch) {
-            if self.checkpoint.is_none() {
-                self.checkpoint_requested = true;
-            }
+            self.retry_checkpoint_at = Some(self.durable_batch);
             completion.refuse(AdmissionRefusal::Overloaded);
             return;
         }
@@ -490,8 +487,29 @@ impl Writer {
             publication.clone(),
         ));
         self.checkpoint = Some(CheckpointFlight { publication, task });
-        self.checkpoint_requested = false;
+        self.last_checkpoint_attempted_cut = Some(self.durable_batch);
+        self.retry_checkpoint_at = None;
         Ok(())
+    }
+
+    fn should_checkpoint(&self) -> bool {
+        if self.checkpoint.is_some()
+            || suffix_span(self.seal.replay(), self.durable_batch)
+                < WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER
+        {
+            return false;
+        }
+        let head_is_unattempted = match self.last_checkpoint_attempted_cut {
+            None => true,
+            Some(attempted) => {
+                assert!(
+                    attempted <= self.durable_batch,
+                    "a checkpoint attempt never names a future durable cut"
+                );
+                attempted < self.durable_batch
+            }
+        };
+        head_is_unattempted || self.retry_checkpoint_at == Some(self.durable_batch)
     }
 
     fn complete_checkpoint(&mut self, outcome: CheckpointOutcome) -> Result<(), WriterExit> {
@@ -592,12 +610,6 @@ impl Writer {
             command.completion.send();
         }
         self.spare = flight.commands;
-        if self.checkpoint.is_none()
-            && suffix_span(self.seal.replay(), self.durable_batch)
-                >= WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER
-        {
-            self.checkpoint_requested = true;
-        }
     }
 }
 

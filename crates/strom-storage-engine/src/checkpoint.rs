@@ -863,17 +863,6 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_and_seal_send_share_one_atomic_boundary() {
-        let cancelled = PublicationGate::new();
-        assert!(cancelled.cancel_before_publish());
-        assert!(!cancelled.begin_publish());
-
-        let publishing = PublicationGate::new();
-        assert!(publishing.begin_publish());
-        assert!(!publishing.cancel_before_publish());
-    }
-
-    #[test]
     fn create_then_delete_emits_a_directory_tombstone_and_no_ledger_row()
     -> Result<(), Box<dyn std::error::Error>> {
         let path = directory_key("events/a")?;

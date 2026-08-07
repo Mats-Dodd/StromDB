@@ -5,7 +5,10 @@ use object_store::{ObjectStore, ObjectStoreExt as _};
 use strom_common::{Entropy, Seed};
 use strom_domain::{CreateOutcome, ExpiryPolicy, StreamContentType, StreamId, StreamLifecycle};
 use strom_object_store::ObjectKey;
-use strom_storage_domain::{BatchId, SealGeneration, SealKey, SealNamespace, WalKey, WalNamespace};
+use strom_storage_domain::{
+    AttemptId, BatchId, FreshIdentity, SealGeneration, SealKey, SealNamespace, StoreKind, TableKey,
+    TableObjectId, WalKey, WalNamespace,
+};
 use strom_storage_engine::{Engine, StreamError};
 
 pub(crate) type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -40,6 +43,25 @@ pub(crate) fn seal_key(generation: u64) -> ObjectKey {
         .to_string()
         .parse()
         .expect("Seal key spelling is a canonical object key")
+}
+
+pub(crate) fn checkpoint_table_key(store: StoreKind, ordinal: u32) -> ObjectKey {
+    checkpoint_table_key_at_attempt(store, 0, ordinal)
+}
+
+pub(crate) fn checkpoint_table_key_at_attempt(
+    store: StoreKind,
+    attempt: u64,
+    ordinal: u32,
+) -> ObjectKey {
+    let birth = SealGeneration::try_from(3).expect("the first checkpoint Seal is generation three");
+    let owner = SealGeneration::try_from(2).expect("the first writer claim is generation two");
+    let fresh = FreshIdentity::new(birth, AttemptId::new(owner, attempt), ordinal)
+        .expect("the first checkpoint table has a fresh identity");
+    TableKey::new(TableObjectId::new(fresh, store))
+        .to_string()
+        .parse()
+        .expect("table key spelling is a canonical object key")
 }
 
 pub(crate) fn seal_namespace() -> ObjectKey {
