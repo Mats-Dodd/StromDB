@@ -48,8 +48,11 @@ pub(super) async fn collect(wal_store: WalStore, table_store: TableStore, input:
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use std::num::NonZeroU64;
     use std::sync::Arc;
+    use strom_common::MonotonicInstant;
 
     use object_store::path::Path;
     use object_store::{ObjectStore, ObjectStoreExt as _};
@@ -466,8 +469,14 @@ mod tests {
             return Err("collection fixture did not complete bootstrap".into());
         };
 
-        let mut writer = WriterMachine::from_recovery(recovery);
-        let (outputs, exit) = writer.handle(WriterEvent::Started).into_parts();
+        let mut writer = WriterMachine::from_recovery(
+            recovery,
+            Duration::ZERO,
+            strom_storage_domain::WAL_ENCODED_BYTES_MAX,
+        );
+        let (outputs, exit) = writer
+            .handle(MonotonicInstant::ZERO, WriterEvent::Started)
+            .into_parts();
         assert_eq!(None, exit);
         let mut preparations = outputs.into_iter().filter_map(|output| match output {
             WriterOutput::Effect(WriterEffect::PrepareCheckpoint(input)) => Some(input),
@@ -489,10 +498,13 @@ mod tests {
         let prepared =
             PreparedCheckpoint::new(ticket, source, state.successor.clone(), snapshot, candidate);
         let (outputs, exit) = writer
-            .handle(WriterEvent::CheckpointPrepared {
-                ticket,
-                outcome: PreparationOutcome::Prepared(Box::new(prepared)),
-            })
+            .handle(
+                MonotonicInstant::ZERO,
+                WriterEvent::CheckpointPrepared {
+                    ticket,
+                    outcome: PreparationOutcome::Prepared(Box::new(prepared)),
+                },
+            )
             .into_parts();
         assert_eq!(None, exit);
         assert!(outputs.iter().any(|output| matches!(
@@ -501,10 +513,13 @@ mod tests {
                 if *issued == ticket
         )));
         let (outputs, exit) = writer
-            .handle(WriterEvent::SealPublished {
-                ticket,
-                result: Ok(SealPublication::Authored),
-            })
+            .handle(
+                MonotonicInstant::ZERO,
+                WriterEvent::SealPublished {
+                    ticket,
+                    result: Ok(SealPublication::Authored),
+                },
+            )
             .into_parts();
         assert_eq!(None, exit);
         outputs

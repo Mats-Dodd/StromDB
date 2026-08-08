@@ -13,10 +13,10 @@ use strom_storage_domain::{
     SealGeneration, SortedRun, StoreKind, StreamRecord, StreamUid, TableKey, TableObjectId,
     TableRef, TreeVersion, WalReplayPoint, encode_directory_sst, encode_ledger_sst, encode_seal,
 };
-use strom_storage_engine::{CloseOutcome, Engine, OpenError};
+use strom_storage_engine::{CloseOutcome, OpenError};
 
 use super::support::{
-    TestResult, assert_object_present, entropy, seal_key, seal_namespace, wal_key,
+    TestResult, assert_object_present, entropy, open_engine, seal_key, seal_namespace, wal_key,
 };
 
 #[tokio::test]
@@ -24,12 +24,12 @@ async fn empty_namespace_creates_genesis_and_reopens() -> TestResult {
     let store = FaultStore::new();
     let backend = store.backend();
 
-    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    let engine = open_engine(Arc::clone(&backend), entropy()).await?;
     let partition = engine.partition_id();
     assert_eq!(CloseOutcome::Shutdown, engine.shutdown().await);
     store.assert_called_once(Operation::Create, &seal_key(1))?;
 
-    let reopened = Engine::open(backend, entropy()).await?;
+    let reopened = open_engine(backend, entropy()).await?;
     assert_eq!(partition, reopened.partition_id());
     assert_eq!(CloseOutcome::Shutdown, reopened.shutdown().await);
     store.verify()?;
@@ -47,7 +47,7 @@ async fn genesis_race_loser_adopts_the_winning_partition() -> TestResult {
     let backend = store.backend();
     let winner = partition();
 
-    let opening = Engine::open(Arc::clone(&backend), entropy());
+    let opening = open_engine(Arc::clone(&backend), entropy());
     tokio::pin!(opening);
     tokio::select! {
         () = gate.wait_until_blocked() => {}
@@ -72,10 +72,10 @@ async fn retryable_store_failure_crosses_the_interpreter_seam() -> TestResult {
     })?;
 
     assert!(matches!(
-        Engine::open(store.backend(), entropy()).await,
+        open_engine(store.backend(), entropy()).await,
         Err(OpenError::Retryable { .. })
     ));
-    let reopened = Engine::open(store.backend(), entropy()).await?;
+    let reopened = open_engine(store.backend(), entropy()).await?;
     assert_eq!(CloseOutcome::Shutdown, reopened.shutdown().await);
     store.verify()?;
     Ok(())
@@ -172,7 +172,7 @@ async fn planted_tables_and_wal_replay_open_the_expected_view() -> TestResult {
     )
     .await?;
 
-    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    let engine = open_engine(Arc::clone(&backend), entropy()).await?;
     assert_eq!(
         StreamStatus::Live {
             content_type: "application/json".parse()?,

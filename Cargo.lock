@@ -3249,6 +3249,7 @@ version = "0.1.0"
 dependencies = [
  "imbl",
  "proptest",
+ "strom-common",
  "strom-domain",
  "strom-storage-domain",
  "thiserror",

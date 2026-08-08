@@ -1,7 +1,13 @@
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use proptest::prelude::*;
-use strom_storage_domain::WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER;
+use strom_common::MonotonicInstant;
+use strom_domain::StreamContentType;
+use strom_storage_domain::{
+    WAL_ENCODED_BYTES_MAX, WAL_FACT_ENCODED_FIXED_BYTES_MAX, WAL_RUN_FIXED_ENCODED_BYTES_MAX,
+    WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER,
+};
 use strom_storage_protocol::{
     CheckpointInput, EffectKey, PreparationOutcome, SealPublication, TypedStoreError,
     WRITER_OUTPUTS_PER_STEP_MAX, WalEstablishment, WriterAction, WriterEffect, WriterEvent,
@@ -10,10 +16,11 @@ use strom_storage_protocol::{
 
 use super::fixtures::{
     CreateReply, TestResult, complete_success, create, prepared, recovered_machine_at,
-    settle_replies,
+    recovered_machine_at_with_options, settle_replies,
 };
 
 const DRAIN_STEPS_MAX: usize = 64;
+const PACING_INTERVAL: Duration = Duration::from_millis(10);
 
 enum Outstanding {
     Effect(WriterEffect),
@@ -40,6 +47,15 @@ proptest! {
         run_schedule(WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, "checkpoint", &choices)
             .expect("the generated checkpoint schedule is legal");
     }
+
+    #[test]
+    fn generated_paced_schedules_start_wal_only_for_the_four_declared_reasons(
+        delays_ms in prop::collection::vec(0u8..=20, 1..=64),
+        flush_buffer_bytes in 1usize..=WAL_ENCODED_BYTES_MAX,
+    ) {
+        run_paced_schedule(&delays_ms, flush_buffer_bytes)
+            .expect("the generated paced schedule is legal");
+    }
 }
 
 #[test]
@@ -49,6 +65,160 @@ fn scripted_overlap_never_double_issues_machine_effect_slots() -> TestResult {
         "effect-slots",
         &[[1, 0], [1, 0], [1, 0], [0, 1], [0, 1]],
     )
+}
+
+struct PacingModel {
+    flush_buffer_bytes: usize,
+    flush_deadline: Option<MonotonicInstant>,
+    flush_started_at_last: Option<MonotonicInstant>,
+    pending_bytes_estimated: usize,
+}
+
+fn run_paced_schedule(delays_ms: &[u8], flush_buffer_bytes: usize) -> TestResult {
+    let mut machine = recovered_machine_at_with_options(1, PACING_INTERVAL, flush_buffer_bytes)?;
+    let mut model = PacingModel {
+        flush_buffer_bytes,
+        flush_deadline: None,
+        flush_started_at_last: None,
+        pending_bytes_estimated: WAL_RUN_FIXED_ENCODED_BYTES_MAX,
+    };
+    let started = observe_paced_step(
+        &mut machine,
+        MonotonicInstant::ZERO,
+        WriterEvent::Started,
+        false,
+        &mut model,
+    )?;
+    assert_eq!(None, started, "paced writer startup remains live");
+    let mut now = MonotonicInstant::ZERO;
+    let mut replies = Vec::new();
+
+    for (ordinal, delay_ms) in delays_ms.iter().copied().enumerate() {
+        now = now.saturating_add(Duration::from_millis(u64::from(delay_ms)));
+        observe_due_flushes(&mut machine, now, &mut model)?;
+
+        let raw = format!("paced/{ordinal}");
+        let (command, reply) = create(&raw)?;
+        replies.push(reply);
+        let fact_bytes_estimated = WAL_FACT_ENCODED_FIXED_BYTES_MAX
+            .checked_add(raw.len())
+            .and_then(|bytes| bytes.checked_add(StreamContentType::octet_stream().as_str().len()))
+            .ok_or("the generated fact estimate fits in usize")?;
+        model.pending_bytes_estimated = model
+            .pending_bytes_estimated
+            .checked_add(fact_bytes_estimated)
+            .ok_or("the generated pending estimate fits in usize")?;
+        let exit = observe_paced_step(
+            &mut machine,
+            now,
+            WriterEvent::Command(command),
+            false,
+            &mut model,
+        )?;
+        assert_eq!(None, exit, "paced command schedules remain live");
+    }
+
+    observe_due_flushes(&mut machine, now, &mut model)?;
+    let exit = observe_paced_step(
+        &mut machine,
+        now,
+        WriterEvent::IngressClosed,
+        true,
+        &mut model,
+    )?;
+    assert_eq!(
+        Some(WriterExit::Shutdown),
+        exit,
+        "the generated paced schedule drains cleanly"
+    );
+    assert_all_replies_settled(replies);
+    Ok(())
+}
+
+fn observe_paced_step(
+    machine: &mut WriterMachine,
+    now: MonotonicInstant,
+    event: WriterEvent,
+    ingress_draining: bool,
+    model: &mut PacingModel,
+) -> TestResult<Option<WriterExit>> {
+    let (outputs, exit) = machine.handle(now, event).into_parts();
+    assert!(
+        outputs.len() <= WRITER_OUTPUTS_PER_STEP_MAX,
+        "a paced event stays inside the public output bound"
+    );
+    let mut wal_batch = None;
+    for output in outputs {
+        match output {
+            WriterOutput::Effect(WriterEffect::EstablishWal(candidate)) => {
+                assert!(wal_batch.is_none(), "one paced step starts at most one WAL");
+                let spacing_satisfied = model
+                    .flush_started_at_last
+                    .is_none_or(|started| now >= started.saturating_add(PACING_INTERVAL));
+                assert!(
+                    ingress_draining
+                        || model.pending_bytes_estimated >= model.flush_buffer_bytes
+                        || spacing_satisfied,
+                    "every generated WAL start is justified by shutdown, byte pressure, or spacing; the generated barrier stays below hard capacity"
+                );
+                model.pending_bytes_estimated = WAL_RUN_FIXED_ENCODED_BYTES_MAX;
+                model.flush_started_at_last = Some(now);
+                wal_batch = Some(candidate.batch());
+            }
+            WriterOutput::Action(WriterAction::ArmFlush { deadline }) => {
+                assert!(
+                    model.flush_deadline.is_none(),
+                    "a paced schedule has at most one armed timer"
+                );
+                assert_eq!(
+                    model
+                        .flush_started_at_last
+                        .ok_or("an armed timer has a prior flush start")?
+                        .saturating_add(PACING_INTERVAL),
+                    deadline,
+                    "the timer retains the absolute spacing boundary"
+                );
+                model.flush_deadline = Some(deadline);
+            }
+            WriterOutput::Action(WriterAction::SendReplies(replies)) => settle_replies(replies),
+            WriterOutput::Action(WriterAction::PublishView(_)) => {}
+            WriterOutput::Effect(
+                WriterEffect::PrepareCheckpoint(_)
+                | WriterEffect::PublishAuthority { .. }
+                | WriterEffect::Collect(_),
+            )
+            | WriterOutput::Action(WriterAction::CancelCheckpointPreparation { .. }) => {
+                return Err("a short paced schedule does not reach checkpoint work".into());
+            }
+        }
+    }
+    if let Some(batch) = wal_batch {
+        let completion_exit = observe_paced_step(
+            machine,
+            now,
+            WriterEvent::WalEstablished {
+                batch,
+                result: Ok(WalEstablishment::Durable),
+            },
+            ingress_draining,
+            model,
+        )?;
+        return Ok(completion_exit.or(exit));
+    }
+    Ok(exit)
+}
+
+fn observe_due_flushes(
+    machine: &mut WriterMachine,
+    now: MonotonicInstant,
+    model: &mut PacingModel,
+) -> TestResult {
+    while model.flush_deadline.is_some_and(|deadline| deadline <= now) {
+        model.flush_deadline = None;
+        let exit = observe_paced_step(machine, now, WriterEvent::FlushDue, false, model)?;
+        assert_eq!(None, exit, "a due flush observation remains live");
+    }
+    Ok(())
 }
 
 fn run_schedule(durable: u64, label: &str, choices: &[[u8; 2]]) -> TestResult {
@@ -136,7 +306,10 @@ fn start_machine(
     machine: &mut WriterMachine,
     outstanding: &mut Vec<Outstanding>,
 ) -> TestResult<Option<WriterExit>> {
-    observe_step(machine.handle(WriterEvent::Started), outstanding)
+    observe_step(
+        machine.handle(MonotonicInstant::ZERO, WriterEvent::Started),
+        outstanding,
+    )
 }
 
 fn issue_command(
@@ -148,7 +321,10 @@ fn issue_command(
 ) -> TestResult<Option<WriterExit>> {
     let (command, reply) = create(&format!("generated/{label}/{ordinal}"))?;
     replies.push(reply);
-    observe_step(machine.handle(WriterEvent::Command(command)), outstanding)
+    observe_step(
+        machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(command)),
+        outstanding,
+    )
 }
 
 fn complete_generated(
@@ -180,14 +356,17 @@ fn complete_generated(
         }
         Outstanding::Cancelling(input) => cancellation_event(input, choice[1])?,
     };
-    observe_step(machine.handle(event), outstanding)
+    observe_step(machine.handle(MonotonicInstant::ZERO, event), outstanding)
 }
 
 fn close_ingress(
     machine: &mut WriterMachine,
     outstanding: &mut Vec<Outstanding>,
 ) -> TestResult<Option<WriterExit>> {
-    observe_step(machine.handle(WriterEvent::IngressClosed), outstanding)
+    observe_step(
+        machine.handle(MonotonicInstant::ZERO, WriterEvent::IngressClosed),
+        outstanding,
+    )
 }
 
 fn assert_all_replies_settled(replies: Vec<CreateReply>) {
@@ -214,7 +393,7 @@ fn complete_for_shutdown(
             ticket: input.ticket(),
         },
     };
-    observe_step(machine.handle(event), outstanding)
+    observe_step(machine.handle(MonotonicInstant::ZERO, event), outstanding)
 }
 
 fn wal_result(choice: u8) -> Result<WalEstablishment, TypedStoreError> {
@@ -317,6 +496,9 @@ fn observe_step(
             WriterOutput::Effect(effect) => outstanding.push(Outstanding::Effect(effect)),
             WriterOutput::Action(WriterAction::SendReplies(replies)) => settle_replies(replies),
             WriterOutput::Action(WriterAction::PublishView(_)) => {}
+            WriterOutput::Action(WriterAction::ArmFlush { .. }) => {
+                return Err("eager generated schedules never arm a flush timer".into());
+            }
             WriterOutput::Action(WriterAction::CancelCheckpointPreparation { ticket }) => {
                 let key = EffectKey::CheckpointPreparation { ticket };
                 let index = outstanding

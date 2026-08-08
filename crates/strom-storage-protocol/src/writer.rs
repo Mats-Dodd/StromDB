@@ -1,12 +1,17 @@
 //! Pure admission-to-durability writer machine.
 
+use std::time::Duration;
+
+use strom_common::MonotonicInstant;
 use strom_domain::{
     CloseStreamOutcome, CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamPath,
 };
 use strom_storage_domain::{
     AttemptId, BatchId, DirectoryEntry, EncodedAuthoritySeal, EncodedWal, OperationFact,
-    OwnerToken, PartitionId, Seal, SealGeneration, WAL_RUN_FACTS_MAX,
-    WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WalBody, WalFacts, WalObject, WalReplayPoint,
+    OwnerToken, PartitionId, Seal, SealGeneration, WAL_ENCODED_BYTES_MAX,
+    WAL_FACT_ENCODED_BYTES_ESTIMATE_MAX, WAL_RUN_FIXED_ENCODED_BYTES_MAX,
+    WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WRITER_PENDING_COMMANDS_MAX, WalBody, WalFacts, WalObject,
+    WalReplayPoint,
 };
 use tokio::sync::oneshot;
 
@@ -34,7 +39,7 @@ pub enum AdmissionRefusal {
     PathCapacityExhausted,
     #[error("stream path is not live")]
     PathNotLive,
-    #[error("partition writer is at a bounded capacity limit")]
+    #[error("partition writer has exhausted its bounded WAL suffix")]
     Overloaded,
 }
 
@@ -227,6 +232,7 @@ pub enum PreparationOutcome {
 pub enum WriterEvent {
     Started,
     Command(CommandEnvelope),
+    FlushDue,
     IngressClosed,
     WalEstablished {
         batch: BatchId,
@@ -343,6 +349,7 @@ impl WriterEffect {
 /// Immediate interpreter mutation requested by the machine.
 #[derive(Debug)]
 pub enum WriterAction {
+    ArmFlush { deadline: MonotonicInstant },
     PublishView(Forest),
     SendReplies(Vec<Completion>),
     CancelCheckpointPreparation { ticket: CheckpointTicket },
@@ -460,8 +467,12 @@ pub struct WriterMachine {
     durable: Forest,
     durable_batch: BatchId,
     next_batch: BatchId,
-    pending: Vec<PendingCommand>,
+    pending: PendingBarrier,
     flight: Option<InFlight>,
+    flush_interval_min: Duration,
+    flush_buffer_bytes: usize,
+    last_flush_started_at: Option<MonotonicInstant>,
+    flush_armed: bool,
     checkpoint_attempt: u64,
     last_checkpoint_attempted_cut: Option<BatchId>,
     retry_checkpoint_at: Option<BatchId>,
@@ -475,6 +486,61 @@ struct PendingCommand {
     /// `None` when an idempotent reply inherits an earlier fact's barrier.
     fact: Option<OperationFact>,
     completion: Completion,
+}
+
+#[derive(Debug)]
+struct PendingBarrier {
+    commands: Vec<PendingCommand>,
+    facts_bytes_estimated: usize,
+}
+
+impl PendingBarrier {
+    fn new() -> Self {
+        Self {
+            commands: Vec::with_capacity(WRITER_PENDING_COMMANDS_MAX),
+            facts_bytes_estimated: 0,
+        }
+    }
+
+    fn into_commands(self) -> Vec<PendingCommand> {
+        self.commands
+    }
+
+    fn push_fact(&mut self, fact: OperationFact, completion: Completion) {
+        self.facts_bytes_estimated = self
+            .facts_bytes_estimated
+            .checked_add(fact.estimated_encoded_bytes())
+            .expect("the pending fact estimates fit in usize");
+        self.commands.push(PendingCommand {
+            fact: Some(fact),
+            completion,
+        });
+    }
+
+    fn push_idempotent(&mut self, completion: Completion) {
+        self.commands.push(PendingCommand {
+            fact: None,
+            completion,
+        });
+    }
+
+    const fn bytes_estimated(&self) -> usize {
+        WAL_RUN_FIXED_ENCODED_BYTES_MAX
+            .checked_add(self.facts_bytes_estimated)
+            .expect("the pending RUN estimate fits in usize")
+    }
+
+    const fn has_facts(&self) -> bool {
+        self.facts_bytes_estimated > 0
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+
+    const fn len(&self) -> usize {
+        self.commands.len()
+    }
 }
 
 #[derive(Debug)]
@@ -492,7 +558,11 @@ impl WriterMachine {
     /// Panics unless the recovery claim names its Seal and the durable head is
     /// at or beyond the Seal replay cut with a successor coordinate available.
     #[must_use]
-    pub fn from_recovery(recovery: WriterRecovery) -> Self {
+    pub fn from_recovery(
+        recovery: WriterRecovery,
+        flush_interval_min: Duration,
+        flush_buffer_bytes: usize,
+    ) -> Self {
         let WriterRecovery {
             claim,
             seal,
@@ -512,6 +582,10 @@ impl WriterMachine {
         let next_batch = durable_batch
             .successor()
             .expect("bootstrap proves a successor coordinate after its durable FENCE");
+        assert!(
+            (1..=WAL_ENCODED_BYTES_MAX).contains(&flush_buffer_bytes),
+            "the writer flush byte budget is nonzero and within the WAL object bound"
+        );
         Self {
             started: false,
             claim,
@@ -521,8 +595,12 @@ impl WriterMachine {
             durable: forest,
             durable_batch,
             next_batch,
-            pending: Vec::with_capacity(WAL_RUN_FACTS_MAX),
+            pending: PendingBarrier::new(),
             flight: None,
+            flush_interval_min,
+            flush_buffer_bytes,
+            last_flush_started_at: None,
+            flush_armed: false,
             checkpoint_attempt: 0,
             last_checkpoint_attempted_cut: None,
             retry_checkpoint_at: None,
@@ -537,13 +615,19 @@ impl WriterMachine {
         self.seal.partition()
     }
 
+    /// Whether the interpreter may poll one more ingress command.
+    #[must_use]
+    pub fn admission_open(&self) -> bool {
+        self.ingress_open && !self.hard_full()
+    }
+
     /// Apply one observation and return all ordered work it causes.
     ///
     /// # Panics
     ///
     /// Panics when the event violates an issued-effect identity, budget, or
     /// machine-state invariant.
-    pub fn handle(&mut self, event: WriterEvent) -> WriterStep {
+    pub fn handle(&mut self, now: MonotonicInstant, event: WriterEvent) -> WriterStep {
         let is_start = matches!(&event, WriterEvent::Started);
         assert_eq!(
             !self.started, is_start,
@@ -555,7 +639,7 @@ impl WriterMachine {
         let (mut outputs, exit) = self.apply_event(event);
         let exit = match exit {
             Some(exit) => Some(exit),
-            None => self.schedule(&mut outputs),
+            None => self.schedule(now, &mut outputs),
         };
         assert!(
             outputs.len() <= WRITER_OUTPUTS_PER_STEP_MAX,
@@ -578,14 +662,22 @@ impl WriterMachine {
             WriterEvent::Started => None,
             WriterEvent::Command(envelope) => {
                 assert!(
-                    self.ingress_open,
-                    "commands arrive only while ingress is open"
+                    self.admission_open(),
+                    "commands arrive only while machine admission is open"
                 );
                 if let Some(completion) = self.admit(envelope) {
                     outputs.push(WriterOutput::Action(WriterAction::SendReplies(vec![
                         completion,
                     ])));
                 }
+                None
+            }
+            WriterEvent::FlushDue => {
+                assert!(
+                    self.flush_armed,
+                    "a flush deadline is observed only for the one armed timer"
+                );
+                self.flush_armed = false;
                 None
             }
             WriterEvent::IngressClosed => {
@@ -780,9 +872,31 @@ impl WriterMachine {
         }
     }
 
-    fn schedule(&mut self, outputs: &mut Vec<WriterOutput>) -> Option<WriterExit> {
-        if let Some(output) = self.take_flight() {
-            outputs.push(output);
+    #[expect(
+        clippy::unwrap_in_result,
+        reason = "unsatisfied spacing without a prior start is a process-local machine invariant"
+    )]
+    fn schedule(
+        &mut self,
+        now: MonotonicInstant,
+        outputs: &mut Vec<WriterOutput>,
+    ) -> Option<WriterExit> {
+        if self.flight.is_none() && !self.pending.is_empty() {
+            if !self.pending_has_facts()
+                || !self.ingress_open
+                || self.hard_full()
+                || self.pending.bytes_estimated() >= self.flush_buffer_bytes
+                || self.spacing_satisfied(now)
+            {
+                outputs.push(self.drain_pending(now));
+            } else if !self.flush_armed {
+                let deadline = self
+                    .last_flush_started_at
+                    .expect("unsatisfied spacing has one prior flush start")
+                    .saturating_add(self.flush_interval_min);
+                self.flush_armed = true;
+                outputs.push(WriterOutput::Action(WriterAction::ArmFlush { deadline }));
+            }
         }
 
         if self.ingress_open {
@@ -800,10 +914,10 @@ impl WriterMachine {
 
     fn admit(&mut self, envelope: CommandEnvelope) -> Option<Completion> {
         if self.flight.is_none() {
-            self.assert_quiescent();
-        }
-        if self.pending.len() == WAL_RUN_FACTS_MAX {
-            return Some(envelope.refusal(AdmissionRefusal::Overloaded));
+            assert!(
+                self.pending.is_empty() || self.pending_has_facts(),
+                "an all-idempotent barrier drains in the event that creates it"
+            );
         }
 
         let batch = self.next_batch;
@@ -875,15 +989,16 @@ impl WriterMachine {
         }
     }
 
-    fn take_flight(&mut self) -> Option<WriterOutput> {
-        if self.flight.is_some() {
-            return None;
-        }
-        if self.pending.is_empty() {
-            self.assert_quiescent();
-            return None;
-        }
-        let commands = std::mem::replace(&mut self.pending, Vec::with_capacity(WAL_RUN_FACTS_MAX));
+    fn drain_pending(&mut self, now: MonotonicInstant) -> WriterOutput {
+        assert!(
+            self.flight.is_none(),
+            "a writer drains its pending barrier only without an active WAL flight"
+        );
+        assert!(
+            !self.pending.is_empty(),
+            "a writer drains only a nonempty pending barrier"
+        );
+        let commands = std::mem::replace(&mut self.pending, PendingBarrier::new()).into_commands();
         let mut facts = Vec::new();
         let mut replies = Vec::with_capacity(commands.len());
         for PendingCommand { fact, completion } in commands {
@@ -898,7 +1013,7 @@ impl WriterMachine {
                 "an all-idempotent barrier leaves admitted and durable state equal"
             );
             self.admitted = self.durable.clone();
-            return Some(WriterOutput::Action(WriterAction::SendReplies(replies)));
+            return WriterOutput::Action(WriterAction::SendReplies(replies));
         }
 
         let batch = self.next_batch;
@@ -917,7 +1032,8 @@ impl WriterMachine {
             forest: self.admitted.clone(),
             replies,
         });
-        Some(WriterOutput::Effect(WriterEffect::EstablishWal(encoded)))
+        self.last_flush_started_at = Some(now);
+        WriterOutput::Effect(WriterEffect::EstablishWal(encoded))
     }
 
     fn record_wal_durable(&mut self, batch: BatchId, outputs: &mut Vec<WriterOutput>) {
@@ -1034,21 +1150,19 @@ impl WriterMachine {
             return Some(completion.refusal(AdmissionRefusal::Overloaded));
         }
         self.admitted = admitted.forest;
-        self.pending.push(PendingCommand {
-            fact: Some(admitted.fact),
-            completion,
-        });
+        self.pending.push_fact(admitted.fact, completion);
+        assert!(
+            self.pending.bytes_estimated() <= WAL_ENCODED_BYTES_MAX,
+            "admission keeps the pending WAL estimate within the hard object bound"
+        );
         None
     }
 
     fn accept_idempotent(&mut self, completion: Completion) -> Option<Completion> {
-        if self.flight.is_none() {
+        if self.flight.is_none() && !self.pending_has_facts() {
             Some(completion)
         } else {
-            self.pending.push(PendingCommand {
-                fact: None,
-                completion,
-            });
+            self.pending.push_idempotent(completion);
             None
         }
     }
@@ -1077,24 +1191,28 @@ impl WriterMachine {
             "no flight and empty pending shares admitted and durable forest roots"
         );
     }
-}
 
-impl CommandEnvelope {
-    fn refusal(self, refusal: AdmissionRefusal) -> Completion {
-        match self {
-            Self::Create { command: _, reply } => Completion::Create {
-                outcome: Err(refusal),
-                reply,
-            },
-            Self::Close { path: _, reply } => Completion::Close {
-                outcome: Err(refusal),
-                reply,
-            },
-            Self::Delete { path: _, reply } => Completion::Delete {
-                outcome: Err(refusal),
-                reply,
-            },
-        }
+    fn hard_full(&self) -> bool {
+        assert!(
+            self.pending.len() <= WRITER_PENDING_COMMANDS_MAX,
+            "the pending command barrier stays inside its named memory bound"
+        );
+        self.pending.len() == WRITER_PENDING_COMMANDS_MAX
+            || self
+                .pending
+                .bytes_estimated()
+                .checked_add(WAL_FACT_ENCODED_BYTES_ESTIMATE_MAX)
+                .expect("the pending and worst-case fact estimates fit in usize")
+                > WAL_ENCODED_BYTES_MAX
+    }
+
+    const fn pending_has_facts(&self) -> bool {
+        self.pending.has_facts()
+    }
+
+    fn spacing_satisfied(&self, now: MonotonicInstant) -> bool {
+        self.last_flush_started_at
+            .is_none_or(|started| now >= started.saturating_add(self.flush_interval_min))
     }
 }
 

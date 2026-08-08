@@ -1,13 +1,15 @@
 use std::num::NonZeroU64;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::time::Duration;
 
+use strom_common::MonotonicInstant;
 use strom_domain::{
     CloseStreamOutcome, CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamTtl,
 };
 use strom_storage_domain::{
     AttemptId, BatchId, OperationFact, Seal, SealGeneration, StreamUid, TreeVersion,
-    WAL_RUN_FACTS_MAX, WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WAL_SUFFIX_COORDINATES_MAX_V2,
-    WalReplayPoint,
+    WAL_FACT_ENCODED_FIXED_BYTES_MAX, WAL_RUN_FACTS_MAX, WAL_RUN_FIXED_ENCODED_BYTES_MAX,
+    WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WAL_SUFFIX_COORDINATES_MAX_V2, WalReplayPoint,
 };
 use strom_storage_protocol::{
     AdmissionRefusal, Applied, CheckpointTicket, CommandEnvelope, CreateStream, Forest,
@@ -19,6 +21,9 @@ use tokio::sync::oneshot;
 use super::fixtures::*;
 
 const STALE_ATTEMPT_COUNTER: u64 = 99;
+const FLUSH_INTERVAL_MS: u64 = 250;
+const FIRST_COMMAND_AT_MS: u64 = 100;
+const SECOND_COMMAND_DELAY_MS: u64 = 50;
 
 #[derive(Clone, Copy)]
 enum CheckpointStage {
@@ -77,17 +82,21 @@ impl SealFailure {
 fn wal_durability_orders_publication_before_reply_release() -> TestResult {
     let mut machine = machine_at(1)?;
     let (command, mut reply) = create("events/ordered")?;
-    let batch = establish_wal(machine.handle(WriterEvent::Command(command)))?;
+    let batch =
+        establish_wal(machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(command)))?;
     assert!(matches!(
         reply.try_recv(),
         Err(oneshot::error::TryRecvError::Empty)
     ));
 
     let (outputs, exit) = machine
-        .handle(WriterEvent::WalEstablished {
-            batch,
-            result: Ok(WalEstablishment::Durable),
-        })
+        .handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::WalEstablished {
+                batch,
+                result: Ok(WalEstablishment::Durable),
+            },
+        )
         .into_parts();
     assert_eq!(None, exit);
     assert!(matches!(
@@ -107,7 +116,9 @@ fn wal_durability_orders_publication_before_reply_release() -> TestResult {
 #[test]
 fn closing_during_preparation_accepts_both_exact_termination_races() -> TestResult {
     let (mut cancelled, ticket, _input) = machine_with_preparation()?;
-    let (outputs, exit) = cancelled.handle(WriterEvent::IngressClosed).into_parts();
+    let (outputs, exit) = cancelled
+        .handle(MonotonicInstant::ZERO, WriterEvent::IngressClosed)
+        .into_parts();
     assert_eq!(None, exit);
     assert!(matches!(
         outputs.as_slice(),
@@ -116,13 +127,18 @@ fn closing_during_preparation_accepts_both_exact_termination_races() -> TestResu
         )] if *observed == ticket
     ));
     let (outputs, exit) = cancelled
-        .handle(WriterEvent::CheckpointPreparationCancelled { ticket })
+        .handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::CheckpointPreparationCancelled { ticket },
+        )
         .into_parts();
     assert!(outputs.is_empty());
     assert_eq!(Some(WriterExit::Shutdown), exit);
 
     let (mut completed, ticket, input) = machine_with_preparation()?;
-    let (outputs, exit) = completed.handle(WriterEvent::IngressClosed).into_parts();
+    let (outputs, exit) = completed
+        .handle(MonotonicInstant::ZERO, WriterEvent::IngressClosed)
+        .into_parts();
     assert_eq!(None, exit);
     assert!(matches!(
         outputs.as_slice(),
@@ -131,10 +147,13 @@ fn closing_during_preparation_accepts_both_exact_termination_races() -> TestResu
         )] if *observed == ticket
     ));
     let (outputs, exit) = completed
-        .handle(WriterEvent::CheckpointPrepared {
-            ticket,
-            outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
-        })
+        .handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::CheckpointPrepared {
+                ticket,
+                outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
+            },
+        )
         .into_parts();
     assert!(
         outputs.is_empty(),
@@ -148,19 +167,25 @@ fn closing_during_preparation_accepts_both_exact_termination_races() -> TestResu
 fn closure_after_preparation_waits_for_publication_then_skips_collection() -> TestResult {
     let (mut machine, ticket, input) = machine_with_preparation()?;
     assert_publication(
-        machine.handle(WriterEvent::CheckpointPrepared {
-            ticket,
-            outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
-        }),
+        machine.handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::CheckpointPrepared {
+                ticket,
+                outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
+            },
+        ),
         ticket,
     );
-    assert_empty_step(machine.handle(WriterEvent::IngressClosed));
+    assert_empty_step(machine.handle(MonotonicInstant::ZERO, WriterEvent::IngressClosed));
 
     let (outputs, exit) = machine
-        .handle(WriterEvent::SealPublished {
-            ticket,
-            result: Ok(SealPublication::Authored),
-        })
+        .handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::SealPublished {
+                ticket,
+                result: Ok(SealPublication::Authored),
+            },
+        )
         .into_parts();
     assert!(matches!(
         outputs.as_slice(),
@@ -179,17 +204,22 @@ fn wal_and_checkpoint_completions_are_legal_in_either_order() -> TestResult {
         } else {
             "events/wal-first"
         })?;
-        let batch = establish_wal(machine.handle(WriterEvent::Command(command)))?;
+        let batch =
+            establish_wal(machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(command)))?;
 
         if checkpoint_first {
             assert_publication(
-                machine.handle(WriterEvent::CheckpointPrepared {
-                    ticket,
-                    outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
-                }),
+                machine.handle(
+                    MonotonicInstant::ZERO,
+                    WriterEvent::CheckpointPrepared {
+                        ticket,
+                        outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
+                    },
+                ),
                 ticket,
             );
             assert!(has_publish_then_replies(machine.handle(
+                MonotonicInstant::ZERO,
                 WriterEvent::WalEstablished {
                     batch,
                     result: Ok(WalEstablishment::Durable),
@@ -197,16 +227,20 @@ fn wal_and_checkpoint_completions_are_legal_in_either_order() -> TestResult {
             )));
         } else {
             assert!(has_publish_then_replies(machine.handle(
+                MonotonicInstant::ZERO,
                 WriterEvent::WalEstablished {
                     batch,
                     result: Ok(WalEstablishment::Durable),
                 }
             )));
             assert_publication(
-                machine.handle(WriterEvent::CheckpointPrepared {
-                    ticket,
-                    outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
-                }),
+                machine.handle(
+                    MonotonicInstant::ZERO,
+                    WriterEvent::CheckpointPrepared {
+                        ticket,
+                        outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
+                    },
+                ),
                 ticket,
             );
         }
@@ -218,24 +252,36 @@ fn wal_and_checkpoint_completions_are_legal_in_either_order() -> TestResult {
 fn collector_budget_skips_an_occupied_advance_and_releases_on_completion() -> TestResult {
     let (mut occupied, first_cut, ticket) = machine_with_collector_and_publication()?;
     let (outputs, exit) = occupied
-        .handle(WriterEvent::SealPublished {
-            ticket,
-            result: Ok(SealPublication::Authored),
-        })
+        .handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::SealPublished {
+                ticket,
+                result: Ok(SealPublication::Authored),
+            },
+        )
         .into_parts();
     assert_eq!(None, exit);
     assert!(matches!(
         outputs.as_slice(),
         [WriterOutput::Action(WriterAction::PublishView(_))]
     ));
-    assert_empty_step(occupied.handle(WriterEvent::CollectFinished { cut: first_cut }));
+    assert_empty_step(occupied.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::CollectFinished { cut: first_cut },
+    ));
 
     let (mut released, first_cut, ticket) = machine_with_collector_and_publication()?;
-    assert_empty_step(released.handle(WriterEvent::CollectFinished { cut: first_cut }));
-    let cut = collection_cut(released.handle(WriterEvent::SealPublished {
-        ticket,
-        result: Ok(SealPublication::Authored),
-    }))?;
+    assert_empty_step(released.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::CollectFinished { cut: first_cut },
+    ));
+    let cut = collection_cut(released.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::SealPublished {
+            ticket,
+            result: Ok(SealPublication::Authored),
+        },
+    ))?;
     assert_eq!(ticket.cut(), cut);
     Ok(())
 }
@@ -243,7 +289,9 @@ fn collector_budget_skips_an_occupied_advance_and_releases_on_completion() -> Te
 #[test]
 fn stale_cancellation_identity_is_a_protocol_violation() -> TestResult {
     let (mut machine, ticket, _input) = machine_with_preparation()?;
-    let (outputs, exit) = machine.handle(WriterEvent::IngressClosed).into_parts();
+    let (outputs, exit) = machine
+        .handle(MonotonicInstant::ZERO, WriterEvent::IngressClosed)
+        .into_parts();
     assert_eq!(None, exit);
     assert!(matches!(
         outputs.as_slice(),
@@ -258,12 +306,18 @@ fn stale_cancellation_identity_is_a_protocol_violation() -> TestResult {
     );
     assert!(
         catch_unwind(AssertUnwindSafe(|| {
-            machine.handle(WriterEvent::CheckpointPreparationCancelled { ticket: wrong });
+            machine.handle(
+                MonotonicInstant::ZERO,
+                WriterEvent::CheckpointPreparationCancelled { ticket: wrong },
+            );
         }))
         .is_err()
     );
     let (_, exit) = machine
-        .handle(WriterEvent::CheckpointPreparationCancelled { ticket })
+        .handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::CheckpointPreparationCancelled { ticket },
+        )
         .into_parts();
     assert_eq!(Some(WriterExit::Shutdown), exit);
     Ok(())
@@ -272,28 +326,39 @@ fn stale_cancellation_identity_is_a_protocol_violation() -> TestResult {
 #[test]
 fn checkpoint_attempts_wait_until_suffix_shedding_rearms_the_cut() -> TestResult {
     let (mut suppressed, first, _input) = machine_with_preparation()?;
-    assert_empty_step(suppressed.handle(WriterEvent::CheckpointPrepared {
-        ticket: first,
-        outcome: PreparationOutcome::Abandoned,
-    }));
+    assert_empty_step(suppressed.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::CheckpointPrepared {
+            ticket: first,
+            outcome: PreparationOutcome::Abandoned,
+        },
+    ));
     let (reply, _outcome) = oneshot::channel();
     let (outputs, exit) = suppressed
-        .handle(WriterEvent::Command(CommandEnvelope::Delete {
-            path: path("events/missing")?,
-            reply,
-        }))
+        .handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::Command(CommandEnvelope::Delete {
+                path: path("events/missing")?,
+                reply,
+            }),
+        )
         .into_parts();
     assert_eq!(None, exit);
     assert!(take_preparation(outputs).is_none());
 
     let (mut retry, first, _input) =
         machine_with_preparation_at(WAL_SUFFIX_COORDINATES_MAX_V2 - 1)?;
-    assert_empty_step(retry.handle(WriterEvent::CheckpointPrepared {
-        ticket: first,
-        outcome: PreparationOutcome::Abandoned,
-    }));
+    assert_empty_step(retry.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::CheckpointPrepared {
+            ticket: first,
+            outcome: PreparationOutcome::Abandoned,
+        },
+    ));
     let (command, _outcome) = create("events/shed")?;
-    let (outputs, exit) = retry.handle(WriterEvent::Command(command)).into_parts();
+    let (outputs, exit) = retry
+        .handle(MonotonicInstant::ZERO, WriterEvent::Command(command))
+        .into_parts();
     assert_eq!(None, exit);
     let (second, _input) =
         take_preparation(outputs).ok_or("suffix shedding rearms the exact cut")?;
@@ -307,15 +372,19 @@ fn checkpoint_attempts_wait_until_suffix_shedding_rearms_the_cut() -> TestResult
 fn duplicate_behind_a_flight_inherits_its_barrier_without_a_second_wal() -> TestResult {
     let mut machine = machine_at(1)?;
     let (first, mut created) = create("events/duplicate")?;
-    let first_batch = establish_wal(machine.handle(WriterEvent::Command(first)))?;
+    let first_batch =
+        establish_wal(machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(first)))?;
     let (duplicate, mut duplicate_outcome) = create("events/duplicate")?;
-    assert_empty_step(machine.handle(WriterEvent::Command(duplicate)));
+    assert_empty_step(machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(duplicate)));
 
     let (outputs, exit) = machine
-        .handle(WriterEvent::WalEstablished {
-            batch: first_batch,
-            result: Ok(WalEstablishment::Durable),
-        })
+        .handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::WalEstablished {
+                batch: first_batch,
+                result: Ok(WalEstablishment::Durable),
+            },
+        )
         .into_parts();
     assert_eq!(None, exit);
     assert!(
@@ -329,24 +398,184 @@ fn duplicate_behind_a_flight_inherits_its_barrier_without_a_second_wal() -> Test
     );
 
     let (duplicate, mut immediate) = create("events/duplicate")?;
-    execute_actions(machine.handle(WriterEvent::Command(duplicate)));
+    execute_actions(machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(duplicate)));
     assert_eq!(Ok(CreateOutcome::AlreadyExists), immediate.try_recv()?);
     Ok(())
 }
 
 #[test]
-fn full_pending_barrier_refuses_before_admission() -> TestResult {
+fn recovery_flushes_immediately_then_quiescent_work_waits_for_remaining_spacing() -> TestResult {
+    let interval = Duration::from_millis(FLUSH_INTERVAL_MS);
+    let mut machine = recovered_machine_at_with_options(
+        1,
+        interval,
+        strom_storage_domain::WAL_ENCODED_BYTES_MAX,
+    )?;
+    assert_empty_step(machine.handle(MonotonicInstant::ZERO, WriterEvent::Started));
+
+    let first_at =
+        MonotonicInstant::ZERO.saturating_add(Duration::from_millis(FIRST_COMMAND_AT_MS));
+    let (first, _first_outcome) = create("events/paced-first")?;
+    let first_batch = establish_wal(machine.handle(first_at, WriterEvent::Command(first)))?;
+    execute_actions(machine.handle(
+        first_at,
+        WriterEvent::WalEstablished {
+            batch: first_batch,
+            result: Ok(WalEstablishment::Durable),
+        },
+    ));
+
+    let second_at = first_at.saturating_add(Duration::from_millis(SECOND_COMMAND_DELAY_MS));
+    let (second, mut second_outcome) = create("events/paced-second")?;
+    let deadline = flush_deadline(machine.handle(second_at, WriterEvent::Command(second)))?;
+    assert_eq!(first_at.saturating_add(interval), deadline);
+    assert!(
+        matches!(
+            second_outcome.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
+        "a quiescent command inside the spacing window still awaits durability"
+    );
+    let (duplicate, mut duplicate_outcome) = create("events/paced-second")?;
+    assert_empty_step(machine.handle(second_at, WriterEvent::Command(duplicate)));
+    assert!(
+        matches!(
+            duplicate_outcome.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
+        "an idempotent completion cannot outrun the waiting fact it observes"
+    );
+
+    let batch = establish_wal(machine.handle(deadline, WriterEvent::FlushDue))?;
+    execute_actions(machine.handle(
+        deadline,
+        WriterEvent::WalEstablished {
+            batch,
+            result: Ok(WalEstablishment::Durable),
+        },
+    ));
+    assert_eq!(Ok(CreateOutcome::Created), second_outcome.try_recv()?);
+    assert_eq!(
+        Ok(CreateOutcome::AlreadyExists),
+        duplicate_outcome.try_recv()?
+    );
+    Ok(())
+}
+
+#[test]
+fn byte_pressure_bypasses_spacing_and_the_stale_tick_is_harmless() -> TestResult {
+    let interval = Duration::from_millis(FLUSH_INTERVAL_MS);
+    let first_pending_estimate = WAL_RUN_FIXED_ENCODED_BYTES_MAX
+        + WAL_FACT_ENCODED_FIXED_BYTES_MAX
+        + "events/budget-a".len()
+        + StreamContentType::octet_stream().as_str().len();
+    let mut machine = recovered_machine_at_with_options(
+        1,
+        interval,
+        first_pending_estimate
+            .checked_add(1)
+            .expect("the test byte budget fits in usize"),
+    )?;
+    assert_empty_step(machine.handle(MonotonicInstant::ZERO, WriterEvent::Started));
+
+    let (first, _outcome) = create("events/budget-first")?;
+    let first_batch =
+        establish_wal(machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(first)))?;
+    execute_actions(machine.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::WalEstablished {
+            batch: first_batch,
+            result: Ok(WalEstablishment::Durable),
+        },
+    ));
+
+    let inside_window = MonotonicInstant::ZERO.saturating_add(Duration::from_millis(10));
+    let (second, _outcome) = create("events/budget-a")?;
+    let deadline = flush_deadline(machine.handle(inside_window, WriterEvent::Command(second)))?;
+    let (third, _outcome) = create("events/budget-b")?;
+    let budget_batch = establish_wal(machine.handle(inside_window, WriterEvent::Command(third)))?;
+    execute_actions(machine.handle(
+        inside_window,
+        WriterEvent::WalEstablished {
+            batch: budget_batch,
+            result: Ok(WalEstablishment::Durable),
+        },
+    ));
+
+    assert_empty_step(machine.handle(deadline, WriterEvent::FlushDue));
+    Ok(())
+}
+
+#[test]
+fn shutdown_bypasses_spacing_and_an_unarmed_tick_is_a_protocol_violation() -> TestResult {
+    let interval = Duration::from_millis(FLUSH_INTERVAL_MS);
+    let mut machine = recovered_machine_at_with_options(
+        1,
+        interval,
+        strom_storage_domain::WAL_ENCODED_BYTES_MAX,
+    )?;
+    assert_empty_step(machine.handle(MonotonicInstant::ZERO, WriterEvent::Started));
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            drop(machine.handle(MonotonicInstant::ZERO, WriterEvent::FlushDue));
+        }))
+        .is_err(),
+        "FlushDue without the one armed marker violates the timer protocol"
+    );
+
+    let mut machine = recovered_machine_at_with_options(
+        1,
+        interval,
+        strom_storage_domain::WAL_ENCODED_BYTES_MAX,
+    )?;
+    assert_empty_step(machine.handle(MonotonicInstant::ZERO, WriterEvent::Started));
+    let (first, _outcome) = create("events/shutdown-paced-first")?;
+    let batch = establish_wal(machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(first)))?;
+    execute_actions(machine.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::WalEstablished {
+            batch,
+            result: Ok(WalEstablishment::Durable),
+        },
+    ));
+    let (waiting, _outcome) = create("events/shutdown-paced-waiting")?;
+    let _deadline =
+        flush_deadline(machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(waiting)))?;
+    let _shutdown_batch =
+        establish_wal(machine.handle(MonotonicInstant::ZERO, WriterEvent::IngressClosed))?;
+    Ok(())
+}
+
+#[test]
+fn full_pending_barrier_gates_ingress_until_the_active_flight_drains() -> TestResult {
     let mut machine = machine_at(1)?;
     let (first, _created) = create("events/full")?;
-    let _batch = establish_wal(machine.handle(WriterEvent::Command(first)))?;
+    let batch = establish_wal(machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(first)))?;
+    let mut outcomes = Vec::new();
     for _ordinal in 0..WAL_RUN_FACTS_MAX {
-        let (duplicate, _outcome) = create("events/full")?;
-        assert_empty_step(machine.handle(WriterEvent::Command(duplicate)));
+        let (duplicate, outcome) = create("events/full")?;
+        assert_empty_step(machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(duplicate)));
+        outcomes.push(outcome);
     }
+    assert!(
+        !machine.admission_open(),
+        "a full pending barrier stops interpreter ingress polling"
+    );
 
-    let (overflow, mut outcome) = create("events/full")?;
-    execute_actions(machine.handle(WriterEvent::Command(overflow)));
-    assert_eq!(Err(AdmissionRefusal::Overloaded), outcome.try_recv()?);
+    execute_actions(machine.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::WalEstablished {
+            batch,
+            result: Ok(WalEstablishment::Durable),
+        },
+    ));
+    assert!(
+        machine.admission_open(),
+        "draining the hard-full barrier reopens interpreter ingress"
+    );
+    for mut outcome in outcomes {
+        assert_eq!(Ok(CreateOutcome::AlreadyExists), outcome.try_recv()?);
+    }
     Ok(())
 }
 
@@ -355,28 +584,36 @@ fn unissued_and_wrong_wal_completions_are_protocol_violations() -> TestResult {
     let mut machine = machine_at(1)?;
     assert!(
         catch_unwind(AssertUnwindSafe(|| {
-            machine.handle(WriterEvent::WalEstablished {
-                batch: BatchId::try_from(2).expect("two is nonzero"),
-                result: Ok(WalEstablishment::Durable),
-            });
+            machine.handle(
+                MonotonicInstant::ZERO,
+                WriterEvent::WalEstablished {
+                    batch: BatchId::try_from(2).expect("two is nonzero"),
+                    result: Ok(WalEstablishment::Durable),
+                },
+            );
         }))
         .is_err()
     );
 
     let (command, _outcome) = create("events/wrong-completion")?;
-    let batch = establish_wal(machine.handle(WriterEvent::Command(command)))?;
+    let batch =
+        establish_wal(machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(command)))?;
     assert!(
         catch_unwind(AssertUnwindSafe(|| {
-            machine.handle(WriterEvent::WalEstablished {
-                batch: batch
-                    .successor()
-                    .expect("the fixture batch has a successor"),
-                result: Ok(WalEstablishment::Durable),
-            });
+            machine.handle(
+                MonotonicInstant::ZERO,
+                WriterEvent::WalEstablished {
+                    batch: batch
+                        .successor()
+                        .expect("the fixture batch has a successor"),
+                    result: Ok(WalEstablishment::Durable),
+                },
+            );
         }))
         .is_err()
     );
     assert!(has_publish_then_replies(machine.handle(
+        MonotonicInstant::ZERO,
         WriterEvent::WalEstablished {
             batch,
             result: Ok(WalEstablishment::Durable),
@@ -388,20 +625,28 @@ fn unissued_and_wrong_wal_completions_are_protocol_violations() -> TestResult {
 #[test]
 fn startup_schedules_recovered_work_once_before_ingress() -> TestResult {
     let mut below = recovered_machine_at(WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER - 1)?;
-    assert_empty_step(below.handle(WriterEvent::Started));
+    assert_empty_step(below.handle(MonotonicInstant::ZERO, WriterEvent::Started));
 
     let mut due = recovered_machine_at(WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER)?;
-    let (outputs, exit) = due.handle(WriterEvent::Started).into_parts();
+    let (outputs, exit) = due
+        .handle(MonotonicInstant::ZERO, WriterEvent::Started)
+        .into_parts();
     assert_eq!(None, exit);
     let (ticket, _input) = take_preparation(outputs).ok_or("startup issues the due checkpoint")?;
     assert!(
-        catch_unwind(AssertUnwindSafe(|| due.handle(WriterEvent::Started))).is_err(),
+        catch_unwind(AssertUnwindSafe(
+            || due.handle(MonotonicInstant::ZERO, WriterEvent::Started)
+        ))
+        .is_err(),
         "startup is a one-shot machine observation"
     );
-    assert_empty_step(due.handle(WriterEvent::CheckpointPrepared {
-        ticket,
-        outcome: PreparationOutcome::Abandoned,
-    }));
+    assert_empty_step(due.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::CheckpointPrepared {
+            ticket,
+            outcome: PreparationOutcome::Abandoned,
+        },
+    ));
     Ok(())
 }
 
@@ -409,15 +654,19 @@ fn startup_schedules_recovered_work_once_before_ingress() -> TestResult {
 fn consecutive_wal_runs_publish_and_release_only_their_own_barriers() -> TestResult {
     let mut machine = machine_at(1)?;
     let (first, mut first_outcome) = create("events/first")?;
-    let first_batch = establish_wal(machine.handle(WriterEvent::Command(first)))?;
+    let first_batch =
+        establish_wal(machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(first)))?;
     let (second, mut second_outcome) = create("events/second")?;
-    assert_empty_step(machine.handle(WriterEvent::Command(second)));
+    assert_empty_step(machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(second)));
 
     let (outputs, exit) = machine
-        .handle(WriterEvent::WalEstablished {
-            batch: first_batch,
-            result: Ok(WalEstablishment::Durable),
-        })
+        .handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::WalEstablished {
+                batch: first_batch,
+                result: Ok(WalEstablishment::Durable),
+            },
+        )
         .into_parts();
     assert_eq!(None, exit);
     assert!(matches!(
@@ -444,10 +693,13 @@ fn consecutive_wal_runs_publish_and_release_only_their_own_barriers() -> TestRes
         Err(oneshot::error::TryRecvError::Empty)
     ));
     let (outputs, exit) = machine
-        .handle(WriterEvent::WalEstablished {
-            batch: second_candidate.batch(),
-            result: Ok(WalEstablishment::Durable),
-        })
+        .handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::WalEstablished {
+                batch: second_candidate.batch(),
+                result: Ok(WalEstablishment::Durable),
+            },
+        )
         .into_parts();
     assert_eq!(None, exit);
     let second_view =
@@ -463,11 +715,15 @@ fn admission_refusal_and_idempotence_axes_are_complete() -> TestResult {
     let mut machine = machine_at(1)?;
     let axes = path("events/axes")?;
     let (create, mut created) = create("events/axes")?;
-    let batch = establish_wal(machine.handle(WriterEvent::Command(create)))?;
-    execute_actions(machine.handle(WriterEvent::WalEstablished {
-        batch,
-        result: Ok(WalEstablishment::Durable),
-    }));
+    let batch =
+        establish_wal(machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(create)))?;
+    execute_actions(machine.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::WalEstablished {
+            batch,
+            result: Ok(WalEstablishment::Durable),
+        },
+    ));
     assert_eq!(Ok(CreateOutcome::Created), created.try_recv()?);
 
     for command in [
@@ -493,66 +749,78 @@ fn admission_refusal_and_idempotence_axes_are_complete() -> TestResult {
         },
     ] {
         let (reply, mut outcome) = oneshot::channel();
-        execute_replies(
-            machine.handle(WriterEvent::Command(CommandEnvelope::Create {
-                command,
-                reply,
-            })),
-        );
+        execute_replies(machine.handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::Command(CommandEnvelope::Create { command, reply }),
+        ));
         assert_eq!(Err(AdmissionRefusal::PathOccupied), outcome.try_recv()?);
     }
 
     let (reply, mut missing_close) = oneshot::channel();
-    execute_replies(machine.handle(WriterEvent::Command(CommandEnvelope::Close {
-        path: path("events/missing")?,
-        reply,
-    })));
+    execute_replies(machine.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::Command(CommandEnvelope::Close {
+            path: path("events/missing")?,
+            reply,
+        }),
+    ));
     assert_eq!(
         Err(AdmissionRefusal::PathNotLive),
         missing_close.try_recv()?
     );
 
     let (reply, mut closed) = oneshot::channel();
-    let batch = establish_wal(machine.handle(WriterEvent::Command(CommandEnvelope::Close {
-        path: axes.clone(),
-        reply,
-    })))?;
-    execute_actions(machine.handle(WriterEvent::WalEstablished {
-        batch,
-        result: Ok(WalEstablishment::Durable),
-    }));
+    let batch = establish_wal(machine.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::Command(CommandEnvelope::Close {
+            path: axes.clone(),
+            reply,
+        }),
+    ))?;
+    execute_actions(machine.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::WalEstablished {
+            batch,
+            result: Ok(WalEstablishment::Durable),
+        },
+    ));
     assert_eq!(Ok(CloseStreamOutcome::Closed), closed.try_recv()?);
 
     let (reply, mut already_closed) = oneshot::channel();
-    execute_replies(machine.handle(WriterEvent::Command(CommandEnvelope::Close {
-        path: axes.clone(),
-        reply,
-    })));
+    execute_replies(machine.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::Command(CommandEnvelope::Close {
+            path: axes.clone(),
+            reply,
+        }),
+    ));
     assert_eq!(
         Ok(CloseStreamOutcome::AlreadyClosed),
         already_closed.try_recv()?
     );
 
     let (reply, mut deleted) = oneshot::channel();
-    let batch = establish_wal(
-        machine.handle(WriterEvent::Command(CommandEnvelope::Delete {
+    let batch = establish_wal(machine.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::Command(CommandEnvelope::Delete {
             path: axes.clone(),
             reply,
-        })),
-    )?;
-    execute_actions(machine.handle(WriterEvent::WalEstablished {
-        batch,
-        result: Ok(WalEstablishment::Durable),
-    }));
+        }),
+    ))?;
+    execute_actions(machine.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::WalEstablished {
+            batch,
+            result: Ok(WalEstablishment::Durable),
+        },
+    ));
     assert_eq!(Ok(()), deleted.try_recv()?);
 
     let (reply, mut deleted_again) = oneshot::channel();
-    execute_replies(
-        machine.handle(WriterEvent::Command(CommandEnvelope::Delete {
-            path: axes,
-            reply,
-        })),
-    );
+    execute_replies(machine.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::Command(CommandEnvelope::Delete { path: axes, reply }),
+    ));
     assert_eq!(
         Err(AdmissionRefusal::PathNotLive),
         deleted_again.try_recv()?
@@ -578,17 +846,22 @@ fn suffix_shedding_refuses_new_facts_without_changing_durable_state() -> TestRes
         )
     );
     let mut machine = recovered_machine_at_with_forest(WAL_SUFFIX_COORDINATES_MAX_V2 - 1, &forest)?;
-    let (outputs, exit) = machine.handle(WriterEvent::Started).into_parts();
+    let (outputs, exit) = machine
+        .handle(MonotonicInstant::ZERO, WriterEvent::Started)
+        .into_parts();
     assert_eq!(None, exit);
     let (first, _input) = take_preparation(outputs).ok_or("the bounded suffix is due")?;
-    assert_empty_step(machine.handle(WriterEvent::CheckpointPrepared {
-        ticket: first,
-        outcome: PreparationOutcome::Abandoned,
-    }));
+    assert_empty_step(machine.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::CheckpointPrepared {
+            ticket: first,
+            outcome: PreparationOutcome::Abandoned,
+        },
+    ));
 
     let (new_stream, mut refused) = create("events/refused")?;
     let (outputs, exit) = machine
-        .handle(WriterEvent::Command(new_stream))
+        .handle(MonotonicInstant::ZERO, WriterEvent::Command(new_stream))
         .into_parts();
     assert_eq!(None, exit);
     assert!(
@@ -607,7 +880,7 @@ fn suffix_shedding_refuses_new_facts_without_changing_durable_state() -> TestRes
     assert_eq!(first.cut(), retry.cut());
 
     let (duplicate, mut duplicate_outcome) = create("events/existing")?;
-    execute_replies(machine.handle(WriterEvent::Command(duplicate)));
+    execute_replies(machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(duplicate)));
     assert_eq!(
         Ok(CreateOutcome::AlreadyExists),
         duplicate_outcome.try_recv()?
@@ -623,17 +896,23 @@ fn authored_checkpoint_publication_preserves_the_durable_view_and_starts_collect
     let prepared = prepared(input)?;
     let successor = prepared.successor().clone();
     assert_publication(
-        machine.handle(WriterEvent::CheckpointPrepared {
-            ticket,
-            outcome: PreparationOutcome::Prepared(Box::new(prepared)),
-        }),
+        machine.handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::CheckpointPrepared {
+                ticket,
+                outcome: PreparationOutcome::Prepared(Box::new(prepared)),
+            },
+        ),
         ticket,
     );
     let (outputs, exit) = machine
-        .handle(WriterEvent::SealPublished {
-            ticket,
-            result: Ok(SealPublication::Authored),
-        })
+        .handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::SealPublished {
+                ticket,
+                result: Ok(SealPublication::Authored),
+            },
+        )
         .into_parts();
     assert_eq!(None, exit);
     assert!(matches!(
@@ -656,57 +935,78 @@ fn invalid_completions_panic_before_consuming_the_issued_effect() -> TestResult 
     let wrong = CheckpointTicket::new(ticket.source().successor()?, ticket.cut(), ticket.attempt());
     assert!(
         catch_unwind(AssertUnwindSafe(|| {
-            preparing.handle(WriterEvent::CheckpointPrepared {
-                ticket: wrong,
-                outcome: PreparationOutcome::Abandoned,
-            });
+            preparing.handle(
+                MonotonicInstant::ZERO,
+                WriterEvent::CheckpointPrepared {
+                    ticket: wrong,
+                    outcome: PreparationOutcome::Abandoned,
+                },
+            );
         }))
         .is_err()
     );
     assert!(
         catch_unwind(AssertUnwindSafe(|| {
-            preparing.handle(WriterEvent::SealPublished {
-                ticket,
-                result: Ok(SealPublication::Authored),
-            });
+            preparing.handle(
+                MonotonicInstant::ZERO,
+                WriterEvent::SealPublished {
+                    ticket,
+                    result: Ok(SealPublication::Authored),
+                },
+            );
         }))
         .is_err()
     );
     assert!(
         catch_unwind(AssertUnwindSafe(|| {
-            preparing.handle(WriterEvent::CheckpointPreparationCancelled { ticket });
+            preparing.handle(
+                MonotonicInstant::ZERO,
+                WriterEvent::CheckpointPreparationCancelled { ticket },
+            );
         }))
         .is_err()
     );
     assert_publication(
-        preparing.handle(WriterEvent::CheckpointPrepared {
-            ticket,
-            outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
-        }),
-        ticket,
-    );
-    assert!(
-        catch_unwind(AssertUnwindSafe(|| {
-            preparing.handle(WriterEvent::SealPublished {
-                ticket: wrong,
-                result: Ok(SealPublication::Authored),
-            });
-        }))
-        .is_err()
-    );
-    assert!(
-        catch_unwind(AssertUnwindSafe(|| {
-            preparing.handle(WriterEvent::CheckpointPrepared {
+        preparing.handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::CheckpointPrepared {
                 ticket,
-                outcome: PreparationOutcome::Abandoned,
-            });
+                outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
+            },
+        ),
+        ticket,
+    );
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            preparing.handle(
+                MonotonicInstant::ZERO,
+                WriterEvent::SealPublished {
+                    ticket: wrong,
+                    result: Ok(SealPublication::Authored),
+                },
+            );
         }))
         .is_err()
     );
-    let cut = collection_cut(preparing.handle(WriterEvent::SealPublished {
-        ticket,
-        result: Ok(SealPublication::Authored),
-    }))?;
+    assert!(
+        catch_unwind(AssertUnwindSafe(|| {
+            preparing.handle(
+                MonotonicInstant::ZERO,
+                WriterEvent::CheckpointPrepared {
+                    ticket,
+                    outcome: PreparationOutcome::Abandoned,
+                },
+            );
+        }))
+        .is_err()
+    );
+    let cut = collection_cut(preparing.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::SealPublished {
+            ticket,
+            result: Ok(SealPublication::Authored),
+        },
+    ))?;
     assert_eq!(ticket.cut(), cut);
     Ok(())
 }
@@ -795,7 +1095,9 @@ fn cancellation_discards_every_preparation_outcome() -> TestResult {
         },
     ] {
         let (mut machine, ticket, _input) = machine_with_preparation()?;
-        let (outputs, exit) = machine.handle(WriterEvent::IngressClosed).into_parts();
+        let (outputs, exit) = machine
+            .handle(MonotonicInstant::ZERO, WriterEvent::IngressClosed)
+            .into_parts();
         assert_eq!(None, exit, "WAL durability keeps the writer live");
         assert!(matches!(
             outputs.as_slice(),
@@ -804,7 +1106,10 @@ fn cancellation_discards_every_preparation_outcome() -> TestResult {
             )] if *observed == ticket
         ));
         let (outputs, exit) = machine
-            .handle(WriterEvent::CheckpointPrepared { ticket, outcome })
+            .handle(
+                MonotonicInstant::ZERO,
+                WriterEvent::CheckpointPrepared { ticket, outcome },
+            )
             .into_parts();
         assert!(outputs.is_empty());
         assert_eq!(Some(WriterExit::Shutdown), exit);
@@ -816,12 +1121,15 @@ fn cancellation_discards_every_preparation_outcome() -> TestResult {
 fn preparation_contradiction_is_an_immediate_terminal_step() -> TestResult {
     let (mut machine, ticket, _input) = machine_with_preparation()?;
     let (outputs, exit) = machine
-        .handle(WriterEvent::CheckpointPrepared {
-            ticket,
-            outcome: PreparationOutcome::Contradiction {
-                detail: "scripted preparation contradiction".into(),
+        .handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::CheckpointPrepared {
+                ticket,
+                outcome: PreparationOutcome::Contradiction {
+                    detail: "scripted preparation contradiction".into(),
+                },
             },
-        })
+        )
         .into_parts();
     assert!(outputs.is_empty());
     assert!(matches!(
@@ -845,10 +1153,13 @@ fn fail_stop_wal_outcomes_are_terminal_during_every_checkpoint_stage() -> TestRe
         ] {
             let (mut machine, batch) = machine_with_wal_and_checkpoint(stage)?;
             let (outputs, exit) = machine
-                .handle(WriterEvent::WalEstablished {
-                    batch,
-                    result: outcome.result(),
-                })
+                .handle(
+                    MonotonicInstant::ZERO,
+                    WriterEvent::WalEstablished {
+                        batch,
+                        result: outcome.result(),
+                    },
+                )
                 .into_parts();
             assert!(outputs.is_empty(), "fail-stop emits no new effect");
             match outcome {
@@ -878,17 +1189,23 @@ fn every_non_authored_seal_publication_is_terminal() -> TestResult {
     ] {
         let (mut machine, ticket, input) = machine_with_preparation()?;
         assert_publication(
-            machine.handle(WriterEvent::CheckpointPrepared {
-                ticket,
-                outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
-            }),
+            machine.handle(
+                MonotonicInstant::ZERO,
+                WriterEvent::CheckpointPrepared {
+                    ticket,
+                    outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
+                },
+            ),
             ticket,
         );
         let (outputs, exit) = machine
-            .handle(WriterEvent::SealPublished {
-                ticket,
-                result: failure.result(),
-            })
+            .handle(
+                MonotonicInstant::ZERO,
+                WriterEvent::SealPublished {
+                    ticket,
+                    result: failure.result(),
+                },
+            )
             .into_parts();
         assert!(outputs.is_empty());
         match failure {
@@ -916,21 +1233,27 @@ fn every_non_authored_seal_publication_is_terminal() -> TestResult {
 #[test]
 fn shutdown_waits_for_wal_barriers_but_not_leak_only_collection() -> TestResult {
     let mut idle = machine_at(1)?;
-    let (outputs, exit) = idle.handle(WriterEvent::IngressClosed).into_parts();
+    let (outputs, exit) = idle
+        .handle(MonotonicInstant::ZERO, WriterEvent::IngressClosed)
+        .into_parts();
     assert!(outputs.is_empty());
     assert_eq!(Some(WriterExit::Shutdown), exit);
 
     let mut draining = machine_at(1)?;
     let (first, mut first_reply) = create("events/drain-first")?;
-    let first_batch = establish_wal(draining.handle(WriterEvent::Command(first)))?;
+    let first_batch =
+        establish_wal(draining.handle(MonotonicInstant::ZERO, WriterEvent::Command(first)))?;
     let (second, mut second_reply) = create("events/drain-second")?;
-    assert_empty_step(draining.handle(WriterEvent::Command(second)));
-    assert_empty_step(draining.handle(WriterEvent::IngressClosed));
+    assert_empty_step(draining.handle(MonotonicInstant::ZERO, WriterEvent::Command(second)));
+    assert_empty_step(draining.handle(MonotonicInstant::ZERO, WriterEvent::IngressClosed));
     let (outputs, exit) = draining
-        .handle(WriterEvent::WalEstablished {
-            batch: first_batch,
-            result: Ok(WalEstablishment::Durable),
-        })
+        .handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::WalEstablished {
+                batch: first_batch,
+                result: Ok(WalEstablishment::Durable),
+            },
+        )
         .into_parts();
     assert_eq!(None, exit);
     let mut effects = execute_outputs(outputs);
@@ -944,10 +1267,13 @@ fn shutdown_waits_for_wal_barriers_but_not_leak_only_collection() -> TestResult 
         Err(oneshot::error::TryRecvError::Empty)
     ));
     let (outputs, exit) = draining
-        .handle(WriterEvent::WalEstablished {
-            batch: second_candidate.batch(),
-            result: Ok(WalEstablishment::Durable),
-        })
+        .handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::WalEstablished {
+                batch: second_candidate.batch(),
+                result: Ok(WalEstablishment::Durable),
+            },
+        )
         .into_parts();
     assert_eq!(Some(WriterExit::Shutdown), exit);
     assert!(execute_outputs(outputs).is_empty());
@@ -955,17 +1281,25 @@ fn shutdown_waits_for_wal_barriers_but_not_leak_only_collection() -> TestResult 
 
     let (mut collecting, ticket, input) = machine_with_preparation()?;
     assert_publication(
-        collecting.handle(WriterEvent::CheckpointPrepared {
-            ticket,
-            outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
-        }),
+        collecting.handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::CheckpointPrepared {
+                ticket,
+                outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
+            },
+        ),
         ticket,
     );
-    let _cut = collection_cut(collecting.handle(WriterEvent::SealPublished {
-        ticket,
-        result: Ok(SealPublication::Authored),
-    }))?;
-    let (outputs, exit) = collecting.handle(WriterEvent::IngressClosed).into_parts();
+    let _cut = collection_cut(collecting.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::SealPublished {
+            ticket,
+            result: Ok(SealPublication::Authored),
+        },
+    ))?;
+    let (outputs, exit) = collecting
+        .handle(MonotonicInstant::ZERO, WriterEvent::IngressClosed)
+        .into_parts();
     assert!(outputs.is_empty());
     assert_eq!(Some(WriterExit::Shutdown), exit);
     Ok(())
@@ -975,26 +1309,36 @@ fn machine_with_collector_and_publication() -> TestResult<(WriterMachine, BatchI
 {
     let (mut machine, first_ticket, first_input) = machine_with_preparation()?;
     assert_publication(
-        machine.handle(WriterEvent::CheckpointPrepared {
-            ticket: first_ticket,
-            outcome: PreparationOutcome::Prepared(Box::new(prepared(first_input)?)),
-        }),
+        machine.handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::CheckpointPrepared {
+                ticket: first_ticket,
+                outcome: PreparationOutcome::Prepared(Box::new(prepared(first_input)?)),
+            },
+        ),
         first_ticket,
     );
-    let first_cut = collection_cut(machine.handle(WriterEvent::SealPublished {
-        ticket: first_ticket,
-        result: Ok(SealPublication::Authored),
-    }))?;
+    let first_cut = collection_cut(machine.handle(
+        MonotonicInstant::ZERO,
+        WriterEvent::SealPublished {
+            ticket: first_ticket,
+            result: Ok(SealPublication::Authored),
+        },
+    ))?;
 
     let mut next_preparation = None;
     for ordinal in 0..WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER {
         let (command, _reply) = create(&format!("events/advance-{ordinal}"))?;
-        let batch = establish_wal(machine.handle(WriterEvent::Command(command)))?;
+        let batch =
+            establish_wal(machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(command)))?;
         let (outputs, exit) = machine
-            .handle(WriterEvent::WalEstablished {
-                batch,
-                result: Ok(WalEstablishment::Durable),
-            })
+            .handle(
+                MonotonicInstant::ZERO,
+                WriterEvent::WalEstablished {
+                    batch,
+                    result: Ok(WalEstablishment::Durable),
+                },
+            )
             .into_parts();
         assert_eq!(
             None, exit,
@@ -1006,10 +1350,13 @@ fn machine_with_collector_and_publication() -> TestResult<(WriterMachine, BatchI
     }
     let (ticket, input) = next_preparation.ok_or("the next checkpoint becomes due")?;
     assert_publication(
-        machine.handle(WriterEvent::CheckpointPrepared {
-            ticket,
-            outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
-        }),
+        machine.handle(
+            MonotonicInstant::ZERO,
+            WriterEvent::CheckpointPrepared {
+                ticket,
+                outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
+            },
+        ),
         ticket,
     );
     Ok((machine, first_cut, ticket))
@@ -1018,19 +1365,25 @@ fn machine_with_collector_and_publication() -> TestResult<(WriterMachine, BatchI
 fn machine_with_wal_and_checkpoint(stage: CheckpointStage) -> TestResult<(WriterMachine, BatchId)> {
     let (mut machine, ticket, input) = machine_with_preparation()?;
     let (command, _reply) = create("events/fail-stop-stage")?;
-    let batch = establish_wal(machine.handle(WriterEvent::Command(command)))?;
+    let batch =
+        establish_wal(machine.handle(MonotonicInstant::ZERO, WriterEvent::Command(command)))?;
     match stage {
         CheckpointStage::Preparation => drop(input),
         CheckpointStage::Publication => assert_publication(
-            machine.handle(WriterEvent::CheckpointPrepared {
-                ticket,
-                outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
-            }),
+            machine.handle(
+                MonotonicInstant::ZERO,
+                WriterEvent::CheckpointPrepared {
+                    ticket,
+                    outcome: PreparationOutcome::Prepared(Box::new(prepared(input)?)),
+                },
+            ),
             ticket,
         ),
         CheckpointStage::Cancellation => {
             drop(input);
-            let (outputs, exit) = machine.handle(WriterEvent::IngressClosed).into_parts();
+            let (outputs, exit) = machine
+                .handle(MonotonicInstant::ZERO, WriterEvent::IngressClosed)
+                .into_parts();
             assert_eq!(None, exit, "checkpoint cancellation waits for completion");
             assert!(
                 matches!(

@@ -4,7 +4,7 @@ use std::time::Duration;
 use futures::TryStreamExt as _;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt as _};
-use strom_common::{Entropy, Seed};
+use strom_common::{Entropy, ManualMonotonicClock, MonotonicInstant, Seed};
 use strom_domain::{CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamPath};
 use strom_object_store::ObjectKey;
 use strom_object_store::test_support::FaultStore;
@@ -12,7 +12,7 @@ use strom_storage_domain::{
     AttemptId, BatchId, FreshIdentity, SealGeneration, SealKey, SealNamespace, StoreKind, TableKey,
     TableObjectId, WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WalKey,
 };
-use strom_storage_engine::{CloseOutcome, Engine, StreamError};
+use strom_storage_engine::{CloseOutcome, Engine, OpenError, Options, StreamError};
 
 pub(crate) type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -44,6 +44,19 @@ pub(crate) fn entropy() -> Entropy {
     Entropy::from_seed(Seed::from(TEST_SEED))
 }
 
+pub(crate) async fn open_engine(
+    store: Arc<dyn ObjectStore>,
+    entropy: Entropy,
+) -> Result<Engine, OpenError> {
+    Engine::open(
+        store,
+        entropy,
+        Arc::new(ManualMonotonicClock::new(MonotonicInstant::ZERO)),
+        Options::default().with_min_flush_interval(Duration::ZERO),
+    )
+    .await
+}
+
 pub(crate) fn wal_key(batch: u64) -> ObjectKey {
     let batch = BatchId::try_from(batch).expect("test WAL batch is nonzero");
     WalKey::from(batch)
@@ -68,7 +81,7 @@ pub(crate) async fn observe_checkpoint_keys() -> Result<CheckpointKeys, Box<dyn 
 {
     let store = FaultStore::new();
     let backend = store.backend();
-    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    let engine = open_engine(Arc::clone(&backend), entropy()).await?;
     drive_checkpoint_span(&engine).await?;
 
     let (directory, ledger) = tokio::time::timeout(CHECKPOINT_OBSERVATION_TIMEOUT, async {

@@ -12,12 +12,12 @@ use strom_storage_domain::{
     BatchId, OwnerToken, Seal, SortedRun, TableKey, TableRef, TreeVersion,
     WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER, WalReplayPoint, encode_seal,
 };
-use strom_storage_engine::{CloseOutcome, Engine, OpenError};
+use strom_storage_engine::{CloseOutcome, OpenError};
 
 use super::support::{
     CheckpointKeys, TestResult, assert_object_absent, assert_object_present,
     checkpoint_table_key_at_attempt, create, drive_checkpoint_span, entropy,
-    observe_checkpoint_keys, wal_key,
+    observe_checkpoint_keys, open_engine, wal_key,
 };
 
 const CHECKPOINT_CUT: u64 = WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER;
@@ -32,7 +32,7 @@ async fn children_are_durable_before_the_seal_is_published() -> TestResult {
     let store =
         FaultStore::new().gate(Selection::create(Target::Key(seal.clone())), gate.clone())?;
     let backend = store.backend();
-    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    let engine = open_engine(Arc::clone(&backend), entropy()).await?;
     let streams = drive_checkpoint_span(&engine).await?;
 
     gate.wait_until_blocked().await;
@@ -66,7 +66,7 @@ async fn applied_child_with_a_lost_reply_reconciles_and_publishes() -> TestResul
         })?
         .gate(Selection::create(Target::Key(seal.clone())), gate.clone())?;
     let backend = store.backend();
-    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    let engine = open_engine(Arc::clone(&backend), entropy()).await?;
     let streams = drive_checkpoint_span(&engine).await?;
 
     gate.wait_until_blocked().await;
@@ -107,7 +107,7 @@ async fn abandoned_checkpoint_clears_matching_state_and_shell_tickets_before_ret
             retry.clone(),
         )?;
     let backend = store.backend();
-    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    let engine = open_engine(Arc::clone(&backend), entropy()).await?;
     let streams = drive_checkpoint_span(&engine).await?;
 
     reconciliation.wait_until_blocked().await;
@@ -149,7 +149,7 @@ async fn failed_child_reconciliation_abandons_and_reopens_from_wal() -> TestResu
             retry.clone(),
         )?;
     let backend = store.backend();
-    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    let engine = open_engine(Arc::clone(&backend), entropy()).await?;
     let streams = drive_checkpoint_span(&engine).await?;
 
     reconciliation.wait_until_blocked().await;
@@ -180,12 +180,13 @@ async fn foreign_child_racing_shutdown_never_publishes() -> TestResult {
             gate.clone(),
         )?;
     let backend = store.backend();
-    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    let engine = open_engine(Arc::clone(&backend), entropy()).await?;
     let streams = drive_checkpoint_span(&engine).await?;
 
     gate.wait_until_blocked().await;
     put_foreign(&backend, &directory).await?;
     gate.release();
+    gate.wait_until_finished().await;
     assert!(matches!(
         engine.shutdown().await,
         CloseOutcome::Shutdown | CloseOutcome::Contradiction { .. }
@@ -206,7 +207,7 @@ async fn shutdown_cancels_before_publication_and_leaves_only_ignored_child_garba
     let store =
         FaultStore::new().gate(Selection::create(Target::Key(ledger.clone())), gate.clone())?;
     let backend = store.backend();
-    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    let engine = open_engine(Arc::clone(&backend), entropy()).await?;
     let streams = drive_checkpoint_span(&engine).await?;
 
     gate.wait_until_blocked().await;
@@ -234,7 +235,7 @@ async fn seal_failure_before_apply_poisoned_but_reopens_from_wal() -> TestResult
         })?
         .gate(Selection::create(Target::Key(seal.clone())), gate.clone())?;
     let backend = store.backend();
-    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    let engine = open_engine(Arc::clone(&backend), entropy()).await?;
     let streams = drive_checkpoint_span(&engine).await?;
 
     gate.wait_until_blocked().await;
@@ -259,7 +260,7 @@ async fn applied_seal_with_a_lost_reply_poisoned_but_reopens_from_the_checkpoint
         })?
         .gate(Selection::create(Target::Key(seal.clone())), gate.clone())?;
     let backend = store.backend();
-    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    let engine = open_engine(Arc::clone(&backend), entropy()).await?;
     let streams = drive_checkpoint_span(&engine).await?;
 
     gate.wait_until_blocked().await;
@@ -283,7 +284,7 @@ async fn matching_seal_occupant_fences_but_is_authoritative_on_reopen() -> TestR
     let store =
         FaultStore::new().gate(Selection::create(Target::Key(seal.clone())), gate.clone())?;
     let backend = store.backend();
-    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    let engine = open_engine(Arc::clone(&backend), entropy()).await?;
     let partition = engine.partition_id();
     let streams = drive_checkpoint_span(&engine).await?;
 
@@ -312,7 +313,7 @@ async fn foreign_seal_occupant_fences_and_is_a_contradiction_on_reopen() -> Test
     let store =
         FaultStore::new().gate(Selection::create(Target::Key(seal.clone())), gate.clone())?;
     let backend = store.backend();
-    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    let engine = open_engine(Arc::clone(&backend), entropy()).await?;
     let _streams = drive_checkpoint_span(&engine).await?;
 
     gate.wait_until_blocked().await;
@@ -321,7 +322,7 @@ async fn foreign_seal_occupant_fences_and_is_a_contradiction_on_reopen() -> Test
 
     assert_eq!(CloseOutcome::Fenced, engine.shutdown().await);
     assert!(matches!(
-        Engine::open(backend, entropy()).await,
+        open_engine(backend, entropy()).await,
         Err(OpenError::Contradiction { .. })
     ));
     store.verify()?;
@@ -343,7 +344,7 @@ async fn advancing_publication_starts_leak_only_collection_without_poisoning_the
             delete_gate.clone(),
         )?;
     let backend = store.backend();
-    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    let engine = open_engine(Arc::clone(&backend), entropy()).await?;
     let mut streams = drive_checkpoint_span(&engine).await?;
 
     delete_gate.wait_until_blocked().await;
@@ -367,7 +368,7 @@ async fn assert_reopens_with_streams(
     backend: Arc<dyn ObjectStore>,
     streams: &[StreamPath],
 ) -> TestResult {
-    let reopened = Engine::open(backend, entropy()).await?;
+    let reopened = open_engine(backend, entropy()).await?;
     for id in streams {
         assert!(
             matches!(reopened.stream(id)?, StreamStatus::Live { .. }),

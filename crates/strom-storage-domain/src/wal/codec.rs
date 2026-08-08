@@ -93,7 +93,9 @@ mod tests {
     use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle};
 
     use super::*;
-    use crate::SealGeneration;
+    use crate::{
+        SealGeneration, WAL_FACT_ENCODED_FIXED_BYTES_MAX, WAL_RUN_FIXED_ENCODED_BYTES_MAX,
+    };
 
     #[test]
     fn fact_count_is_gated_before_result_materialization() -> Result<(), Box<dyn std::error::Error>>
@@ -159,7 +161,70 @@ mod tests {
             WalBody::Run(WalFacts::try_from(facts)?),
         );
         let encoded = encode_wal(&object)?;
-        assert!(encoded.len() <= WAL_ENCODED_BYTES_MAX);
+        let estimate = WAL_RUN_FIXED_ENCODED_BYTES_MAX
+            .checked_add(
+                WAL_RUN_FACTS_MAX
+                    .checked_mul(
+                        WAL_FACT_ENCODED_FIXED_BYTES_MAX
+                            + strom_domain::STREAM_PATH_BYTES_MAX
+                            + strom_domain::CONTENT_TYPE_BYTES_MAX,
+                    )
+                    .expect("the maximum fact estimate fits in usize"),
+            )
+            .expect("the maximum RUN estimate fits in usize");
+        assert!(
+            encoded.len() <= estimate,
+            "the incremental estimate dominates a maximum worst-case create RUN"
+        );
+        assert!(
+            estimate <= WAL_ENCODED_BYTES_MAX,
+            "the maximum estimated RUN stays inside the hard WAL object bound"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn encoded_vectors_stay_below_the_incremental_byte_estimate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let partition = partition()?;
+        let batch = BatchId::try_from(1)?;
+        let owner = OwnerToken::from(SealGeneration::genesis());
+        let path = "a"
+            .repeat(strom_domain::STREAM_PATH_BYTES_MAX)
+            .parse::<strom_domain::StreamPath>()?;
+        let content_type: StreamContentType =
+            format!("a/{}", "b".repeat(strom_domain::CONTENT_TYPE_BYTES_MAX - 2)).parse()?;
+        let uid = StreamUid::try_from(1)?;
+        let vectors = [
+            OperationFact::StreamCreated {
+                path: path.clone(),
+                uid,
+                content_type,
+                expiry: ExpiryPolicy::None,
+                lifecycle: StreamLifecycle::Closed,
+            },
+            OperationFact::StreamClosed {
+                path: path.clone(),
+                uid,
+            },
+            OperationFact::StreamDeleted { path, uid },
+        ];
+
+        for fact in vectors {
+            let estimate = WAL_RUN_FIXED_ENCODED_BYTES_MAX
+                .checked_add(fact.estimated_encoded_bytes())
+                .expect("the one-fact estimate fits in usize");
+            let object = WalObject::new(
+                partition,
+                batch,
+                owner,
+                WalBody::Run(WalFacts::try_from(vec![fact])?),
+            );
+            assert!(
+                encode_wal(&object)?.len() <= estimate,
+                "the fixed constants and variable lengths dominate every worst-case fact vector"
+            );
+        }
         Ok(())
     }
 

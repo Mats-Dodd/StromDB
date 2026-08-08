@@ -9,6 +9,32 @@ pub const WAL_ENCODED_BYTES_MAX: usize = 4 * 1024 * 1024;
 /// Most operation facts one WAL run may carry.
 pub const WAL_RUN_FACTS_MAX: usize = 4096;
 
+/// Worst-case fixed archive framing for one WAL RUN.
+pub const WAL_RUN_FIXED_ENCODED_BYTES_MAX: usize = 128;
+
+/// Worst-case encoded contribution of one fact excluding variable strings.
+pub const WAL_FACT_ENCODED_FIXED_BYTES_MAX: usize = 128;
+
+/// Worst-case complete estimated contribution of one fact to a WAL RUN.
+pub const WAL_FACT_ENCODED_BYTES_ESTIMATE_MAX: usize = WAL_FACT_ENCODED_FIXED_BYTES_MAX
+    + strom_domain::STREAM_PATH_BYTES_MAX
+    + strom_domain::CONTENT_TYPE_BYTES_MAX;
+
+/// Most commands retained in the writer's pending durability barrier.
+pub const WRITER_PENDING_COMMANDS_MAX: usize = 4096;
+
+const _: () = assert!(
+    WRITER_PENDING_COMMANDS_MAX <= WAL_RUN_FACTS_MAX,
+    "every pending barrier must remain inside the WAL fact-count bound"
+);
+
+const _: () = assert!(
+    WAL_RUN_FIXED_ENCODED_BYTES_MAX
+        + WRITER_PENDING_COMMANDS_MAX * WAL_FACT_ENCODED_BYTES_ESTIMATE_MAX
+        <= WAL_ENCODED_BYTES_MAX,
+    "the pending-command and field bounds must fit one encoded WAL object"
+);
+
 /// Most sorted runs carried by one tree manifest.
 pub const TREE_RUNS_MAX: usize = 16;
 

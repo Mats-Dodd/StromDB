@@ -1,5 +1,10 @@
 //! Thin async interpreter for the pure writer machine.
 
+use std::future::{Future, pending};
+use std::pin::Pin;
+use std::sync::Arc;
+
+use strom_common::MonotonicClock;
 use strom_object_store::ObjectStoreAdapter;
 use strom_storage_protocol::{
     Completion, EffectKey, WRITER_OUTPUTS_PER_STEP_MAX, WriterAction, WriterEffect, WriterEvent,
@@ -10,7 +15,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_util::task::JoinMap;
 
 use crate::checkpoint;
-use crate::engine::PublishedView;
+use crate::engine::{Options, PublishedView};
 use crate::store::{SealStore, TableStore, WalStore};
 
 struct Writer {
@@ -20,6 +25,8 @@ struct Writer {
     table_store: TableStore,
     view: watch::Sender<PublishedView>,
     effects: JoinMap<EffectKey, WriterEvent>,
+    clock: Arc<dyn MonotonicClock>,
+    flush_timer: Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
 }
 
 pub(crate) fn spawn_writer(
@@ -27,8 +34,10 @@ pub(crate) fn spawn_writer(
     recovery: WriterRecovery,
     ingress: mpsc::Receiver<strom_storage_protocol::CommandEnvelope>,
     view: watch::Sender<PublishedView>,
+    clock: Arc<dyn MonotonicClock>,
+    options: Options,
 ) -> JoinHandle<WriterExit> {
-    let writer = Writer::new(adapter, recovery, view);
+    let writer = Writer::new(adapter, recovery, view, clock, options);
     tokio::spawn(writer.run(ingress))
 }
 
@@ -37,14 +46,22 @@ impl Writer {
         adapter: ObjectStoreAdapter,
         recovery: WriterRecovery,
         view: watch::Sender<PublishedView>,
+        clock: Arc<dyn MonotonicClock>,
+        options: Options,
     ) -> Self {
         Self {
-            machine: WriterMachine::from_recovery(recovery),
+            machine: WriterMachine::from_recovery(
+                recovery,
+                options.flush_interval_min(),
+                options.flush_buffer_bytes(),
+            ),
             seal_store: SealStore::new(adapter.clone()),
             wal_store: WalStore::new(adapter.clone()),
             table_store: TableStore::new(adapter),
             view,
             effects: JoinMap::new(),
+            clock,
+            flush_timer: None,
         }
     }
 
@@ -52,11 +69,10 @@ impl Writer {
         mut self,
         mut ingress: mpsc::Receiver<strom_storage_protocol::CommandEnvelope>,
     ) -> WriterExit {
-        let startup = self.machine.handle(WriterEvent::Started);
+        let startup = self.machine.handle(self.clock.now(), WriterEvent::Started);
         if let Some(exit) = self.execute_step(startup) {
             return exit;
         }
-        let mut ingress_open = true;
         loop {
             let event = tokio::select! {
                 biased;
@@ -64,15 +80,18 @@ impl Writer {
                     let joined = joined.expect("a nonempty JoinMap has a task");
                     joined_event(joined)
                 }
-                command = ingress.recv(), if ingress_open => if let Some(command) = command {
+                () = wait_for_flush(&mut self.flush_timer) => {
+                    drop(self.flush_timer.take());
+                    WriterEvent::FlushDue
+                }
+                command = ingress.recv(), if self.machine.admission_open() => if let Some(command) = command {
                     WriterEvent::Command(command)
                 } else {
-                    ingress_open = false;
                     WriterEvent::IngressClosed
                 },
                 else => panic!("a live writer has ingress or an outstanding effect"),
             };
-            let step = self.machine.handle(event);
+            let step = self.machine.handle(self.clock.now(), event);
             if let Some(exit) = self.execute_step(step) {
                 return exit;
             }
@@ -152,6 +171,13 @@ impl Writer {
 
     fn execute_action(&mut self, action: WriterAction) {
         match action {
+            WriterAction::ArmFlush { deadline } => {
+                assert!(
+                    self.flush_timer.is_none(),
+                    "the writer interpreter owns at most one flush timer"
+                );
+                self.flush_timer = Some(self.clock.sleep_until(deadline));
+            }
             WriterAction::PublishView(forest) => {
                 self.view.send_replace(PublishedView::new(forest));
             }
@@ -164,6 +190,13 @@ impl Writer {
                 );
             }
         }
+    }
+}
+
+async fn wait_for_flush(timer: &mut Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>) {
+    match timer {
+        Some(timer) => timer.await,
+        None => pending::<()>().await,
     }
 }
 
@@ -206,7 +239,9 @@ fn send_replies(replies: Vec<Completion>) {
 #[cfg(test)]
 mod tests {
     use std::future::pending;
+    use std::time::Duration;
 
+    use strom_common::MonotonicInstant;
     use strom_domain::{ExpiryPolicy, StreamContentType, StreamLifecycle, StreamPath};
     use strom_storage_domain::{
         BatchId, OwnerToken, Seal, SealGeneration, TreeVersion, WalBody, WalObject, WalReplayPoint,
@@ -307,20 +342,26 @@ mod tests {
         let mut machine = machine()?;
         for ordinal in 0..strom_storage_domain::WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER {
             let (reply, _outcome) = oneshot::channel();
-            let step = machine.handle(WriterEvent::Command(CommandEnvelope::Create {
-                command: CreateStream {
-                    path: path(&format!("events/ticket-{ordinal}"))?,
-                    content_type: StreamContentType::octet_stream(),
-                    expiry: ExpiryPolicy::None,
-                    lifecycle: StreamLifecycle::Open,
-                },
-                reply,
-            }));
+            let step = machine.handle(
+                MonotonicInstant::ZERO,
+                WriterEvent::Command(CommandEnvelope::Create {
+                    command: CreateStream {
+                        path: path(&format!("events/ticket-{ordinal}"))?,
+                        content_type: StreamContentType::octet_stream(),
+                        expiry: ExpiryPolicy::None,
+                        lifecycle: StreamLifecycle::Open,
+                    },
+                    reply,
+                }),
+            );
             let batch = wal_batch(step).ok_or("each create issues one WAL")?;
-            let step = machine.handle(WriterEvent::WalEstablished {
-                batch,
-                result: Ok(WalEstablishment::Durable),
-            });
+            let step = machine.handle(
+                MonotonicInstant::ZERO,
+                WriterEvent::WalEstablished {
+                    batch,
+                    result: Ok(WalEstablishment::Durable),
+                },
+            );
             if let Some(ticket) = preparation_key(step) {
                 return Ok(ticket);
             }
@@ -330,7 +371,9 @@ mod tests {
 
     fn machine() -> Result<WriterMachine, Box<dyn std::error::Error>> {
         let mut machine = recovered_machine()?;
-        let (outputs, exit) = machine.handle(WriterEvent::Started).into_parts();
+        let (outputs, exit) = machine
+            .handle(MonotonicInstant::ZERO, WriterEvent::Started)
+            .into_parts();
         assert!(outputs.is_empty());
         assert_eq!(None, exit);
         Ok(machine)
@@ -374,7 +417,11 @@ mod tests {
         else {
             return Err("writer fixture reaches complete bootstrap".into());
         };
-        Ok(WriterMachine::from_recovery(recovery))
+        Ok(WriterMachine::from_recovery(
+            recovery,
+            Duration::ZERO,
+            strom_storage_domain::WAL_ENCODED_BYTES_MAX,
+        ))
     }
 
     fn path(raw: &str) -> Result<StreamPath, Box<dyn std::error::Error>> {

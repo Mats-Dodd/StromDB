@@ -11,7 +11,7 @@ check: fmt-check clippy lint-style protocol-boundary
     cargo check --workspace --all-targets --all-features
 
 protocol-boundary:
-    @if rg --line-number '\b(runtime|select|spawn|task|time)\b' crates/strom-storage-protocol/src; then echo 'strom-storage-protocol must not name runtime execution' >&2; exit 1; fi
+    @if rg --line-number '\b(runtime|select|spawn|task|sleep|MonotonicClock)\b' crates/strom-storage-protocol/src; then echo 'strom-storage-protocol must not name runtime execution or clock capabilities' >&2; exit 1; fi
     cargo check -p strom-storage-protocol
 
 clippy:

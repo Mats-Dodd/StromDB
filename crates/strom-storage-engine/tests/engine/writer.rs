@@ -1,7 +1,10 @@
 use std::sync::Arc;
+use std::time::Duration;
 
+use futures::poll;
 use object_store::path::Path;
 use object_store::{ObjectStoreExt as _, PutPayload};
+use strom_common::{ManualMonotonicClock, MonotonicClock, MonotonicInstant};
 use strom_domain::{CreateOutcome, StreamPath, StreamStatus};
 use strom_object_store::test_support::{
     BackendFailure, Fault, FaultStore, Gate, Operation, Selection, Target,
@@ -10,9 +13,45 @@ use strom_storage_domain::{
     BatchId, OwnerToken, SealGeneration, WAL_SUFFIX_CHECKPOINT_SPAN_TRIGGER,
     WAL_SUFFIX_COORDINATES_MAX_V2, WalBody, WalObject, encode_wal,
 };
-use strom_storage_engine::{CloseOutcome, Engine, OpenError, StreamError};
+use strom_storage_engine::{CloseOutcome, Engine, OpenError, Options, StreamError};
 
-use super::support::{TestResult, create, entropy, observe_checkpoint_keys, wal_key};
+use super::support::{TestResult, create, entropy, observe_checkpoint_keys, open_engine, wal_key};
+
+const FLUSH_INTERVAL_TEST: Duration = Duration::from_millis(250);
+
+#[tokio::test]
+async fn manual_clock_drives_the_interpreter_flush_timer() -> TestResult {
+    let store = FaultStore::new();
+    let clock = Arc::new(ManualMonotonicClock::new(MonotonicInstant::ZERO));
+    let writer_clock: Arc<dyn MonotonicClock> = Arc::<ManualMonotonicClock>::clone(&clock);
+    let engine = Engine::open(
+        store.backend(),
+        entropy(),
+        writer_clock,
+        Options::default().with_min_flush_interval(FLUSH_INTERVAL_TEST),
+    )
+    .await?;
+    let first: StreamPath = "events/paced-first".parse()?;
+    let second: StreamPath = "events/paced-second".parse()?;
+
+    assert_eq!(CreateOutcome::Created, create(&engine, &first).await?);
+    let mut waiting = Box::pin(create(&engine, &second));
+    assert!(poll!(waiting.as_mut()).is_pending());
+    while clock.sleeper_count() == 0 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(1, clock.sleeper_count());
+
+    clock.advance(FLUSH_INTERVAL_TEST.saturating_sub(Duration::from_nanos(1)));
+    tokio::task::yield_now().await;
+    assert!(poll!(waiting.as_mut()).is_pending());
+    clock.advance(Duration::from_nanos(1));
+    assert_eq!(CreateOutcome::Created, waiting.await?);
+
+    assert_eq!(CloseOutcome::Shutdown, engine.shutdown().await);
+    store.verify()?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn direct_wal_create_commits_once_and_survives_reopen() -> TestResult {
@@ -20,13 +59,13 @@ async fn direct_wal_create_commits_once_and_survives_reopen() -> TestResult {
     let store = FaultStore::new();
     let id: StreamPath = "events/direct".parse()?;
 
-    let engine = Engine::open(store.backend(), entropy()).await?;
+    let engine = open_engine(store.backend(), entropy()).await?;
     assert_eq!(CreateOutcome::Created, create(&engine, &id).await?);
     assert!(matches!(engine.stream(&id)?, StreamStatus::Live { .. }));
     assert_eq!(CloseOutcome::Shutdown, engine.shutdown().await);
     store.assert_called_once(Operation::Create, &wal_key)?;
 
-    let reopened = Engine::open(store.backend(), entropy()).await?;
+    let reopened = open_engine(store.backend(), entropy()).await?;
     assert!(matches!(reopened.stream(&id)?, StreamStatus::Live { .. }));
     assert_eq!(CloseOutcome::Shutdown, reopened.shutdown().await);
 
@@ -42,14 +81,14 @@ async fn ambiguous_wal_create_with_matching_bytes_commits_without_resend() -> Te
     })?;
     let id: StreamPath = "events/ambiguous".parse()?;
 
-    let engine = Engine::open(store.backend(), entropy()).await?;
+    let engine = open_engine(store.backend(), entropy()).await?;
     assert_eq!(CreateOutcome::Created, create(&engine, &id).await?);
     assert!(matches!(engine.stream(&id)?, StreamStatus::Live { .. }));
     assert_eq!(CloseOutcome::Shutdown, engine.shutdown().await);
     store.assert_called_once(Operation::Create, &wal_key)?;
     store.assert_called_once(Operation::Read, &wal_key)?;
 
-    let reopened = Engine::open(store.backend(), entropy()).await?;
+    let reopened = open_engine(store.backend(), entropy()).await?;
     assert!(matches!(reopened.stream(&id)?, StreamStatus::Live { .. }));
     assert_eq!(CloseOutcome::Shutdown, reopened.shutdown().await);
 
@@ -73,7 +112,7 @@ async fn ambiguous_wal_create_with_foreign_bytes_fences_without_resend() -> Test
         )?;
     let backend = store.backend();
     let id: StreamPath = "events/foreign".parse()?;
-    let engine = Engine::open(Arc::clone(&backend), entropy()).await?;
+    let engine = open_engine(Arc::clone(&backend), entropy()).await?;
     let partition = engine.partition_id();
 
     let outcome = {
@@ -106,7 +145,7 @@ async fn ambiguous_wal_create_with_foreign_bytes_fences_without_resend() -> Test
     store.assert_called_once(Operation::Create, &wal_key)?;
     store.assert_called_once(Operation::Read, &wal_key)?;
     assert!(matches!(
-        Engine::open(backend, entropy()).await,
+        open_engine(backend, entropy()).await,
         Err(OpenError::Contradiction { .. })
     ));
     store.verify()?;
@@ -122,7 +161,7 @@ async fn ambiguous_wal_create_absent_on_reconciliation_poisoned_without_resend()
     })?;
     let id: StreamPath = "events/absent".parse()?;
 
-    let engine = Engine::open(store.backend(), entropy()).await?;
+    let engine = open_engine(store.backend(), entropy()).await?;
     assert_eq!(Err(StreamError::Indeterminate), create(&engine, &id).await);
     assert!(matches!(
         engine.shutdown().await,
@@ -132,7 +171,7 @@ async fn ambiguous_wal_create_absent_on_reconciliation_poisoned_without_resend()
     store.assert_called_once(Operation::Create, &wal_key)?;
     store.assert_called_once(Operation::Read, &wal_key)?;
 
-    let reopened = Engine::open(store.backend(), entropy()).await?;
+    let reopened = open_engine(store.backend(), entropy()).await?;
     assert_eq!(StreamStatus::Missing, reopened.stream(&id)?);
     assert_eq!(CloseOutcome::Shutdown, reopened.shutdown().await);
     store.verify()?;
@@ -153,7 +192,7 @@ async fn failed_wal_reconciliation_poisoned_without_resend() -> TestResult {
         })?;
     let id: StreamPath = "events/reconciliation-failed".parse()?;
 
-    let engine = Engine::open(store.backend(), entropy()).await?;
+    let engine = open_engine(store.backend(), entropy()).await?;
     assert_eq!(Err(StreamError::Indeterminate), create(&engine, &id).await);
     assert!(matches!(
         engine.shutdown().await,
@@ -162,7 +201,7 @@ async fn failed_wal_reconciliation_poisoned_without_resend() -> TestResult {
     store.assert_called_once(Operation::Create, &wal_key)?;
     store.assert_called_once(Operation::Read, &wal_key)?;
 
-    let reopened = Engine::open(store.backend(), entropy()).await?;
+    let reopened = open_engine(store.backend(), entropy()).await?;
     assert_eq!(StreamStatus::Missing, reopened.stream(&id)?);
     assert_eq!(CloseOutcome::Shutdown, reopened.shutdown().await);
     store.verify()?;
@@ -178,7 +217,7 @@ async fn rejected_wal_create_poisoned_without_resend() -> TestResult {
     })?;
     let id: StreamPath = "events/rejected".parse()?;
 
-    let engine = Engine::open(store.backend(), entropy()).await?;
+    let engine = open_engine(store.backend(), entropy()).await?;
     assert_eq!(Err(StreamError::Indeterminate), create(&engine, &id).await);
     assert!(matches!(
         engine.shutdown().await,
@@ -195,7 +234,7 @@ async fn wal_commit_is_published_before_the_success_reply_is_released() -> TestR
     let gate = Gate::new();
     let store = FaultStore::new().gate(Selection::create(Target::Key(wal_key)), gate.clone())?;
     let id: StreamPath = "events/visibility".parse()?;
-    let engine = Engine::open(store.backend(), entropy()).await?;
+    let engine = open_engine(store.backend(), entropy()).await?;
 
     let outcome = {
         let command = create(&engine, &id);
@@ -219,8 +258,8 @@ async fn wal_commit_is_published_before_the_success_reply_is_released() -> TestR
 #[tokio::test]
 async fn successor_writer_fences_the_previous_writer_and_preserves_its_own_work() -> TestResult {
     let store = FaultStore::new();
-    let previous = Engine::open(store.backend(), entropy()).await?;
-    let current = Engine::open(store.backend(), entropy()).await?;
+    let previous = open_engine(store.backend(), entropy()).await?;
+    let current = open_engine(store.backend(), entropy()).await?;
     let rejected: StreamPath = "events/previous".parse()?;
     let accepted: StreamPath = "events/current".parse()?;
 
@@ -238,7 +277,7 @@ async fn successor_writer_fences_the_previous_writer_and_preserves_its_own_work(
     ));
     assert_eq!(CloseOutcome::Shutdown, current.shutdown().await);
 
-    let reopened = Engine::open(store.backend(), entropy()).await?;
+    let reopened = open_engine(store.backend(), entropy()).await?;
     assert_eq!(StreamStatus::Missing, reopened.stream(&rejected)?);
     assert!(matches!(
         reopened.stream(&accepted)?,
@@ -254,7 +293,7 @@ async fn wal_run_retains_matching_state_and_shell_flights_until_completion() -> 
     let gate = Gate::new();
     let store = FaultStore::new().gate(Selection::create(Target::Key(wal_key(2))), gate.clone())?;
     let id: StreamPath = "events/shutdown".parse()?;
-    let engine = Engine::open(store.backend(), entropy()).await?;
+    let engine = open_engine(store.backend(), entropy()).await?;
 
     {
         let command = create(&engine, &id);
@@ -269,7 +308,7 @@ async fn wal_run_retains_matching_state_and_shell_flights_until_completion() -> 
     gate.release();
     assert_eq!(CloseOutcome::Shutdown, shutdown.await?);
 
-    let reopened = Engine::open(store.backend(), entropy()).await?;
+    let reopened = open_engine(store.backend(), entropy()).await?;
     assert!(matches!(reopened.stream(&id)?, StreamStatus::Live { .. }));
     assert_eq!(CloseOutcome::Shutdown, reopened.shutdown().await);
     store.verify()?;
@@ -284,7 +323,7 @@ async fn held_checkpoint_cannot_extend_the_bounded_wal_suffix() -> TestResult {
         Selection::create(Target::Key(seal_key.clone())),
         seal_gate.clone(),
     )?;
-    let engine = Engine::open(store.backend(), entropy()).await?;
+    let engine = open_engine(store.backend(), entropy()).await?;
 
     let accepted_count = WAL_SUFFIX_COORDINATES_MAX_V2
         .checked_sub(2)
@@ -320,7 +359,7 @@ async fn held_checkpoint_cannot_extend_the_bounded_wal_suffix() -> TestResult {
     seal_gate.release();
     assert_eq!(CloseOutcome::Shutdown, engine.shutdown().await);
 
-    let reopened = Engine::open(store.backend(), entropy()).await?;
+    let reopened = open_engine(store.backend(), entropy()).await?;
     assert!(matches!(
         reopened.stream(&first)?,
         StreamStatus::Live { .. }

@@ -44,12 +44,14 @@ pub use strom_domain::{
     CloseStreamOutcome, CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle,
     StreamPath, StreamPathError, StreamStatus,
 };
-pub use strom_storage_engine::{CloseOutcome, OpenError, PartitionId, SealGeneration, StreamError};
+pub use strom_storage_engine::{
+    CloseOutcome, OpenError, Options, OptionsError, PartitionId, SealGeneration, StreamError,
+};
 
 use std::sync::Arc;
 
 use object_store::ObjectStore;
-use strom_common::{Entropy, Seed};
+use strom_common::{Entropy, OsMonotonicClock, Seed};
 use strom_storage_engine::Engine;
 
 /// One open `StromDB` durable streams database.
@@ -70,10 +72,28 @@ impl Db {
     /// Returns [`OpenError`] unless the complete durable state is bounded,
     /// internally consistent, directly claimed, fenced, replayed, and current.
     pub async fn open(store: Arc<dyn ObjectStore>) -> Result<Self, OpenError> {
+        Self::open_with(store, Options::default()).await
+    }
+
+    /// Open with an explicit validated WAL flush policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpenError`] unless the complete durable state is bounded,
+    /// internally consistent, directly claimed, fenced, replayed, and current.
+    pub async fn open_with(
+        store: Arc<dyn ObjectStore>,
+        options: Options,
+    ) -> Result<Self, OpenError> {
         let entropy = Entropy::from_seed(Seed::from_os());
-        Engine::open(store, entropy)
-            .await
-            .map(|engine| Self { engine })
+        Engine::open(
+            store,
+            entropy,
+            Arc::new(OsMonotonicClock::default()),
+            options,
+        )
+        .await
+        .map(|engine| Self { engine })
     }
 
     /// The genesis-born identity of the partition at this store root.

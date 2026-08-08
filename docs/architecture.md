@@ -559,12 +559,16 @@ keys.
 
 ### enter bounded ingress
 
-The handler uses non-blocking submission to a bounded many-producer,
-single-consumer queue. A full queue means the request was never admitted and
-returns retryable load shedding.
+The handler awaits submission to a bounded many-producer, single-consumer
+queue. When the writer's pending barrier is hard full it stops polling ingress,
+so a full channel applies bounded backpressure until the active WAL flight
+drains the barrier. Suffix exhaustion remains explicit retryable load shedding
+because it means checkpointing has fallen behind rather than that one WAL PUT
+will clear capacity.
 
-Once submitted, client cancellation only drops the response waiter. It does
-not cancel a fact that may become durable.
+Cancellation withdraws a send while it is still awaiting channel capacity.
+Once submitted, cancellation only drops the response waiter; it does not
+cancel a fact that may become durable.
 
 ### pure writer machine
 
@@ -573,7 +577,7 @@ object-store adapter or the typed stores. Commands, ingress closure, and exact
 effect completions enter through one seam:
 
 ```rust
-fn handle(&mut self, event: WriterEvent) -> WriterStep;
+fn handle(&mut self, now: MonotonicInstant, event: WriterEvent) -> WriterStep;
 ```
 
 One step contains a bounded, totally ordered list of completion-producing
@@ -589,17 +593,19 @@ state even when no client command arrives; a second startup event is a
 protocol violation.
 
 ```text
-command or exact effect completion
+stamped command, timer observation, or exact effect completion
   -> WriterMachine::handle
-  -> [PublishView | SendReplies | CancelPreparation | typed-store effect]
+  -> [ArmFlush | PublishView | SendReplies | CancelPreparation | typed-store effect]
   -> interpreter executes in list order
   -> effect completion becomes the next WriterEvent
 ```
 
-The writer protocol uses no timers. Its progress is self-clocking: only a
-matching completion releases an effect budget and can issue its successor.
-Protocol schedules are therefore tested as synchronous event scripts without
-storage, tasks, sleeps, or ambient time.
+WAL pacing uses one monotonic timer owned by the interpreter. The pure machine
+receives time as stamped data, emits `ArmFlush` with an absolute deadline, and
+reconsiders current state when `FlushDue` arrives. All other progress remains
+self-clocking: only a matching completion releases an effect budget and can
+issue its successor. Protocol schedules remain synchronous event scripts with
+explicit monotonic instants and no storage, tasks, sleeps, or ambient time.
 
 Within the machine, admission still decides requests in ingress order.
 
@@ -620,8 +626,11 @@ create remains only in flight.
 
 Accepted facts and payload bytes enter one bounded `PendingRun`. The writer has
 zero or one immutable WAL create in flight. While one PUT is pending, later
-requests accumulate in the next run; there is no batching timer required for
-group commit.
+requests accumulate in the next run. With no flight active, pending facts start
+a WAL flight on shutdown, hard capacity, the configured byte threshold, or
+when the minimum interval since the prior flush start has elapsed. Otherwise
+the interpreter owns exactly one armed monotonic timer. The first flight after
+recovery starts immediately because it has no prior flush start.
 
 The machine's active flight owns its batch, proven post-run forest, and waiters. Its effect owns
 an `EncodedWal` from `strom-storage-domain`: partition, batch, and immutable
@@ -830,7 +839,7 @@ partition, fresh table identity, and complete ordered row collection. The
 concrete root supplies the store kind rather than archiving it twice:
 
 ```text
-DirectorySstArchive -> [(DirectoryKey, DirectoryEntry)]
+DirectorySstArchive -> [(StreamPath, DirectoryEntry)]
 LedgerSstArchive    -> [(StreamUid, LedgerCell)]
 ```
 

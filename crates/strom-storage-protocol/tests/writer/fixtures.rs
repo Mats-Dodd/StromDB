@@ -1,5 +1,7 @@
 use std::num::NonZeroU64;
+use std::time::Duration;
 
+use strom_common::MonotonicInstant;
 use strom_domain::{CreateOutcome, ExpiryPolicy, StreamContentType, StreamLifecycle, StreamPath};
 use strom_storage_domain::{
     AttemptId, BatchId, DecodedTable, EncodedAuthoritySeal, FreshIdentity, OwnerToken, Seal,
@@ -39,7 +41,7 @@ pub(super) fn path(raw: &str) -> TestResult<StreamPath> {
 
 pub(super) fn machine_at(durable: u64) -> TestResult<WriterMachine> {
     let mut machine = recovered_machine_at(durable)?;
-    assert_empty_step(machine.handle(WriterEvent::Started));
+    assert_empty_step(machine.handle(MonotonicInstant::ZERO, WriterEvent::Started));
     Ok(machine)
 }
 
@@ -52,19 +54,52 @@ pub(super) fn machine_with_preparation_at(
     durable: u64,
 ) -> TestResult<(WriterMachine, CheckpointTicket, CheckpointInput)> {
     let mut machine = recovered_machine_at(durable)?;
-    let (outputs, exit) = machine.handle(WriterEvent::Started).into_parts();
+    let (outputs, exit) = machine
+        .handle(MonotonicInstant::ZERO, WriterEvent::Started)
+        .into_parts();
     assert_eq!(None, exit, "checkpoint fixture startup remains live");
     let (ticket, input) = take_preparation(outputs).ok_or("a due checkpoint is issued")?;
     Ok((machine, ticket, input))
 }
 
 pub(super) fn recovered_machine_at(durable: u64) -> TestResult<WriterMachine> {
-    recovered_machine_at_with_forest(durable, &Forest::empty())
+    recovered_machine_at_with_options(
+        durable,
+        Duration::ZERO,
+        strom_storage_domain::WAL_ENCODED_BYTES_MAX,
+    )
+}
+
+pub(super) fn recovered_machine_at_with_options(
+    durable: u64,
+    flush_interval_min: Duration,
+    flush_buffer_bytes: usize,
+) -> TestResult<WriterMachine> {
+    recovered_machine_at_with_forest_and_options(
+        durable,
+        &Forest::empty(),
+        flush_interval_min,
+        flush_buffer_bytes,
+    )
 }
 
 pub(super) fn recovered_machine_at_with_forest(
     durable: u64,
     forest: &Forest,
+) -> TestResult<WriterMachine> {
+    recovered_machine_at_with_forest_and_options(
+        durable,
+        forest,
+        Duration::ZERO,
+        strom_storage_domain::WAL_ENCODED_BYTES_MAX,
+    )
+}
+
+fn recovered_machine_at_with_forest_and_options(
+    durable: u64,
+    forest: &Forest,
+    flush_interval_min: Duration,
+    flush_buffer_bytes: usize,
 ) -> TestResult<WriterMachine> {
     let partition = "00112233-4455-6677-8899-aabbccddeeff".parse()?;
     let generation = SealGeneration::try_from(durable)?;
@@ -174,7 +209,11 @@ pub(super) fn recovered_machine_at_with_forest(
     else {
         return Err("recovery fixture reaches a complete bootstrap".into());
     };
-    Ok(WriterMachine::from_recovery(recovery))
+    Ok(WriterMachine::from_recovery(
+        recovery,
+        flush_interval_min,
+        flush_buffer_bytes,
+    ))
 }
 
 fn recovery_tree(
@@ -256,6 +295,15 @@ pub(super) fn establish_wal(step: WriterStep) -> TestResult<BatchId> {
         .ok_or_else(|| "the command issues a WAL effect".into())
 }
 
+pub(super) fn flush_deadline(step: WriterStep) -> TestResult<MonotonicInstant> {
+    let (outputs, exit) = step.into_parts();
+    assert_eq!(None, exit, "flush-arm fixture step remains live");
+    match outputs.as_slice() {
+        [WriterOutput::Action(WriterAction::ArmFlush { deadline })] => Ok(*deadline),
+        _ => Err("the waiting barrier arms exactly one flush deadline".into()),
+    }
+}
+
 pub(super) fn take_preparation(
     outputs: Vec<WriterOutput>,
 ) -> Option<(CheckpointTicket, CheckpointInput)> {
@@ -308,7 +356,9 @@ pub(super) fn published_view(outputs: &[WriterOutput]) -> Option<&Forest> {
         WriterOutput::Action(WriterAction::PublishView(view)) => Some(view),
         WriterOutput::Effect(_)
         | WriterOutput::Action(
-            WriterAction::SendReplies(_) | WriterAction::CancelCheckpointPreparation { .. },
+            WriterAction::ArmFlush { .. }
+            | WriterAction::SendReplies(_)
+            | WriterAction::CancelCheckpointPreparation { .. },
         ) => None,
     })
 }
@@ -361,7 +411,9 @@ pub(super) fn execute_outputs(outputs: Vec<WriterOutput>) -> Vec<WriterEffect> {
         match output {
             WriterOutput::Action(WriterAction::SendReplies(replies)) => settle_replies(replies),
             WriterOutput::Action(
-                WriterAction::PublishView(_) | WriterAction::CancelCheckpointPreparation { .. },
+                WriterAction::ArmFlush { .. }
+                | WriterAction::PublishView(_)
+                | WriterAction::CancelCheckpointPreparation { .. },
             ) => {}
             WriterOutput::Effect(effect) => effects.push(effect),
         }
